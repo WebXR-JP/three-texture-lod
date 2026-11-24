@@ -1,0 +1,983 @@
+lockfile_version: '4'
+apm_version: 0.38.1
+manifest_targets: []
+dependencies:
+- repo_url: halby24/agent-common-package
+  name: halby-agent-common-package
+  host: github.com
+  resolved_commit: 635f97ab4de026e8c1879e83ef715660112fe5ba
+  resolved_ref: main
+  version: 0.1.10
+  package_type: apm_package
+  deployed_files:
+  - .agents/skills/code-writing
+  - .agents/skills/code-writing/LICENSE
+  - .agents/skills/code-writing/SKILL.md
+  - .agents/skills/design-policy
+  - .agents/skills/design-policy/LICENSE
+  - .agents/skills/design-policy/SKILL.md
+  - .agents/skills/design-writing
+  - .agents/skills/design-writing/LICENSE
+  - .agents/skills/design-writing/SKILL.md
+  - .agents/skills/document-writing
+  - .agents/skills/document-writing/LICENSE
+  - .agents/skills/document-writing/SKILL.md
+  - .agents/skills/rust-writing
+  - .agents/skills/rust-writing/LICENSE
+  - .agents/skills/rust-writing/SKILL.md
+  - .agents/skills/test-writing
+  - .agents/skills/test-writing/LICENSE
+  - .agents/skills/test-writing/SKILL.md
+  - .agents/skills/ts-writing
+  - .agents/skills/ts-writing/LICENSE
+  - .agents/skills/ts-writing/SKILL.md
+  - .claude/agents/advisor.md
+  - .claude/agents/builder.md
+  - .claude/agents/orchestrator.md
+  - .claude/agents/reviewer.md
+  - .claude/agents/verifier.md
+  - .claude/skills/code-writing
+  - .claude/skills/code-writing/LICENSE
+  - .claude/skills/code-writing/SKILL.md
+  - .claude/skills/design-policy
+  - .claude/skills/design-policy/LICENSE
+  - .claude/skills/design-policy/SKILL.md
+  - .claude/skills/design-writing
+  - .claude/skills/design-writing/LICENSE
+  - .claude/skills/design-writing/SKILL.md
+  - .claude/skills/document-writing
+  - .claude/skills/document-writing/LICENSE
+  - .claude/skills/document-writing/SKILL.md
+  - .claude/skills/rust-writing
+  - .claude/skills/rust-writing/LICENSE
+  - .claude/skills/rust-writing/SKILL.md
+  - .claude/skills/test-writing
+  - .claude/skills/test-writing/LICENSE
+  - .claude/skills/test-writing/SKILL.md
+  - .claude/skills/ts-writing
+  - .claude/skills/ts-writing/LICENSE
+  - .claude/skills/ts-writing/SKILL.md
+  - .opencode/agents/advisor.md
+  - .opencode/agents/builder.md
+  - .opencode/agents/orchestrator.md
+  - .opencode/agents/reviewer.md
+  - .opencode/agents/verifier.md
+  deployed_file_hashes:
+    .agents/skills/code-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/code-writing/SKILL.md: sha256:317faf4ca86c6be6f12f0fa1e08b1f2d768b63e905f0048075ca23c4f6e9dd3c
+    .agents/skills/design-policy/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/design-policy/SKILL.md: sha256:600ffafe5a3351810afbed2190d5eb38456bae6a71089c14a0acf2f6e0aea5bd
+    .agents/skills/design-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/design-writing/SKILL.md: sha256:56a220bc0234c5b3877dcc3594080b7bb3e614ea793f400cd78344b827480179
+    .agents/skills/document-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/document-writing/SKILL.md: sha256:d3b3fa5a0cb622a50b8788767a0558982cca16d1884e9247cc26a34291a3a0b9
+    .agents/skills/rust-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/rust-writing/SKILL.md: sha256:f7edfcd4a6a8724cf497f945490429fff95ba201c2a4cdc6c18d3ce208174b9a
+    .agents/skills/test-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/test-writing/SKILL.md: sha256:013c4f391ce5affc8d3d2a52b91dbdc796ac646c2772bd24faecdc7a3c918a4e
+    .agents/skills/ts-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .agents/skills/ts-writing/SKILL.md: sha256:fa96b7f462130fef94554ed1d56cdeeb5758b2c0139eb734c87976b7ee01f05d
+    .claude/agents/advisor.md: sha256:5fdd6baafa498ce696e7bb60e4522aadf17deb3242ec25e3e603dc7e7299b66a
+    .claude/agents/builder.md: sha256:fad79f4a6bb4f798a54f0a857fb2442fdbbe95b86fa56ad7b219bd16bf6f95d3
+    .claude/agents/orchestrator.md: sha256:fb229e76cb88d39b1d3b71c5f82c9616d62e1844c81d86351dcd12eb7cfec574
+    .claude/agents/reviewer.md: sha256:b02406c0b1652fccf9c6feb5b2cade566e6e9224620a48e4f068059464aac184
+    .claude/agents/verifier.md: sha256:837674a7298dab92f713f1a609d7b146d423cbcd2d9498469fdb6d4de485b6d0
+    .claude/skills/code-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/code-writing/SKILL.md: sha256:317faf4ca86c6be6f12f0fa1e08b1f2d768b63e905f0048075ca23c4f6e9dd3c
+    .claude/skills/design-policy/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/design-policy/SKILL.md: sha256:600ffafe5a3351810afbed2190d5eb38456bae6a71089c14a0acf2f6e0aea5bd
+    .claude/skills/design-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/design-writing/SKILL.md: sha256:56a220bc0234c5b3877dcc3594080b7bb3e614ea793f400cd78344b827480179
+    .claude/skills/document-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/document-writing/SKILL.md: sha256:d3b3fa5a0cb622a50b8788767a0558982cca16d1884e9247cc26a34291a3a0b9
+    .claude/skills/rust-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/rust-writing/SKILL.md: sha256:f7edfcd4a6a8724cf497f945490429fff95ba201c2a4cdc6c18d3ce208174b9a
+    .claude/skills/test-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/test-writing/SKILL.md: sha256:013c4f391ce5affc8d3d2a52b91dbdc796ac646c2772bd24faecdc7a3c918a4e
+    .claude/skills/ts-writing/LICENSE: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+    .claude/skills/ts-writing/SKILL.md: sha256:fa96b7f462130fef94554ed1d56cdeeb5758b2c0139eb734c87976b7ee01f05d
+    .opencode/agents/advisor.md: sha256:5fdd6baafa498ce696e7bb60e4522aadf17deb3242ec25e3e603dc7e7299b66a
+    .opencode/agents/builder.md: sha256:fad79f4a6bb4f798a54f0a857fb2442fdbbe95b86fa56ad7b219bd16bf6f95d3
+    .opencode/agents/orchestrator.md: sha256:fb229e76cb88d39b1d3b71c5f82c9616d62e1844c81d86351dcd12eb7cfec574
+    .opencode/agents/reviewer.md: sha256:b02406c0b1652fccf9c6feb5b2cade566e6e9224620a48e4f068059464aac184
+    .opencode/agents/verifier.md: sha256:837674a7298dab92f713f1a609d7b146d423cbcd2d9498469fdb6d4de485b6d0
+  content_hash: sha256:d670435740870fbdeff37a597189ed050a1ce21f306e7c3b05b14496ea666c9b
+  carried_licenses:
+  - path: .apm/skills/code-writing/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+  - path: .apm/skills/design-policy/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+  - path: .apm/skills/design-writing/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+  - path: .apm/skills/document-writing/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+  - path: .apm/skills/rust-writing/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+  - path: .apm/skills/test-writing/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+  - path: .apm/skills/ts-writing/LICENSE
+    source: LICENSE
+    hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- repo_url: webxr-jp/xrift-skills
+  materialization_repo_url: WebXR-JP/xrift-skills
+  name: xrift-skills
+  host: github.com
+  resolved_commit: e7d76077dd4efa0e081b4484e4d0e85fe29cf95f
+  version: 0.0.0
+  package_type: skill_bundle
+  deployed_files:
+  - .agents/skills/xrift-public-api
+  - .agents/skills/xrift-public-api/LICENSE
+  - .agents/skills/xrift-public-api/SKILL.md
+  - .agents/skills/xrift-public-api/references/api-reference.md
+  - .agents/skills/xrift-public-api/references/code-templates.md
+  - .agents/skills/xrift-sdk
+  - .agents/skills/xrift-sdk/LICENSE
+  - .agents/skills/xrift-sdk/SKILL.md
+  - .agents/skills/xrift-sdk/references/api-reference.md
+  - .agents/skills/xrift-sdk/references/code-templates.md
+  - .agents/skills/xrift-sdk/references/type-definitions.md
+  - .agents/skills/xrift-world
+  - .agents/skills/xrift-world/LICENSE
+  - .agents/skills/xrift-world/SKILL.md
+  - .agents/skills/xrift-world/references/api-reference.md
+  - .agents/skills/xrift-world/references/code-templates.md
+  - .agents/skills/xrift-world/references/type-definitions.md
+  - .claude/skills/xrift-public-api
+  - .claude/skills/xrift-public-api/LICENSE
+  - .claude/skills/xrift-public-api/SKILL.md
+  - .claude/skills/xrift-public-api/references/api-reference.md
+  - .claude/skills/xrift-public-api/references/code-templates.md
+  - .claude/skills/xrift-sdk
+  - .claude/skills/xrift-sdk/LICENSE
+  - .claude/skills/xrift-sdk/SKILL.md
+  - .claude/skills/xrift-sdk/references/api-reference.md
+  - .claude/skills/xrift-sdk/references/code-templates.md
+  - .claude/skills/xrift-sdk/references/type-definitions.md
+  - .claude/skills/xrift-world
+  - .claude/skills/xrift-world/LICENSE
+  - .claude/skills/xrift-world/SKILL.md
+  - .claude/skills/xrift-world/references/api-reference.md
+  - .claude/skills/xrift-world/references/code-templates.md
+  - .claude/skills/xrift-world/references/type-definitions.md
+  deployed_file_hashes:
+    .agents/skills/xrift-public-api/LICENSE: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+    .agents/skills/xrift-public-api/SKILL.md: sha256:7dcbcd4764825967c02af82895bd0c5a225efc118fe313292a5eb304c9ab25d5
+    .agents/skills/xrift-public-api/references/api-reference.md: sha256:9660583f49f930cf8f8a03cbf96ae6974983548d620a15f21e2fdf9202ea03ad
+    .agents/skills/xrift-public-api/references/code-templates.md: sha256:6487a3fee3aafae4f4f3ad00c829471ba488f8bcc6ce527454c4062aec8c7eb1
+    .agents/skills/xrift-sdk/LICENSE: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+    .agents/skills/xrift-sdk/SKILL.md: sha256:a5b37df1e6c12665c6fb7be31edf25bc3a25e1d8019f42cd1027a642fbf2bab4
+    .agents/skills/xrift-sdk/references/api-reference.md: sha256:21359d1810e1863409ba93201d148607a81004c138e1fe016ce1bbdc214999b6
+    .agents/skills/xrift-sdk/references/code-templates.md: sha256:116fe64ac76b662985401bf8197c2967ab65111f8122ce2200b62212d0272565
+    .agents/skills/xrift-sdk/references/type-definitions.md: sha256:bbb7d8eeee10dedb1c7d4e02d4fe107a0f36e5445756ac9570b3a8c3b8b9700c
+    .agents/skills/xrift-world/LICENSE: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+    .agents/skills/xrift-world/SKILL.md: sha256:fd5d91948921d7af83ec36d0a712ff3432f1a754d57589ad367855eb365a6f3f
+    .agents/skills/xrift-world/references/api-reference.md: sha256:a9428d99789b969623ef1b16a17942e38848aaf0f02947c0d643d952fe051a2d
+    .agents/skills/xrift-world/references/code-templates.md: sha256:5069bad21a7a84663ec1d3dad02973c319841ffa57619a0153d577cf92f030eb
+    .agents/skills/xrift-world/references/type-definitions.md: sha256:b73a139ec99a9e820945a3e5539c186ec41ab7ecb782fe1f4637994ddf93ea1e
+    .claude/skills/xrift-public-api/LICENSE: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+    .claude/skills/xrift-public-api/SKILL.md: sha256:7dcbcd4764825967c02af82895bd0c5a225efc118fe313292a5eb304c9ab25d5
+    .claude/skills/xrift-public-api/references/api-reference.md: sha256:9660583f49f930cf8f8a03cbf96ae6974983548d620a15f21e2fdf9202ea03ad
+    .claude/skills/xrift-public-api/references/code-templates.md: sha256:6487a3fee3aafae4f4f3ad00c829471ba488f8bcc6ce527454c4062aec8c7eb1
+    .claude/skills/xrift-sdk/LICENSE: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+    .claude/skills/xrift-sdk/SKILL.md: sha256:a5b37df1e6c12665c6fb7be31edf25bc3a25e1d8019f42cd1027a642fbf2bab4
+    .claude/skills/xrift-sdk/references/api-reference.md: sha256:21359d1810e1863409ba93201d148607a81004c138e1fe016ce1bbdc214999b6
+    .claude/skills/xrift-sdk/references/code-templates.md: sha256:116fe64ac76b662985401bf8197c2967ab65111f8122ce2200b62212d0272565
+    .claude/skills/xrift-sdk/references/type-definitions.md: sha256:bbb7d8eeee10dedb1c7d4e02d4fe107a0f36e5445756ac9570b3a8c3b8b9700c
+    .claude/skills/xrift-world/LICENSE: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+    .claude/skills/xrift-world/SKILL.md: sha256:fd5d91948921d7af83ec36d0a712ff3432f1a754d57589ad367855eb365a6f3f
+    .claude/skills/xrift-world/references/api-reference.md: sha256:a9428d99789b969623ef1b16a17942e38848aaf0f02947c0d643d952fe051a2d
+    .claude/skills/xrift-world/references/code-templates.md: sha256:5069bad21a7a84663ec1d3dad02973c319841ffa57619a0153d577cf92f030eb
+    .claude/skills/xrift-world/references/type-definitions.md: sha256:b73a139ec99a9e820945a3e5539c186ec41ab7ecb782fe1f4637994ddf93ea1e
+  content_hash: sha256:1e15105255107ba91736e654eeda0d9a13a1bff4179bb9a7bef4cec02a30c1b2
+  carried_licenses:
+  - path: skills/xrift-public-api/LICENSE
+    source: LICENSE
+    hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+  - path: skills/xrift-sdk/LICENSE
+    source: LICENSE
+    hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+  - path: skills/xrift-world/LICENSE
+    source: LICENSE
+    hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+deployments:
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/code-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/code-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/code-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:317faf4ca86c6be6f12f0fa1e08b1f2d768b63e905f0048075ca23c4f6e9dd3c
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/design-policy
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/design-policy/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/design-policy/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:600ffafe5a3351810afbed2190d5eb38456bae6a71089c14a0acf2f6e0aea5bd
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/design-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/design-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/design-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:56a220bc0234c5b3877dcc3594080b7bb3e614ea793f400cd78344b827480179
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/document-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/document-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/document-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:d3b3fa5a0cb622a50b8788767a0558982cca16d1884e9247cc26a34291a3a0b9
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/rust-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/rust-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/rust-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:f7edfcd4a6a8724cf497f945490429fff95ba201c2a4cdc6c18d3ce208174b9a
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/test-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/test-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/test-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:013c4f391ce5affc8d3d2a52b91dbdc796ac646c2772bd24faecdc7a3c918a4e
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/ts-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/ts-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/ts-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:fa96b7f462130fef94554ed1d56cdeeb5758b2c0139eb734c87976b7ee01f05d
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-public-api
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-public-api/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-public-api/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:7dcbcd4764825967c02af82895bd0c5a225efc118fe313292a5eb304c9ab25d5
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-public-api/references/api-reference.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:9660583f49f930cf8f8a03cbf96ae6974983548d620a15f21e2fdf9202ea03ad
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-public-api/references/code-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:6487a3fee3aafae4f4f3ad00c829471ba488f8bcc6ce527454c4062aec8c7eb1
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-sdk
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-sdk/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-sdk/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:a5b37df1e6c12665c6fb7be31edf25bc3a25e1d8019f42cd1027a642fbf2bab4
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-sdk/references/api-reference.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:21359d1810e1863409ba93201d148607a81004c138e1fe016ce1bbdc214999b6
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-sdk/references/code-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:116fe64ac76b662985401bf8197c2967ab65111f8122ce2200b62212d0272565
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-sdk/references/type-definitions.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:bbb7d8eeee10dedb1c7d4e02d4fe107a0f36e5445756ac9570b3a8c3b8b9700c
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-world
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: null
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-world/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-world/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:fd5d91948921d7af83ec36d0a712ff3432f1a754d57589ad367855eb365a6f3f
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-world/references/api-reference.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:a9428d99789b969623ef1b16a17942e38848aaf0f02947c0d643d952fe051a2d
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-world/references/code-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:5069bad21a7a84663ec1d3dad02973c319841ffa57619a0153d577cf92f030eb
+- kind: project-relative
+  target: agent-skills
+  value: .agents/skills/xrift-world/references/type-definitions.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:b73a139ec99a9e820945a3e5539c186ec41ab7ecb782fe1f4637994ddf93ea1e
+- kind: project-relative
+  target: claude
+  value: .claude/agents/advisor.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:5fdd6baafa498ce696e7bb60e4522aadf17deb3242ec25e3e603dc7e7299b66a
+- kind: project-relative
+  target: claude
+  value: .claude/agents/builder.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:fad79f4a6bb4f798a54f0a857fb2442fdbbe95b86fa56ad7b219bd16bf6f95d3
+- kind: project-relative
+  target: claude
+  value: .claude/agents/orchestrator.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:fb229e76cb88d39b1d3b71c5f82c9616d62e1844c81d86351dcd12eb7cfec574
+- kind: project-relative
+  target: claude
+  value: .claude/agents/reviewer.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:b02406c0b1652fccf9c6feb5b2cade566e6e9224620a48e4f068059464aac184
+- kind: project-relative
+  target: claude
+  value: .claude/agents/verifier.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:837674a7298dab92f713f1a609d7b146d423cbcd2d9498469fdb6d4de485b6d0
+- kind: project-relative
+  target: claude
+  value: .claude/skills/code-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/code-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/code-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:317faf4ca86c6be6f12f0fa1e08b1f2d768b63e905f0048075ca23c4f6e9dd3c
+- kind: project-relative
+  target: claude
+  value: .claude/skills/design-policy
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/design-policy/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/design-policy/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:600ffafe5a3351810afbed2190d5eb38456bae6a71089c14a0acf2f6e0aea5bd
+- kind: project-relative
+  target: claude
+  value: .claude/skills/design-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/design-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/design-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:56a220bc0234c5b3877dcc3594080b7bb3e614ea793f400cd78344b827480179
+- kind: project-relative
+  target: claude
+  value: .claude/skills/document-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/document-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/document-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:d3b3fa5a0cb622a50b8788767a0558982cca16d1884e9247cc26a34291a3a0b9
+- kind: project-relative
+  target: claude
+  value: .claude/skills/rust-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/rust-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/rust-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:f7edfcd4a6a8724cf497f945490429fff95ba201c2a4cdc6c18d3ce208174b9a
+- kind: project-relative
+  target: claude
+  value: .claude/skills/test-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/test-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/test-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:013c4f391ce5affc8d3d2a52b91dbdc796ac646c2772bd24faecdc7a3c918a4e
+- kind: project-relative
+  target: claude
+  value: .claude/skills/ts-writing
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/ts-writing/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:25dcf774093912a3112a255edba7c589a27a94e2f889b3521be7d9999326a442
+- kind: project-relative
+  target: claude
+  value: .claude/skills/ts-writing/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:fa96b7f462130fef94554ed1d56cdeeb5758b2c0139eb734c87976b7ee01f05d
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-public-api
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-public-api/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-public-api/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:7dcbcd4764825967c02af82895bd0c5a225efc118fe313292a5eb304c9ab25d5
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-public-api/references/api-reference.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:9660583f49f930cf8f8a03cbf96ae6974983548d620a15f21e2fdf9202ea03ad
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-public-api/references/code-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:6487a3fee3aafae4f4f3ad00c829471ba488f8bcc6ce527454c4062aec8c7eb1
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-sdk
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-sdk/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-sdk/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:a5b37df1e6c12665c6fb7be31edf25bc3a25e1d8019f42cd1027a642fbf2bab4
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-sdk/references/api-reference.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:21359d1810e1863409ba93201d148607a81004c138e1fe016ce1bbdc214999b6
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-sdk/references/code-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:116fe64ac76b662985401bf8197c2967ab65111f8122ce2200b62212d0272565
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-sdk/references/type-definitions.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:bbb7d8eeee10dedb1c7d4e02d4fe107a0f36e5445756ac9570b3a8c3b8b9700c
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-world
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: null
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-world/LICENSE
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:73dec738d6d49a07e506b0d4014ec6a6247c1b50ca6bf8aee62763e81f65f176
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-world/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:fd5d91948921d7af83ec36d0a712ff3432f1a754d57589ad367855eb365a6f3f
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-world/references/api-reference.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:a9428d99789b969623ef1b16a17942e38848aaf0f02947c0d643d952fe051a2d
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-world/references/code-templates.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:5069bad21a7a84663ec1d3dad02973c319841ffa57619a0153d577cf92f030eb
+- kind: project-relative
+  target: claude
+  value: .claude/skills/xrift-world/references/type-definitions.md
+  runtime: null
+  scope: project
+  owners:
+  - webxr-jp/xrift-skills
+  active_owner: webxr-jp/xrift-skills
+  content_hash: sha256:b73a139ec99a9e820945a3e5539c186ec41ab7ecb782fe1f4637994ddf93ea1e
+- kind: project-relative
+  target: opencode
+  value: .opencode/agents/advisor.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:5fdd6baafa498ce696e7bb60e4522aadf17deb3242ec25e3e603dc7e7299b66a
+- kind: project-relative
+  target: opencode
+  value: .opencode/agents/builder.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:fad79f4a6bb4f798a54f0a857fb2442fdbbe95b86fa56ad7b219bd16bf6f95d3
+- kind: project-relative
+  target: opencode
+  value: .opencode/agents/orchestrator.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:fb229e76cb88d39b1d3b71c5f82c9616d62e1844c81d86351dcd12eb7cfec574
+- kind: project-relative
+  target: opencode
+  value: .opencode/agents/reviewer.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:b02406c0b1652fccf9c6feb5b2cade566e6e9224620a48e4f068059464aac184
+- kind: project-relative
+  target: opencode
+  value: .opencode/agents/verifier.md
+  runtime: null
+  scope: project
+  owners:
+  - halby24/agent-common-package
+  active_owner: halby24/agent-common-package
+  content_hash: sha256:837674a7298dab92f713f1a609d7b146d423cbcd2d9498469fdb6d4de485b6d0

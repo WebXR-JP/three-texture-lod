@@ -1,0 +1,40 @@
+{
+  "name": "three-texture-lod",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "three.js向け距離ベース・テクスチャLOD（マテリアルバリアント切替方式）",
+  "module": "./dist/lib/three-texture-lod.js",
+  "types": "./dist/lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib/index.d.ts",
+      "import": "./dist/lib/three-texture-lod.js",
+      "default": "./dist/lib/three-texture-lod.js"
+    }
+  },
+  "sideEffects": false,
+  "files": ["dist/lib"],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:lib": "vite build --config vite.lib.config.ts && tsc -p tsconfig.build.json",
+    "build:all": "pnpm build && pnpm build:lib",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "peerDependencies": {
+    "three": ">=0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.187.0",
+    "lil-gui": "0.21.0",
+    "playwright-core": "1.65.1",
+    "pngjs": "7.0.0",
+    "three": "0.187.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.1"
+  }
+}

@@ -1,0 +1,8 @@
+name: three-texture-lod
+version: 0.1.0
+
+dependencies:
+  apm:
+    - git: git@github.com:halby24/agent-common-package.git
+      ref: main
+    - WebXR-JP/xrift-skills

@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // ライブラリの型宣言だけを出す。デモは含めない。
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "noEmit": false,
+    "outDir": "dist/lib",
+    "rootDir": "src/lib"
+  },
+  "include": ["src/lib"],
+  "exclude": ["src/lib/**/*.test.ts"]
+}

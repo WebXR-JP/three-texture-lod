@@ -10,9 +10,10 @@
  *
  * URLパラメータ:
  * - `?models=A,B,C` 読み込むモデル（既定、A/B/C はサンプル、それ以外は /models/<name>.vrm か URL）
- * - `?avatars=4` 総体数（既定4、最大12。不足分は最適化済みモデルの複製で補う）
+ * - `?avatars=4` 総体数（既定4、最大100。不足分は最適化済みモデルの複製で補う）
  * - `?backend=webgl` WebGL2 バックエンドを強制
  * - `?lod=0` LODを無効化（最密テクスチャのみ）
+ * - `?wander=0` 徘徊を無効化（全員を配置位置に固定）
  * - `?h=0.15` ヒステリシス幅
  * - `?atlas=1024` アトラス解像度
  * - `?auto=0` 自動カメラを停止
@@ -24,12 +25,10 @@ import GUI from 'lil-gui';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   ACESFilmicToneMapping,
-  Mesh,
   PerspectiveCamera,
   Scene,
   SRGBColorSpace,
   Vector3,
-  type Material,
 } from 'three/webgpu';
 import { WebGPURenderer } from 'three/webgpu';
 import {
@@ -44,8 +43,17 @@ import {
   type AvatarHandle,
   type AvatarTemplate,
 } from './avatar.js';
-import { createEnvironment, createLevelRing, setRingLevel } from './environment.js';
+import { createEnvironment, createLevelRings } from './environment.js';
+import { buildSlots } from './layout.js';
 import { createAvatarLabel, type AvatarLabel } from './labels.js';
+import {
+  WANDER_TUNING,
+  applyWander,
+  createWander,
+  setHome,
+  stepWander,
+  type WanderState,
+} from './wander.js';
 
 const canvas = document.getElementById('scene');
 if (!(canvas instanceof HTMLCanvasElement)) {
@@ -61,6 +69,7 @@ let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 1000
 let budgetMB = clampNumber(Math.round(Number(params.get('budget') ?? 0)), 0, 256, 0);
 let lodEnabled = params.get('lod') !== '0';
 let autoCamera = params.get('auto') !== '0';
+let wanderEnabled = params.get('wander') !== '0';
 
 const modelSpecs = (params.get('models') ?? 'A,B,C')
   .split(',')
@@ -68,17 +77,15 @@ const modelSpecs = (params.get('models') ?? 'A,B,C')
   .filter(Boolean);
 // ソース上限は最適化時の一時 WebGLRenderer のため。複製は最適化を再実行しないので無関係。
 const MAX_SOURCES = 4;
-const MAX_AVATARS = 12;
+const MAX_AVATARS = 100;
 // 総体数。不足分は最適化済みモデルの複製で補う。既定4（A,B,C + Aの複製1）。
 const targetAvatars = clampNumber(Math.round(Number(params.get('avatars') ?? 4)), 1, MAX_AVATARS, 4);
 const MAX_LOD_LEVEL = LOD_DISTANCES.length - 1;
 
-const LAYOUT = [
-  { x: 0.9, z: 4.2 },
-  { x: -1.3, z: 1.6 },
-  { x: 1.7, z: -4.0 },
-  { x: -1.5, z: -9.5 },
-] as const;
+// 配置スロットは起動時に一度だけ計算する。先頭4体は固定位置、以降はグリッド。
+const slots = buildSlots(MAX_AVATARS);
+// ラベルは共有の4枚だけ作り、シーン直下に置く。先頭4体の頭上に付ける。
+const MAX_LABELS = 4;
 
 const CAMERA_CENTER = new Vector3(0, 1.05, -3);
 
@@ -127,21 +134,33 @@ console.error = (...args: unknown[]) => {
 // ---------------------------------------------------------------- state
 
 const avatars: AvatarHandle[] = [];
+const walkers: WanderState[] = [];
+const baseYaws: number[] = [];
 const labels: AvatarLabel[] = [];
-const rings: Mesh[] = [];
 // ソースごとの共有元。複製はここに積まず、ハンドルの template で参照する。
 const templates: AvatarTemplate[] = [];
+const rings = createLevelRings(MAX_AVATARS);
+scene.add(rings.mesh);
+for (let index = 0; index < MAX_LABELS; index++) {
+  const label = createAvatarLabel();
+  scene.add(label.sprite);
+  labels.push(label);
+}
 
 let manager = createManager();
 let manualLevel: number | null = null;
 let frame = 0;
 let elapsed = 0;
 let frameTimeMs = 0;
+let updateMs = 0;
 let lastFrameCalls = 0;
 let lastHudAt = 0;
 let lastErrorAt = 0;
 let cameraAngle = 0;
 let busy = false;
+// 体構成が変わったらラベルを即時更新する。12フレーム周期の更新だけでは
+// 追加・削除・配置直後の古い表示が残る。
+let labelsDirty = true;
 
 function createManager(): TextureLodManager {
   return new TextureLodManager({
@@ -166,60 +185,56 @@ function restoreBaseMaterials(): void {
   }
 }
 
+/** アバター名から徘徊乱数の種を作る。同じ名前は同じ初期徘徊になる。 */
+function hashName(name: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < name.length; index++) {
+    hash ^= name.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
 function register(avatar: AvatarHandle, source: boolean): void {
   const slot = layoutSlot(avatars.length);
-  avatar.root.position.set(slot.x, 0, slot.z);
-  scene.add(avatar.root);
-
-  const label = createAvatarLabel();
-  label.sprite.position.set(0, 2.0 + (avatars.length % 2) * 0.28, 0);
-  avatar.root.add(label.sprite);
-
-  const ring = createLevelRing();
-  ring.position.set(slot.x, 0.012, slot.z);
-  scene.add(ring);
-
+  const walker = createWander(slot, hashName(avatar.name));
+  const baseYaw = avatar.root.rotation.y;
   avatars.push(avatar);
-  labels.push(label);
-  rings.push(ring);
+  walkers.push(walker);
+  baseYaws.push(baseYaw);
+  scene.add(avatar.root);
+  applyWander(walker, avatar.root, baseYaw);
+  labelsDirty = true;
   if (source) templates.push(avatar.template);
 
   if (lodEnabled && manualLevel === null) addGroup(avatar);
 }
 
-/** 配置スロット。4体目までは固定レイアウト、5体目以降は奥へ2列で並べる。 */
+/** 配置スロット。先頭4体は固定位置、5体目以降は `slots` のグリッド。 */
 function layoutSlot(index: number): { x: number; z: number } {
-  if (index < LAYOUT.length) return LAYOUT[index];
-  // 5体目以降は奥に4列で並べる。2列だと中央に固まってラベルが重なるため。
-  const extra = index - LAYOUT.length;
-  const row = Math.floor(extra / 4);
-  const column = extra % 4;
-  const xs = [-6.0, -2.0, 2.0, 6.0];
-  return { x: xs[column], z: -13.0 - row * 4.5 };
+  return slots[index];
 }
 
 function layout(): void {
-  for (const [index, avatar] of avatars.entries()) {
-    const slot = layoutSlot(index);
-    avatar.root.position.set(slot.x, 0, slot.z);
-    rings[index].position.set(slot.x, 0.012, slot.z);
+  for (const [index] of avatars.entries()) {
+    setHome(walkers[index], slots[index], wanderEnabled);
+  }
+  labelsDirty = true;
+  if (!wanderEnabled) {
+    for (const [index, avatar] of avatars.entries()) {
+      applyWander(walkers[index], avatar.root, baseYaws[index]);
+    }
   }
 }
 
 /**
- * 最もインスタンスが少ないテンプレートを複製して1体増やす。
+ * 最もインスタンスが少ないテンプレートを複製して1体増やす。トーストも配置もしない。
  *
  * @returns 追加できたら true。上限到達やソース無しでは false。
  */
-function addClone(): boolean {
-  if (avatars.length >= MAX_AVATARS) {
-    showToast(`複製は最大 ${MAX_AVATARS} 体までです`);
-    return false;
-  }
-  if (templates.length === 0) {
-    showToast('複製元のモデルがありません');
-    return false;
-  }
+function spawnOne(): boolean {
+  if (avatars.length >= MAX_AVATARS) return false;
+  if (templates.length === 0) return false;
   let target = templates[0];
   let count = Infinity;
   for (const template of templates) {
@@ -231,17 +246,16 @@ function addClone(): boolean {
   }
   const clone = instantiateAvatar(target, uniqueName(target.name));
   register(clone, false);
-  layout();
-  showToast(`${clone.name} を複製しました（${avatars.length}体）`);
   return true;
 }
 
 /**
- * 最後の複製を1体削除する。テクスチャ・マテリアルは共有のため破棄しない。
+ * 最後の複製を1体削除する。トーストも配置もしない。
+ * テクスチャ・マテリアルは共有のため破棄しない。
  *
- * @returns 削除できたら true。複製が無ければ false。
+ * @returns 削除したハンドル。複製が無ければ null。
  */
-function removeClone(): boolean {
+function despawnLastClone(): AvatarHandle | null {
   for (let index = avatars.length - 1; index >= 0; index--) {
     if (!avatars[index].isClone) continue;
     const avatar = avatars[index];
@@ -257,22 +271,99 @@ function removeClone(): boolean {
     });
     for (const skeleton of skeletons) skeleton.dispose();
     scene.remove(avatar.root);
-    const label = labels[index];
-    label.sprite.material.map?.dispose();
-    label.sprite.material.dispose();
-    const ring = rings[index];
-    scene.remove(ring);
-    ring.geometry.dispose();
-    (ring.material as Material).dispose();
     avatars.splice(index, 1);
-    labels.splice(index, 1);
-    rings.splice(index, 1);
-    layout();
-    showToast(`${avatar.name} を削除しました（${avatars.length}体）`);
-    return true;
+    walkers.splice(index, 1);
+    baseYaws.splice(index, 1);
+    labelsDirty = true;
+    return avatar;
   }
-  showToast('削除できる複製がありません');
-  return false;
+  return null;
+}
+
+function syncAvatarCount(): void {
+  guiState.avatarCount = avatars.length;
+}
+
+/**
+ * 最もインスタンスが少ないテンプレートを複製して1体増やす。
+ *
+ * @returns 追加できたら true。上限到達やソース無しでは false。
+ */
+function addClone(): boolean {
+  if (busy) {
+    showToast('読み込み中は体数を変更できません');
+    return false;
+  }
+  if (avatars.length >= MAX_AVATARS) {
+    showToast(`複製は最大 ${MAX_AVATARS} 体までです`);
+    return false;
+  }
+  if (templates.length === 0) {
+    showToast('複製元のモデルがありません');
+    return false;
+  }
+  if (!spawnOne()) return false;
+  layout();
+  syncAvatarCount();
+  showToast(`${avatars[avatars.length - 1].name} を複製しました（${avatars.length}体）`);
+  return true;
+}
+
+/**
+ * 最後の複製を1体削除する。テクスチャ・マテリアルは共有のため破棄しない。
+ *
+ * @returns 削除できたら true。複製が無ければ false。
+ */
+function removeClone(): boolean {
+  const avatar = despawnLastClone();
+  if (!avatar) {
+    showToast('削除できる複製がありません');
+    return false;
+  }
+  layout();
+  syncAvatarCount();
+  showToast(`${avatar.name} を削除しました（${avatars.length}体）`);
+  return true;
+}
+
+/**
+ * 総体数を一度に変える。配置とトーストは最後に1回だけ行う。
+ *
+ * @param n - 目標体数。ソース数未満には減らず、上限を超えない。
+ * @returns 変更後の実際の体数。
+ */
+function setAvatarCount(n: number): number {
+  if (busy) {
+    showToast('読み込み中は体数を変更できません');
+    return avatars.length;
+  }
+  const rounded = Math.round(n);
+  if (!Number.isFinite(rounded) || templates.length === 0) return avatars.length;
+  const target = Math.max(templates.length, Math.min(MAX_AVATARS, rounded));
+  while (avatars.length < target) {
+    if (!spawnOne()) break;
+  }
+  while (avatars.length > target) {
+    if (!despawnLastClone()) break;
+  }
+  layout();
+  syncAvatarCount();
+  showToast(`体数を ${avatars.length} にしました`);
+  return avatars.length;
+}
+
+/** 徘徊の有効・無効を切り替える。無効では全員を配置位置に固定する。 */
+function setWanderEnabled(on: boolean): void {
+  wanderEnabled = on;
+  guiState.wander = on;
+  for (const [index, avatar] of avatars.entries()) {
+    setHome(walkers[index], slots[index], on);
+    if (!on) {
+      applyWander(walkers[index], avatar.root, baseYaws[index]);
+      // ソースの SpringBone を止め、徘徊再開時の跳ねを抑える。
+      avatar.vrm?.springBoneManager?.reset();
+    }
+  }
 }
 
 function uniqueName(base: string): string {
@@ -525,6 +616,14 @@ async function addFromFile(file: File): Promise<void> {
       hysteresis,
       onProgress: (message) => setLoading(message, 0.6),
     });
+    // 読み込み中に体数が上限へ達したら、配置せず破棄する（slots の範囲外参照を防ぐ）。
+    if (avatars.length >= MAX_AVATARS) {
+      // 所有はテンプレートのため、ハンドルの disposeVariants では何も起きない。
+      avatar.template.disposeVariants();
+      showToast(`アバターは最大 ${MAX_AVATARS} 体までです`);
+      hideLoading();
+      return;
+    }
     register(avatar, true);
     layout();
     appendLog(`${name}: 追加しました`);
@@ -570,6 +669,11 @@ try {
   while (avatars.length < targetAvatars && templates.length > 0) {
     const template = templates[avatars.length % templates.length];
     register(instantiateAvatar(template, uniqueName(template.name)), false);
+    if (avatars.length % 8 === 0 || avatars.length >= targetAvatars) {
+      appendLog(`複製中 ${avatars.length}/${targetAvatars}`);
+      setLoading(`複製中 ${avatars.length}/${targetAvatars}`, avatars.length / targetAvatars);
+      await nextFrame();
+    }
   }
   if (avatars.length === 0) {
     throw new Error(
@@ -600,6 +704,8 @@ const guiState = {
   evictDelayMs,
   budgetMB,
   autoCamera,
+  avatarCount: avatars.length,
+  wander: wanderEnabled,
   forceLevel: 'auto' as 'auto' | '0' | '1' | '2' | '3',
   add: pickFile,
   addClone,
@@ -676,6 +782,16 @@ gui
     setForceLevel(value === 'auto' ? null : Number(value));
   })
   .listen();
+gui
+  .add(guiState, 'avatarCount', 1, MAX_AVATARS, 1)
+  .name('体数')
+  .onFinishChange(setAvatarCount)
+  .listen();
+gui
+  .add(guiState, 'wander')
+  .name('うろちょろ')
+  .onChange(setWanderEnabled)
+  .listen();
 gui.add(guiState, 'add').name('VRMを追加');
 gui.add(guiState, 'addClone').name('複製を追加');
 gui.add(guiState, 'removeClone').name('複製を削除');
@@ -726,26 +842,41 @@ function levelOfAvatar(index: number): number | null {
 const labelWorldPosition = new Vector3();
 
 function updateVisuals(): void {
-  const updateLabels = frame % 12 === 0;
-  for (const [index, avatar] of avatars.entries()) {
-    const level = levelOfAvatar(index);
-    setRingLevel(rings[index], level);
+  const updateLabels = labelsDirty || frame % 12 === 0;
+  for (let index = 0; index < avatars.length; index++) {
+    rings.set(index, walkers[index].x, walkers[index].z, levelOfAvatar(index));
+  }
+  rings.setCount(avatars.length);
+  rings.commit();
 
-    // 体数が多いときは全ラベルを出すと重なるため、先頭4体だけ表示する。
-    // 残りはHUDのアバター行で名前・レベル・距離を確認できる。
-    labels[index].sprite.visible = index < 4;
+  // 共有ラベル4枚を先頭4体の頭上に置く。残りの体はHUDのアバター行で確認する。
+  const labeled = Math.min(labels.length, avatars.length);
+  for (let index = 0; index < labels.length; index++) {
+    const label = labels[index];
+    if (index >= labeled) {
+      label.sprite.visible = false;
+      continue;
+    }
+    const avatar = avatars[index];
+    label.sprite.visible = true;
+    label.sprite.position.set(
+      avatar.root.position.x,
+      avatar.root.position.y + 2.0 + (index % 2) * 0.28,
+      avatar.root.position.z,
+    );
 
     // ラベルは距離に比例して大きくし、画面上の見かけの大きさを一定に保つ。
-    labels[index].sprite.getWorldPosition(labelWorldPosition);
+    label.sprite.getWorldPosition(labelWorldPosition);
     const cameraDistance = camera.position.distanceTo(labelWorldPosition);
     const width = Math.min(3.6, Math.max(0.7, cameraDistance * 0.26));
-    labels[index].sprite.scale.set(width, width / 4.44, 1);
+    label.sprite.scale.set(width, width / 4.44, 1);
 
-    if (updateLabels && index < 4) {
+    if (updateLabels) {
       const distance = computeLodDistance(avatar.anchor, camera, 'surface');
-      labels[index].set(`${avatar.name} ${distance.toFixed(1)}m`, level);
+      label.set(`${avatar.name} ${distance.toFixed(1)}m`, levelOfAvatar(index));
     }
   }
+  labelsDirty = false;
 }
 
 function updateHud(): void {
@@ -773,13 +904,14 @@ function updateHud(): void {
   const levelText = [0, 1, 2, 3].map((level) => `L${level} ${counts[level] ?? 0}`).join('  ');
   const pipelines = pipelineInfo();
   const resident = manualLevel !== null || !lodEnabled ? atlasBytes : stats.residentBytes;
-  const rows = avatars.map((avatar, index) => {
+  const rows = avatars.slice(0, 12).map((avatar, index) => {
     const level = levelOfAvatar(index);
     const distance = computeLodDistance(avatar.anchor, camera, 'surface');
-    return `  ${avatar.name.padEnd(4)} ${level === null ? '--' : `L${level}`}  ${distance
+    return `  ${avatar.name.padEnd(6)} ${level === null ? '--' : `L${level}`}  ${distance
       .toFixed(1)
       .padStart(5)}m`;
   });
+  if (avatars.length > 12) rows.push(`  … +${avatars.length - 12} more`);
 
   hudBodyEl.textContent = [
     `backend   ${backendName()}`,
@@ -788,7 +920,7 @@ function updateHud(): void {
     `meshes    ${before.meshes} → ${after.meshes}  (rendered ${renderedMeshes})`,
     `materials ${before.materials} → ${after.materials}`,
     `atlas     ${(atlasBytes / 1048576).toFixed(1)} MB (full)`,
-    `LOD       ${lodEnabled ? 'on' : 'off'}  ${residency}  h=${hysteresis.toFixed(2)}`,
+    `LOD       ${lodEnabled ? 'on' : 'off'}  ${residency}  h=${hysteresis.toFixed(2)}  wander ${wanderEnabled ? 'on' : 'off'}`,
     `levels    ${lodEnabled ? levelText : 'full resolution'}`,
     lodEnabled &&
     manualLevel === null &&
@@ -803,7 +935,7 @@ function updateHud(): void {
             ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (manual)`
             : `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)`,
     `switch    ${stats.switchCount}   pipelines ${pipelines.caches}/${pipelines.fragmentPrograms}`,
-    `frame     ${frameTimeMs.toFixed(2)}ms  calls ${lastFrameCalls}`,
+    `frame     ${frameTimeMs.toFixed(2)}ms upd ${updateMs.toFixed(2)}ms calls ${lastFrameCalls}`,
     '',
     ...rows,
   ].join('\n');
@@ -813,19 +945,28 @@ let lastTime = performance.now();
 
 function animate(now: number): void {
   try {
-    const delta = Math.min(0.05, (now - lastTime) / 1000);
+    const rawDelta = (now - lastTime) / 1000;
+    const delta = Math.min(0.05, rawDelta);
     lastTime = now;
     elapsed += delta;
-    frameTimeMs += (delta * 1000 - frameTimeMs) * 0.1;
+    // 平滑化には上限前の生 delta を使い、重いフレームの遅さを隠さない。
+    frameTimeMs += (rawDelta * 1000 - frameTimeMs) * 0.1;
 
+    const updateStart = performance.now();
     environment.update(delta);
-    for (const avatar of avatars) avatar.update(delta);
+    for (let index = 0; index < avatars.length; index++) {
+      const avatar = avatars[index];
+      avatar.update(delta);
+      if (wanderEnabled) stepWander(walkers[index], delta);
+      applyWander(walkers[index], avatar.root, baseYaws[index]);
+    }
     updateAutoCamera(delta);
 
     if (manualLevel !== null) applyManualLevel();
     else if (lodEnabled) manager.update(camera);
 
     updateVisuals();
+    updateMs += (performance.now() - updateStart - updateMs) * 0.1;
     if (now - lastHudAt > 250) {
       updateHud();
       lastHudAt = now;
@@ -883,6 +1024,9 @@ const api = {
       evictDelayMs,
       budgetMB,
       manualLevel,
+      wander: wanderEnabled,
+      wanderRadius: WANDER_TUNING.radius,
+      ringCount: rings.mesh.count,
       loadFailures: [...loadFailures],
       sourceCount: templates.length,
       cloneCount: avatars.length - templates.length,
@@ -892,6 +1036,8 @@ const api = {
         isClone: avatar.isClone,
         level: levelOfAvatar(index),
         distance: computeLodDistance(avatar.anchor, camera, 'surface'),
+        position: { x: avatar.root.position.x, z: avatar.root.position.z },
+        home: { x: walkers[index].homeX, z: walkers[index].homeZ },
         meshes: avatar.meshes.length,
         materials: avatar.template.sets.length,
         optimizeMs: avatar.stats.optimizeMs,
@@ -902,11 +1048,15 @@ const api = {
         after: avatar.stats.after,
       })),
       manager: manager.stats(),
+      levelCounts: [0, 1, 2, 3].map(
+        (level) => avatars.filter((_, index) => levelOfAvatar(index) === level).length,
+      ),
       pipelineCaches: pipeline.caches,
       fragmentPrograms: pipeline.fragmentPrograms,
       drawCalls: lastFrameCalls,
       textureCount: renderer.info.memory.textures,
       frameTimeMs,
+      updateMs,
       errors: [...errors],
     };
   },
@@ -922,6 +1072,7 @@ const api = {
   setAvatarSurfaceDistance,
   addClone,
   removeClone,
+  setAvatarCount,
   setSettings(partial: {
     hysteresis?: number;
     residency?: ResidencyMode;
@@ -930,6 +1081,7 @@ const api = {
     lodEnabled?: boolean;
     forceLevel?: number | null;
     autoCamera?: boolean;
+    wander?: boolean;
   }) {
     // 破壊的な適用の前に、単体で検証できる値を弾く。
     if (partial.hysteresis !== undefined && !(partial.hysteresis >= 0 && partial.hysteresis < 1)) {
@@ -948,6 +1100,9 @@ const api = {
       partial.budgetMB !== undefined &&
       (!Number.isFinite(partial.budgetMB) || partial.budgetMB < 0 || partial.budgetMB > 256)
     ) {
+      return false;
+    }
+    if (partial.wander !== undefined && typeof partial.wander !== 'boolean') {
       return false;
     }
     if (partial.hysteresis !== undefined) {
@@ -982,6 +1137,9 @@ const api = {
         controls.target.copy(CAMERA_CENTER);
         controls.update();
       }
+    }
+    if (partial.wander !== undefined) {
+      setWanderEnabled(partial.wander);
     }
     if (partial.forceLevel !== undefined) {
       if (

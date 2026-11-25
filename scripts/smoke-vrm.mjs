@@ -34,6 +34,12 @@ function sleep(ms) {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
+/** 2つの quaternion のなす角（rad）。同一姿勢なら 0 になる。 */
+function quatAngle(a, b) {
+  const dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  return 2 * Math.acos(Math.min(1, Math.abs(dot)));
+}
+
 async function waitFor(page, predicate, arg, timeoutMs = 20000) {
   await page.waitForFunction(predicate, arg, { timeout: timeoutMs, polling: 100 });
 }
@@ -288,7 +294,7 @@ async function checkFourSources(browser, backend) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?models=A,B,C,A&avatars=4&auto=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?models=A,B,C,A&avatars=4&auto=0&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -367,7 +373,7 @@ async function checkInstances(browser, backend, config) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?${query}${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?${query}&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -436,20 +442,24 @@ async function checkInstances(browser, backend, config) {
     result.brightness = await screenshot(page, `${backend}-${slug}.png`);
 
     // 複製は raw 頭ボーンを揺らす（normalized ボーンでは skinning に反映されない）。
-    const head0 = await page.evaluate((i) => window.__vrmDemo.cloneHeadQuaternion(i), cloneIndex);
+    // sin 波のピーク付近では1点比較が停滞するため、1秒間5サンプルで最大差を見る。
+    const headSamples = [];
+    for (let i = 0; i < 5; i++) {
+      if (i > 0) await sleep(250);
+      headSamples.push(
+        await page.evaluate((idx) => window.__vrmDemo.cloneHeadQuaternion(idx), cloneIndex),
+      );
+    }
     const inSkeleton = await page.evaluate((i) => window.__vrmDemo.cloneHeadInSkeleton(i), cloneIndex);
-    await sleep(450);
-    const head1 = await page.evaluate((i) => window.__vrmDemo.cloneHeadQuaternion(i), cloneIndex);
     assert(
-      Array.isArray(head0) && Array.isArray(head1),
-      `${backend} (${slug}): 頭ボーン quaternion が取れない: ${JSON.stringify(head0)} / ${JSON.stringify(head1)}`,
+      headSamples.every((sample) => Array.isArray(sample)),
+      `${backend} (${slug}): 頭ボーン quaternion が取れない: ${JSON.stringify(headSamples)}`,
     );
-    const dot =
-      head0[0] * head1[0] + head0[1] * head1[1] + head0[2] * head1[2] + head0[3] * head1[3];
-    const angle = 2 * Math.acos(Math.min(1, Math.abs(dot)));
+    const angles = headSamples.map((sample) => quatAngle(headSamples[0], sample));
+    const maxAngle = Math.max(...angles);
     assert(inSkeleton === true, `${backend} (${slug}): raw 頭ボーンが SkinnedMesh の skeleton に無い`);
-    assert(angle > 1e-3, `${backend} (${slug}): 頭ボーンの回転差が小さすぎる: ${angle}`);
-    result.headMotion = { before: head0, after: head1, angle, inSkeleton };
+    assert(maxAngle > 1e-3, `${backend} (${slug}): 頭ボーンの回転差が小さすぎる: ${maxAngle}`);
+    result.headMotion = { samples: headSamples, angles, maxAngle, inSkeleton };
 
     // GUIボタンと同じAPIで追加・削除ができ、マネージャのグループ数も追従すること。
     const added = await page.evaluate(() => window.__vrmDemo.addClone());
@@ -516,7 +526,7 @@ async function checkBudget(browser, backend) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?auto=0&evictDelay=5000&budget=32${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?auto=0&evictDelay=5000&budget=32&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -636,6 +646,207 @@ async function checkBudget(browser, backend) {
   return result;
 }
 
+async function checkCrowd(browser, backend) {
+  const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+  const messages = [];
+  page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  const result = { backend, ok: false };
+  try {
+    const loadedAt = Date.now();
+    await page.goto(
+      `${BASE_URL}/vrm.html?models=A,B,C&avatars=100&auto=0&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      { waitUntil: 'load' },
+    );
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 300000 },
+    );
+    result.loadMs = Date.now() - loadedAt;
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    result.status = status;
+    if (status !== 'ready') {
+      assert(false, `${backend} (crowd): デモが ready にならなかった（status=${status}）`);
+      return result;
+    }
+    // evictDelay(既定1000ms) 後の常駐量まで待ってから測る。
+    await waitFrames(page, 20);
+    await sleep(1400);
+    const stats = await statsOf(page);
+    result.stats = stats;
+    assert(stats.avatars.length === 100, `${backend} (crowd): アバター数が ${stats.avatars.length}`);
+    assert(stats.sourceCount === 3, `${backend} (crowd): sourceCount が ${stats.sourceCount}`);
+    assert(stats.cloneCount === 97, `${backend} (crowd): cloneCount が ${stats.cloneCount}`);
+    assert(stats.manager.objectCount === 100, `${backend} (crowd): objectCount が ${stats.manager.objectCount}`);
+    assert(stats.ringCount === 100, `${backend} (crowd): ringCount が ${stats.ringCount}`);
+    assert(
+      stats.avatars.slice(0, 4).map((avatar) => avatar.level).join(',') === '0,1,2,3',
+      `${backend} (crowd): 先頭4体のレベルが ${stats.avatars.slice(0, 4).map((avatar) => avatar.level).join(',')}`,
+    );
+    const levelSum = stats.levelCounts.reduce((sum, count) => sum + count, 0);
+    assert(levelSum === 100, `${backend} (crowd): levelCounts の合計が ${levelSum}`);
+    assert(stats.levelCounts[3] >= 80, `${backend} (crowd): L3 が ${stats.levelCounts[3]} 体しかない`);
+    assert(stats.errors.length === 0, `${backend} (crowd): stats.errors ${stats.errors.join(' | ')}`);
+    assert(stats.wander === false, `${backend} (crowd): wander が ${stats.wander}`);
+    const fullAtlas = stats.avatars.reduce((sum, avatar) => sum + avatar.atlasBytes, 0);
+    result.resident = stats.manager.residentBytes;
+    result.fullAtlas = fullAtlas;
+    assert(
+      stats.manager.residentBytes < fullAtlas * 1.5,
+      `${backend} (crowd): 常駐量が全アトラスの1.5倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
+    );
+
+    // 静止時の性能を3秒間記録する。
+    const still = [];
+    for (let i = 0; i < 3; i++) {
+      await sleep(1000);
+      const sample = await statsOf(page);
+      still.push({
+        frameTimeMs: sample.frameTimeMs,
+        updateMs: sample.updateMs,
+        drawCalls: sample.drawCalls,
+        pipelineCaches: sample.pipelineCaches,
+      });
+    }
+    result.perfStill = {
+      frameTimeMs: still.reduce((sum, sample) => sum + sample.frameTimeMs, 0) / still.length,
+      updateMs: still.reduce((sum, sample) => sum + sample.updateMs, 0) / still.length,
+      drawCalls: still[still.length - 1].drawCalls,
+      pipelineCaches: still[still.length - 1].pipelineCaches,
+    };
+
+    // 徘徊を有効化する。2秒待って9割以上が動き出すこと。
+    const wanderSetAt = Date.now();
+    const setWanderOk = await page.evaluate(() => window.__vrmDemo.setSettings({ wander: true }));
+    assert(setWanderOk === true, `${backend} (crowd): setSettings({ wander: true }) が false`);
+    await sleep(2000);
+    const movedFraction = () =>
+      page.evaluate(() => {
+        const demo = window.__vrmDemo.stats();
+        const moved = demo.avatars.filter(
+          (avatar) =>
+            Math.hypot(avatar.position.x - avatar.home.x, avatar.position.z - avatar.home.z) > 0.01,
+        ).length;
+        return moved / demo.avatars.length;
+      });
+    let moved = await movedFraction();
+    // 重い環境では2秒でシミュレーションが進まないため、最大30秒まで待つ。
+    while (moved < 0.9 && Date.now() - wanderSetAt < 30000) {
+      await sleep(500);
+      moved = await movedFraction();
+    }
+    result.wanderWaitMs = Date.now() - wanderSetAt;
+    result.movedFraction = moved;
+    assert(moved >= 0.9, `${backend} (crowd): 移動した体が ${Math.round(moved * 100)}% しかない`);
+
+    const wandering = await statsOf(page);
+    assert(wandering.wander === true, `${backend} (crowd): wander が有効になっていない`);
+    const maxOff = Math.max(
+      ...wandering.avatars.map((avatar) =>
+        Math.hypot(avatar.position.x - avatar.home.x, avatar.position.z - avatar.home.z),
+      ),
+    );
+    result.maxOffHome = maxOff;
+    assert(
+      wandering.avatars.every(
+        (avatar) =>
+          Math.hypot(avatar.position.x - avatar.home.x, avatar.position.z - avatar.home.z) <= 0.75,
+      ),
+      `${backend} (crowd): home からの最大距離が 0.75 を超えた: ${maxOff}`,
+    );
+
+    // 0.25秒おきに5回、2体間の最小間隔を確認する。
+    let minGap = Infinity;
+    for (let i = 0; i < 5; i++) {
+      const sample = await statsOf(page);
+      const points = sample.avatars.map((avatar) => avatar.position);
+      let local = Infinity;
+      for (let a = 0; a < points.length; a++) {
+        for (let b = a + 1; b < points.length; b++) {
+          const gap = Math.hypot(points[a].x - points[b].x, points[a].z - points[b].z);
+          if (gap < local) local = gap;
+        }
+      }
+      if (local < minGap) minGap = local;
+      await sleep(250);
+    }
+    result.minGap = minGap;
+    assert(minGap >= 0.4, `${backend} (crowd): 2体間の最小間隔が ${minGap}`);
+    const wanderPerf = await statsOf(page);
+    result.perfWander = {
+      frameTimeMs: wanderPerf.frameTimeMs,
+      updateMs: wanderPerf.updateMs,
+      drawCalls: wanderPerf.drawCalls,
+      pipelineCaches: wanderPerf.pipelineCaches,
+    };
+
+    // 徘徊を止めると全員が home に戻る（レベルは確認しない）。
+    await page.evaluate(() => window.__vrmDemo.setSettings({ wander: false }));
+    await waitFrames(page, 6);
+    const settled = await statsOf(page);
+    const maxHomeError = Math.max(
+      ...settled.avatars.map((avatar) =>
+        Math.hypot(avatar.position.x - avatar.home.x, avatar.position.z - avatar.home.z),
+      ),
+    );
+    result.maxHomeError = maxHomeError;
+    assert(
+      settled.avatars.every(
+        (avatar) =>
+          Math.abs(avatar.position.x - avatar.home.x) < 1e-6 &&
+          Math.abs(avatar.position.z - avatar.home.z) < 1e-6,
+      ),
+      `${backend} (crowd): 停止後に home へ戻っていない体がある（最大誤差 ${maxHomeError}）`,
+    );
+
+    // 体数の一括変更。往復してもパイプラインは増えないこと。
+    const to4At = Date.now();
+    const to4 = await page.evaluate(() => window.__vrmDemo.setAvatarCount(4));
+    result.setAvatarCount4Ms = Date.now() - to4At;
+    await waitFrames(page, 6);
+    const stats4 = await statsOf(page);
+    assert(to4 === 4, `${backend} (crowd): setAvatarCount(4) が ${to4} を返した`);
+    assert(stats4.avatars.length === 4, `${backend} (crowd): 4体化後に ${stats4.avatars.length} 体`);
+    assert(stats4.manager.objectCount === 4, `${backend} (crowd): 4体化後の objectCount が ${stats4.manager.objectCount}`);
+    assert(stats4.ringCount === 4, `${backend} (crowd): 4体化後の ringCount が ${stats4.ringCount}`);
+
+    const to100At = Date.now();
+    const to100 = await page.evaluate(() => window.__vrmDemo.setAvatarCount(100));
+    result.setAvatarCount100Ms = Date.now() - to100At;
+    await waitFrames(page, 6);
+    const stats100 = await statsOf(page);
+    assert(to100 === 100, `${backend} (crowd): setAvatarCount(100) が ${to100} を返した`);
+    assert(stats100.avatars.length === 100, `${backend} (crowd): 100体化後に ${stats100.avatars.length} 体`);
+    assert(stats100.manager.objectCount === 100, `${backend} (crowd): 100体化後の objectCount が ${stats100.manager.objectCount}`);
+    assert(stats100.ringCount === 100, `${backend} (crowd): 100体化後の ringCount が ${stats100.ringCount}`);
+    assert(
+      stats100.pipelineCaches <= stats.pipelineCaches,
+      `${backend} (crowd): 体数往復で pipelineCaches が増えた: ${stats.pipelineCaches} → ${stats100.pipelineCaches}`,
+    );
+    assert(stats100.errors.length === 0, `${backend} (crowd): 体数往復後に errors ${stats100.errors.join(' | ')}`);
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    const noise = messages.filter((message) =>
+      /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+    );
+    result.consoleErrors = consoleErrors;
+    result.webgpuNoise = noise;
+    assert(consoleErrors.length === 0, `${backend} (crowd): コンソールエラー ${consoleErrors.join(' | ')}`);
+    assert(noise.length === 0, `${backend} (crowd): GPU関連の警告 ${noise.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (crowd): 例外: ${String(error)}`);
+  } finally {
+    result.messages = messages.slice(-20);
+    await page.close();
+  }
+  return result;
+}
+
 async function checkBackend(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
@@ -647,7 +858,7 @@ async function checkBackend(browser, backend) {
   const result = { backend, ok: false, messages: [] };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&h=0.15${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&h=0.15&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -837,10 +1048,19 @@ async function main() {
         await budgetBrowser.close();
       }
 
+      const crowdBrowser = await launchBrowser();
+      let crowd;
+      try {
+        crowd = await checkCrowd(crowdBrowser, backend);
+      } finally {
+        await crowdBrowser.close();
+      }
+
       single.fourSources = fourSources;
       single.default = defaultPage;
       single.clones = clones;
       single.budget = budget;
+      single.crowd = crowd;
       single.ok = failures.length === 0;
       results.push(single);
     }

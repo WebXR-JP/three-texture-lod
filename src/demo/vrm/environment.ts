@@ -9,10 +9,13 @@ import {
   Color,
   DirectionalLight,
   DoubleSide,
+  DynamicDrawUsage,
   Fog,
   GridHelper,
   Group,
   HemisphereLight,
+  InstancedMesh,
+  Matrix4,
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
@@ -74,27 +77,72 @@ function createBackdropTexture(): CanvasTexture {
   return texture;
 }
 
-/** 足元のレベルリング。 */
-export function createLevelRing(): Mesh {
+/** 足元のレベルリングを1つの InstancedMesh で描く束ね役。 */
+export interface LevelRings {
+  /** 全体数ぶんのインスタンスを持つメッシュ。`count` で表示数を絞る。 */
+  readonly mesh: InstancedMesh;
+  /** 表示数を体数に合わせる。次フレームの描画に反映される。 */
+  setCount(n: number): void;
+  /**
+   * 体番号のリング位置と色を積む。行列は純粋な平行移動にする。
+   *
+   * @param index - 体番号。`capacity` 未満であること。
+   * @param x - リング中心の x 座標（メートル）。
+   * @param z - リング中心の z 座標（メートル）。
+   * @param level - LODレベル。`null` はLOD無効時の色になる。
+   */
+  set(index: number, x: number, z: number, level: number | null): void;
+  /** 積んだ行列と色を GPU へ反映する。 */
+  commit(): void;
+}
+
+/** リング中心の高さ（メートル）。床との z ファイティングを避ける。 */
+const RING_Y = 0.012;
+
+/**
+ * 指定容量のリング束ねを作る。`count = 0` から始め、呼び出し側が `set` 後に `commit` する。
+ *
+ * @param capacity - 最大体数。1 未満でも1枠だけ確保する。
+ */
+export function createLevelRings(capacity: number): LevelRings {
   const geometry = new RingGeometry(0.52, 0.62, 64);
+  // リングの向き（-π/2）は共有ジオメトリ側に焼き付ける。インスタンス行列は
+  // メッシュのローカル空間で合成されるため、メッシュ側に回転を持たせると
+  // 平行移動まで回って中心がずれる。行列は純粋な平行移動に保つ。
+  // ADR: 設計書の `ring.rotation.x = -π/2` と等価な見え方にするための措置。
+  geometry.rotateX(-Math.PI / 2);
   const material = new MeshBasicMaterial({
-    color: levelColor(null).clone(),
+    color: new Color('#ffffff'),
     transparent: true,
     opacity: 0.9,
     side: DoubleSide,
     depthWrite: false,
   });
-  const ring = new Mesh(geometry, material);
-  ring.rotation.x = -Math.PI / 2;
-  ring.position.y = 0.012;
-  ring.renderOrder = 1;
-  return ring;
-}
-
-/** リングの色をレベルに合わせる。 */
-export function setRingLevel(ring: Mesh, level: number | null): void {
-  const material = ring.material as MeshBasicMaterial;
-  material.color.copy(levelColor(level));
+  const mesh = new InstancedMesh(geometry, material, Math.max(1, capacity));
+  mesh.instanceMatrix.setUsage(DynamicDrawUsage);
+  // instanceColor は後付けで確保すると WebGPU に反映されない恐れがあるため、
+  // 生成直後に全枠へ白を入れて初期化する。
+  const white = new Color('#ffffff');
+  for (let index = 0; index < Math.max(1, capacity); index++) mesh.setColorAt(index, white);
+  mesh.count = 0;
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 1;
+  const matrix = new Matrix4();
+  return {
+    mesh,
+    setCount(n: number): void {
+      mesh.count = n;
+    },
+    set(index: number, x: number, z: number, level: number | null): void {
+      matrix.makeTranslation(x, RING_Y, z);
+      mesh.setMatrixAt(index, matrix);
+      mesh.setColorAt(index, levelColor(level));
+    },
+    commit(): void {
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    },
+  };
 }
 
 export function createEnvironment(scene: Scene): Environment {

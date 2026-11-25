@@ -15,7 +15,7 @@
  * - `?lod=0` LODを無効化（最密テクスチャのみ）
  * - `?wander=0` 徘徊を無効化（全員を配置位置に固定）
  * - `?h=0.15` ヒステリシス幅
- * - `?atlas=1024` アトラス解像度
+ * - `?atlas=1024` アトラス解像度（256〜4096、既定1024）
  * - `?auto=0` 自動カメラを停止
  * - `?residency=keep-all` 常駐モード
  * - `?evictDelay=1000` evict の猶予ms
@@ -62,7 +62,7 @@ if (!(canvas instanceof HTMLCanvasElement)) {
 
 const params = new URLSearchParams(location.search);
 const forceWebGL = params.get('backend') === 'webgl';
-const atlasResolution = clampNumber(Number(params.get('atlas') ?? 1024), 256, 2048, 1024);
+const atlasResolution = clampNumber(Math.round(Number(params.get('atlas') ?? 1024)), 256, 4096, 1024);
 let hysteresis = clampNumber(Number(params.get('h') ?? 0.15), 0, 0.3, 0.15);
 let residency: ResidencyMode = params.get('residency') === 'keep-all' ? 'keep-all' : 'evict';
 let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 10000, 1000);

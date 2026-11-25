@@ -120,7 +120,8 @@ stateDiagram-v2
 | `hysteresis` | `0.1` | 境界付近のちらつき抑止幅。`0` で単調なしきい値判定になる |
 | `distanceMode` | `'surface'` | `'surface'` は球半径を差し引く。大きな板が目の前にあっても粗LODに落ちない |
 | `residency` | `'evict'` | `'evict'` は未使用テクスチャを破棄、`'keep-all'` は全保持 |
-| `evictDelayMs` | `5000` | `evict` 時の最終使用からの猶予。`0` で即時破棄 |
+| `evictDelayMs` | `5000` | `evict` 時の最終使用からの猶予。`0` で即時破棄。`Infinity` で時間破棄を止め容量のみのキャッシュにできる |
+| `maxResidentBytes` | 上限なし | 常駐推定バイト数の上限。超過時は未参照・非ピンを古い順に破棄。`keep-all` と併用不可。推定値で判定し、`update()` 内でのみ適用 |
 | `now` | `performance.now` | 時刻源。テストで時間を操作するための注入点 |
 
 ### evict の補足
@@ -130,6 +131,14 @@ stateDiagram-v2
   近景復帰時は再アップロードが走るため、大きなテクスチャではヒッチし得る。
 - LOD管理外のメッシュやベースマテリアルが同じ `Texture` を使っている場合、
   `evict` はそのテクスチャも破棄対象にし得る。管理外の利用があるなら `keep-all` を推奨する。
+- `maxResidentBytes` を設定すると、常駐推定値が上限を超えた分だけ、
+  未参照（`refs === 0`）かつ非ピン（`pins === 0`）のテクスチャを
+  最終使用の古い順（同時刻なら推定バイトの大きい順）に、猶予を待たず破棄する。
+  現用中と最粗レベルは守られるため、上限まで下げられない場合は超過を許容する
+  （`stats().overBudgetBytes` で確認する）。破棄の累計は `stats().evictCount` に出る。
+- `evictDelayMs: Infinity` と `maxResidentBytes` の併用で、時間では破棄せず容量だけで破棄するキャッシュになる。
+- 非表示（`visible === false`）のグループは判定を飛ばして参照を保持するため、
+  そのテクスチャは上限破棄でも解放できない。隠したまま上限を締めると超過が残る。
 - 事前に全レベルをアップロードしておくウォームアップAPIは用意していない。
 
 ### 距離の測り方
@@ -168,7 +177,7 @@ pnpm dev
 
 URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大4）、`?avatars=4`（総体数、既定4、最大12）、`?backend=webgl`、
 `?lod=0`（LOD無効）、`?h=0.15`、`?atlas=1024`、`?auto=0`（自動カメラ停止）、
-`?residency=keep-all`、`?evictDelay=1000`。
+`?residency=keep-all`、`?evictDelay=1000`、`?budget=32`（常駐上限MB、`0` で無効、既定 `0`）。
 
 ### 方式
 
@@ -200,6 +209,9 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
   `?models=A,B,C,A&avatars=4` なら従来どおり4ソースになる。
 - GUIの「複製を追加」/「複製を削除」で体数を増減できる。
   追加はインスタンスが最も少ないテンプレートを複製し、削除は最後の複製を外す。
+- GUIの「メモリ上限(MB)」スライダー（`0` で無効、既定 `0`）で `maxResidentBytes` を変えられる。
+  `keep-all` 選択中と LOD 無効中は無効化される。上限が効いている間、HUD の `VRAM` 行に
+  `上限 / 超過 / 破棄回数` が出る（`keep-all` では `budget off (keep-all)` と出る）。
 - 複製は最適化を再実行せず、アトラス・テクスチャ・マテリアル・LODセットを
   テンプレートと共有する。メッシュと束縛だけを複製ごとに持つため、
   複製を増やしても `Too many active WebGL contexts` 警告は出ない。
@@ -229,6 +241,7 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
 | 実GPUテクスチャ数（1体、近景→遠景） | 21 → 17（evictで実際に減少） |
 | 複製時（ソース1 + 複製3、L0/L1/L2/L3 が1体ずつ） | 最適化1回、常駐はソース1体分の約1.33倍 |
 | 既定（3ソース + 複製1） | mesh 319 → 36（rendered 48）、material 272 → 12、atlas 40.0MB、常駐 18.1MB |
+| 上限キャッシュ `?budget=32&evictDelay=5000`（3ソース + 複製1、WebGPU/WebGL とも同値） | 常駐 29.5MB（上限32MB以下、over 0、evict 17）。8MBに締めると常駐 18.1MB・over 10.1MB（= 18.1 - 8）・evict 24、レベル [0,1,2,3] 不変。350ms間隔2回で evict 増加なし。解除で上限なし・over 0。既定行の 18.1MB とは `evictDelay`（1000/5000）の条件が違う |
 | 12体（4ソース + 複製8） | rendered 144 mesh、常駐 18.3MB、警告0 |
 
 ### 注意
@@ -278,7 +291,7 @@ pnpm models:fetch   # VRMデモ用のサンプルモデルを public/models/ へ
 | 操作 | 内容 |
 | --- | --- |
 | `autoMove` / `speed` | カメラの自動往復（z: 6 → -70 → 6）と速度 |
-| `hysteresis` / `residency` / `evictDelayMs` / `distanceMode` | 設定を丸ごと再構築（カウンタはリセット） |
+| `hysteresis` / `residency` / `evictDelayMs` / `maxResidentBytes` / `distanceMode` | 設定を丸ごと再構築（カウンタはリセット） |
 | `LOD有効` | 全meshの登録／解除（解除時はベースマテリアルに戻る） |
 | `近距離へ` / `遠距離へ` | カメラを z=0 / z=30 へ即時移動 |
 | `h=0で往復テスト` | ヒステリシスなしで境界 T=10 / 25 を往復 |

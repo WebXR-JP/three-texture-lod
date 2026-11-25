@@ -6,7 +6,7 @@
  * GPUなしで動くよう three の core クラスのみを使い、時計は注入して時間を操作する。
  */
 import { describe, expect, it, vi } from 'vitest';
-import { DataTexture, Material, Mesh, MeshStandardMaterial, PerspectiveCamera, PlaneGeometry, type Texture } from 'three';
+import { DataTexture, Material, Mesh, MeshStandardMaterial, PerspectiveCamera, PlaneGeometry, Texture } from 'three';
 import { createTextureLodSet } from './texture-lod-set.js';
 import { TextureLodManager } from './texture-lod-manager.js';
 import type { TextureLodLevel } from './types.js';
@@ -947,6 +947,550 @@ describe('TextureLodManager addGroup の Contract 検証', () => {
     } finally {
       broken.levels = originalLevels;
       broken.thresholds = originalThresholds;
+      manager.dispose();
+    }
+  });
+});
+
+describe('TextureLodManager maxResidentBytes', () => {
+  it('上限内なら猶予前のテクスチャを破棄しない', () => {
+    let now = 0;
+    const total = bytes(8) + bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1000,
+      maxResidentBytes: total,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // レベル0を使用
+      manager.update(cameraAt(30)); // レベル2へ
+      now = 500; // 猶予前
+      manager.update(cameraAt(30));
+      for (const spy of spies) {
+        expect(spy).not.toHaveBeenCalled();
+      }
+      const stats = manager.stats();
+      expect(stats.budgetBytes).toBe(total);
+      expect(stats.overBudgetBytes).toBe(0);
+      expect(stats.evictCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('上限超過では最終使用の古い順に破棄する（サイズ優先ではない）', () => {
+    // 時刻優先とサイズ優先を分離する。古い候補を小さく・新しい候補を大きくし、
+    // 時刻を無視したサイズ降順なら新しい大きい方が先に落ちる予算（500）にしている。
+    // 2件を別々の更新で解放するだけでは、先に解放した側がその時点の掃引で落ちるか
+    // 上限内に収まってしまい、同じ掃引で比較できない。
+    // おとり D を先に上限で破棄し、最後の更新で復帰（常駐を再超過）させることで、
+    // 古い V（t=100）と新しい N（t=200）を同じ掃引の候補に残す。
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 500,
+    });
+    const baseV = new MeshStandardMaterial({ name: 'victim' });
+    const victimTex = dataTexture(2);
+    const setV = createTextureLodSet({
+      material: baseV,
+      levels: [
+        { distance: 0, textures: { map: victimTex } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const baseN = new MeshStandardMaterial({ name: 'newcomer' });
+    const newcomerTex = dataTexture(8);
+    const setN = createTextureLodSet({
+      material: baseN,
+      levels: [
+        { distance: 0, textures: { map: newcomerTex } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const baseD = new MeshStandardMaterial({ name: 'decoy' });
+    const decoyTex = dataTexture(4);
+    const setD = createTextureLodSet({
+      material: baseD,
+      levels: [
+        { distance: 0, textures: { map: decoyTex } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const spyV = vi.spyOn(victimTex, 'dispose');
+    const spyN = vi.spyOn(newcomerTex, 'dispose');
+    const spyD = vi.spyOn(decoyTex, 'dispose');
+    const meshV = sceneMesh(baseV);
+    const meshN = sceneMesh(baseN);
+    const meshD = sceneMesh(baseD);
+    meshD.position.z = 60; // D は最初から遠方（L1）。L0 は未参照のまま残る
+    try {
+      manager.add(meshV, setV);
+      manager.add(meshN, setN);
+      manager.add(meshD, setD);
+      manager.update(cameraAt(5)); // V・N は L0、D は L1。段2でおとり D だけ落ちる
+      expect(spyD).toHaveBeenCalledTimes(1);
+      expect(spyV).not.toHaveBeenCalled();
+      expect(spyN).not.toHaveBeenCalled();
+      meshV.position.z = 60;
+      now = 100;
+      manager.update(cameraAt(5)); // V のみ L1 へ。常駐は上限内のため V は残る
+      expect(spyV).not.toHaveBeenCalled();
+      expect(manager.stats().evictCount).toBe(1);
+      meshN.position.z = 60;
+      meshD.position.z = 0;
+      now = 200;
+      manager.update(cameraAt(5)); // N を解放しつつ D を復帰。古い V から落ちる
+      expect(spyV).toHaveBeenCalledTimes(1);
+      expect(spyN).not.toHaveBeenCalled();
+      expect(manager.stats().evictCount).toBe(2);
+      expect(manager.stats().overBudgetBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('同時刻の候補は推定バイトの大きい順に破棄する（挿入順ではない）', () => {
+    // タイ比較 `|| b.bytes - a.bytes` を分離する。小さい方を先に add して
+    // Map 挿入順では小さい方が先になる構成にし、同時刻で解放する。
+    // タイ比較がなければ挿入順で小さい方が落ちて失敗する。
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      // pin 合計 + 小さい L0 + 1。大きい方を1枚落とすと収まる。
+      maxResidentBytes: bytes(2) * 3 + 1,
+    });
+    const baseS = new MeshStandardMaterial({ name: 'smallFirst' });
+    const smallTex = dataTexture(2);
+    const setS = createTextureLodSet({
+      material: baseS,
+      levels: [
+        { distance: 0, textures: { map: smallTex } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const baseB = new MeshStandardMaterial({ name: 'bigSecond' });
+    const bigTex = dataTexture(8);
+    const setB = createTextureLodSet({
+      material: baseB,
+      levels: [
+        { distance: 0, textures: { map: bigTex } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const spyS = vi.spyOn(smallTex, 'dispose');
+    const spyB = vi.spyOn(bigTex, 'dispose');
+    const meshS = sceneMesh(baseS);
+    const meshB = sceneMesh(baseB);
+    meshS.position.z = 60;
+    meshB.position.z = 60;
+    try {
+      // 小さい方を先に add（挿入順で小さい方が先）。
+      manager.add(meshS, setS);
+      manager.add(meshB, setB);
+      // 両方 far のまま更新。L0 は未使用のまま lastUsedAt が登録時刻で同時刻になる。
+      manager.update(cameraAt(5));
+      expect(spyB).toHaveBeenCalledTimes(1);
+      expect(spyS).not.toHaveBeenCalled();
+      expect(manager.stats().evictCount).toBe(1);
+      expect(manager.stats().overBudgetBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('上限超過でも使用中（refs>0）のテクスチャは破棄しない', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // レベル0を使用中
+      // 未参照のレベル1だけが破棄され、使用中のレベル0とピン留めのレベル2は残る。
+      expect(spies[0]).not.toHaveBeenCalled();
+      expect(spies[1]).toHaveBeenCalledTimes(1);
+      expect(spies[2]).not.toHaveBeenCalled();
+      expect(manager.stats().overBudgetBytes).toBeGreaterThan(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('上限超過でも最粗（pins>0）のテクスチャは破棄しない', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(30)); // レベル2を使用。レベル0・1は未参照
+      expect(spies[0]).toHaveBeenCalledTimes(1);
+      expect(spies[1]).toHaveBeenCalledTimes(1);
+      expect(spies[2]).not.toHaveBeenCalled();
+      expect(manager.stats().overBudgetBytes).toBeGreaterThan(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('上限まで下げられなくても例外にならず、2回目以降のupdateで破棄は増えない', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      expect(() => manager.update(cameraAt(5))).not.toThrow();
+      expect(manager.stats().overBudgetBytes).toBeGreaterThan(0);
+      const calls = spies.map((spy) => spy.mock.calls.length);
+      now = 500;
+      manager.update(cameraAt(5));
+      now = 1000;
+      manager.update(cameraAt(5));
+      expect(spies.map((spy) => spy.mock.calls.length)).toEqual(calls);
+      expect(manager.stats().evictCount).toBe(1);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('破棄済みテクスチャを再retainして超過したら、別のLRU候補が破棄される', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 200,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // レベル0。レベル1が上限で破棄される
+      expect(spies[1]).toHaveBeenCalledTimes(1);
+      now = 100;
+      manager.update(cameraAt(15)); // レベル1へ。レベル1は復帰し、代わりにレベル0が破棄される
+      expect(spies[0]).toHaveBeenCalledTimes(1);
+      expect(spies[1]).toHaveBeenCalledTimes(1); // 再破棄はされない
+      expect(spies[2]).not.toHaveBeenCalled();
+      expect(manager.stats().residentBytes).toBeCloseTo(bytes(4) + bytes(2), 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('猶予切れは上限内でも破棄される（段1と段2の併用）', () => {
+    let now = 0;
+    const total = bytes(8) + bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1000,
+      maxResidentBytes: total,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      now = 100;
+      manager.update(cameraAt(30)); // レベル2へ。上限内のため段2は何もしない
+      expect(spies[0]).not.toHaveBeenCalled();
+      now = 2000;
+      manager.update(cameraAt(30)); // 猶予切れでレベル0・1を破棄
+      expect(spies[0]).toHaveBeenCalledTimes(1);
+      expect(spies[1]).toHaveBeenCalledTimes(1);
+      expect(spies[2]).not.toHaveBeenCalled();
+      expect(manager.stats().evictCount).toBe(2);
+      expect(manager.stats().overBudgetBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('上限0なら未参照の候補をすべて破棄し、現用とピンだけ残る', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 0,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // レベル0を使用
+      expect(spies[0]).not.toHaveBeenCalled();
+      expect(spies[1]).toHaveBeenCalledTimes(1);
+      expect(spies[2]).not.toHaveBeenCalled();
+      const stats = manager.stats();
+      expect(stats.budgetBytes).toBe(0);
+      expect(stats.residentBytes).toBeCloseTo(bytes(8) + bytes(2), 10);
+      expect(stats.overBudgetBytes).toBeCloseTo(bytes(8) + bytes(2), 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('画像なし（0バイト）のテクスチャは上限破棄でdisposeされない', () => {
+    let now = 0;
+    const base = new MeshStandardMaterial({ name: 'empty' });
+    const fine = dataTexture(8);
+    const empty = new Texture();
+    const coarse = dataTexture(2);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: fine } },
+        { distance: 10, textures: { map: empty } },
+        { distance: 20, textures: { map: coarse } },
+      ],
+    });
+    const emptySpy = vi.spyOn(empty, 'dispose');
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(8),
+    });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // レベル0を使用。常駐は上限を超過するが候補がいない
+      expect(emptySpy).not.toHaveBeenCalled();
+      expect(manager.stats().overBudgetBytes).toBeCloseTo(bytes(2), 10);
+      expect(manager.stats().evictCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('異なるsetで共有するテクスチャは、一方で現用なら上限超過でも破棄しない', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+    });
+    // shared は両setの最粗以外に置き、ピンではなく参照カウントで守られる状態にする。
+    const shared = dataTexture(8);
+    const sharedSpy = vi.spyOn(shared, 'dispose');
+    const baseA = new MeshStandardMaterial({ name: 'a' });
+    const baseB = new MeshStandardMaterial({ name: 'b' });
+    const setA = createTextureLodSet({
+      material: baseA,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: dataTexture(4) } },
+        { distance: 20, textures: { map: dataTexture(1) } },
+      ],
+    });
+    const setB = createTextureLodSet({
+      material: baseB,
+      levels: [
+        { distance: 0, textures: { map: dataTexture(6) } },
+        { distance: 10, textures: { map: shared } },
+        { distance: 20, textures: { map: dataTexture(1) } },
+      ],
+    });
+    const meshA = sceneMesh(baseA);
+    const meshB = sceneMesh(baseB);
+    try {
+      manager.add(meshA, setA);
+      manager.add(meshB, setB);
+      manager.update(cameraAt(5)); // 両方レベル0。shared は A が現用（refs=1）
+      // 掃引は動いているが、現用の shared は破棄されない。
+      expect(sharedSpy).not.toHaveBeenCalled();
+      expect(manager.stats().overBudgetBytes).toBeGreaterThan(0);
+      meshA.position.z = 60;
+      now = 100;
+      manager.update(cameraAt(5)); // Aのみレベル2。shared の参照が外れる
+      expect(sharedSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('evictDelayMs: Infinity では時間で破棄されず、容量だけで破棄される', () => {
+    let now = 0;
+    const total = bytes(8) + bytes(4) + bytes(2);
+    const keepManager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: Infinity,
+      maxResidentBytes: total,
+    });
+    const overManager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: Infinity,
+      maxResidentBytes: 200,
+    });
+    const keep = set3('keep');
+    const over = set3('over');
+    const keepSpies = keep.maps.map((map) => vi.spyOn(map, 'dispose'));
+    const overSpies = over.maps.map((map) => vi.spyOn(map, 'dispose'));
+    const meshKeep = sceneMesh(keep.base);
+    const meshOver = sceneMesh(over.base);
+    try {
+      keepManager.add(meshKeep, keep.set);
+      overManager.add(meshOver, over.set);
+      keepManager.update(cameraAt(5));
+      overManager.update(cameraAt(5)); // レベル0。段2でレベル1が破棄される
+      keepManager.update(cameraAt(30));
+      overManager.update(cameraAt(30)); // レベル2へ。段2でレベル0が破棄される
+      // 上限超過分は容量だけで破棄される（猶予 Infinity は有限差で発火しないため段1の寄与はない）。
+      expect(overSpies[0]).toHaveBeenCalledTimes(1);
+      expect(overSpies[1]).toHaveBeenCalledTimes(1);
+      expect(overSpies[2]).not.toHaveBeenCalled();
+      now = 1e12;
+      keepManager.update(cameraAt(30));
+      overManager.update(cameraAt(30));
+      // 猶予 Infinity は有限差では発火しない。時間が経っても破棄は増えず、
+      // 上限内なら何も破棄されない。
+      expect(overSpies[0]).toHaveBeenCalledTimes(1);
+      expect(overSpies[1]).toHaveBeenCalledTimes(1);
+      for (const spy of keepSpies) {
+        expect(spy).not.toHaveBeenCalled();
+      }
+      expect(keepManager.stats().evictCount).toBe(0);
+    } finally {
+      keepManager.dispose();
+      overManager.dispose();
+    }
+  });
+
+  it('maxResidentBytes が負・NaN・Infinity なら RangeError、keep-all 併用なら Error', () => {
+    expect(() => new TextureLodManager({ maxResidentBytes: -1 })).toThrow(RangeError);
+    expect(() => new TextureLodManager({ maxResidentBytes: NaN })).toThrow(RangeError);
+    expect(() => new TextureLodManager({ maxResidentBytes: Infinity })).toThrow(RangeError);
+    expect(() => new TextureLodManager({ maxResidentBytes: 0 })).not.toThrow();
+    expect(
+      () => new TextureLodManager({ residency: 'keep-all', maxResidentBytes: 1024 }),
+    ).toThrow("maxResidentBytes は residency: 'keep-all' と併用できません");
+  });
+
+  it('stats は budgetBytes・overBudgetBytes・evictCount（猶予＋上限の累計）を返す', () => {
+    // 未設定なら budgetBytes は null、overBudgetBytes は 0。
+    {
+      const manager = new TextureLodManager();
+      const { set, base } = set3('plain');
+      const mesh = sceneMesh(base);
+      try {
+        manager.add(mesh, set);
+        manager.update(cameraAt(5));
+        const stats = manager.stats();
+        expect(stats.budgetBytes).toBeNull();
+        expect(stats.overBudgetBytes).toBe(0);
+        expect(stats.evictCount).toBe(0);
+      } finally {
+        manager.dispose();
+      }
+    }
+    // 猶予破棄と上限破棄の合計が evictCount になる。
+    let now = 0;
+    const budget = 800;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1000,
+      maxResidentBytes: budget,
+    });
+    const a = set3('a');
+    const b = set3('b');
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(b.base);
+    const spyA0 = vi.spyOn(a.maps[0], 'dispose');
+    const spyA1 = vi.spyOn(a.maps[1], 'dispose');
+    const spyB1 = vi.spyOn(b.maps[1], 'dispose');
+    try {
+      manager.add(meshA, a.set);
+      manager.add(meshB, b.set);
+      expect(manager.stats().budgetBytes).toBe(budget);
+      manager.update(cameraAt(5)); // 両方レベル0。段2で古い順に A-L1・B-L1 を破棄
+      expect(spyA1).toHaveBeenCalledTimes(1);
+      expect(spyB1).toHaveBeenCalledTimes(1);
+      expect(manager.stats().evictCount).toBe(2);
+      meshA.position.z = 60;
+      now = 100;
+      manager.update(cameraAt(5)); // Aのみレベル2。上限内のため段2は動かない
+      expect(manager.stats().evictCount).toBe(2);
+      now = 2000;
+      manager.update(cameraAt(5)); // A-L0 が猶予切れで段1が破棄
+      expect(spyA0).toHaveBeenCalledTimes(1);
+      expect(manager.stats().evictCount).toBe(3);
+      expect(manager.stats().overBudgetBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('上限はupdate内でのみ効く（add直後は超過し得て、update後に解消する）', () => {
+    let now = 0;
+    const budget = bytes(8) + bytes(2);
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+    });
+    const { set, base, maps } = set3('wall');
+    const spies = maps.map((map) => vi.spyOn(map, 'dispose'));
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      // update 前は掃引が走らず、全テクスチャが常駐扱いで上限を超過し得る。
+      expect(manager.stats().overBudgetBytes).toBeGreaterThan(0);
+      expect(spies[1]).not.toHaveBeenCalled();
+      manager.update(cameraAt(5)); // レベル0。未参照のレベル1を上限で破棄し、超過が解消する
+      expect(spies[1]).toHaveBeenCalledTimes(1);
+      expect(manager.stats().overBudgetBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('removeで追跡から外れたテクスチャは上限計算に入らない', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(2),
+    });
+    const a = set3('a');
+    const b = set3('b');
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(b.base);
+    try {
+      manager.add(meshA, a.set);
+      manager.add(meshB, b.set);
+      manager.update(cameraAt(5)); // 両方レベル0。未参照の L1 が2件とも上限で破棄される
+      expect(manager.stats().residentBytes).toBeCloseTo(2 * (bytes(8) + bytes(2)), 10);
+      manager.remove(meshA);
+      // A のテクスチャは追跡から外れ、B の分だけが残る。
+      const after = manager.stats();
+      expect(after.objectCount).toBe(1);
+      expect(after.residentBytes).toBeCloseTo(bytes(8) + bytes(2), 10);
+      expect(after.overBudgetBytes).toBeCloseTo(bytes(8), 10);
+    } finally {
       manager.dispose();
     }
   });

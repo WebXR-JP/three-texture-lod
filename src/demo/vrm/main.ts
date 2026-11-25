@@ -18,6 +18,7 @@
  * - `?auto=0` 自動カメラを停止
  * - `?residency=keep-all` 常駐モード
  * - `?evictDelay=1000` evict の猶予ms
+ * - `?budget=32` 常駐上限MB（0で無効、既定0）
  */
 import GUI from 'lil-gui';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -57,6 +58,7 @@ const atlasResolution = clampNumber(Number(params.get('atlas') ?? 1024), 256, 20
 let hysteresis = clampNumber(Number(params.get('h') ?? 0.15), 0, 0.3, 0.15);
 let residency: ResidencyMode = params.get('residency') === 'keep-all' ? 'keep-all' : 'evict';
 let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 10000, 1000);
+let budgetMB = clampNumber(Math.round(Number(params.get('budget') ?? 0)), 0, 256, 0);
 let lodEnabled = params.get('lod') !== '0';
 let autoCamera = params.get('auto') !== '0';
 
@@ -146,6 +148,7 @@ function createManager(): TextureLodManager {
     distanceMode: 'surface',
     residency,
     evictDelayMs,
+    maxResidentBytes: residency === 'evict' && budgetMB > 0 ? budgetMB * 1048576 : undefined,
   });
 }
 
@@ -340,6 +343,7 @@ function recreateManager(): void {
 
 function setLodEnabled(enabled: boolean): void {
   lodEnabled = enabled;
+  updateBudgetController();
   guiState.forceLevel = 'auto';
   if (enabled) {
     manualLevel = null;
@@ -594,6 +598,7 @@ const guiState = {
   hysteresis,
   residency,
   evictDelayMs,
+  budgetMB,
   autoCamera,
   forceLevel: 'auto' as 'auto' | '0' | '1' | '2' | '3',
   add: pickFile,
@@ -631,6 +636,7 @@ gui
   .onChange((value: ResidencyMode) => {
     residency = value;
     recreateManager();
+    updateBudgetController();
   })
   .listen();
 gui
@@ -641,6 +647,21 @@ gui
     recreateManager();
   })
   .listen();
+const budgetController = gui
+  .add(guiState, 'budgetMB', 0, 256, 1)
+  .name('メモリ上限(MB)')
+  .onFinishChange((value: number) => {
+    budgetMB = value;
+    recreateManager();
+  })
+  .listen();
+
+/** `keep-all` 選択中と LOD off 中は上限スライダーを無効化する。 */
+function updateBudgetController(): void {
+  if (residency === 'keep-all' || !lodEnabled) budgetController.disable();
+  else budgetController.enable();
+}
+updateBudgetController();
 gui.add(guiState, 'autoCamera').name('自動カメラ').onChange((value: boolean) => {
   autoCamera = value;
   if (!value) {
@@ -769,7 +790,18 @@ function updateHud(): void {
     `atlas     ${(atlasBytes / 1048576).toFixed(1)} MB (full)`,
     `LOD       ${lodEnabled ? 'on' : 'off'}  ${residency}  h=${hysteresis.toFixed(2)}`,
     `levels    ${lodEnabled ? levelText : 'full resolution'}`,
-    `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)`,
+    lodEnabled &&
+    manualLevel === null &&
+    residency === 'evict' &&
+    budgetMB > 0
+      ? `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}`
+      : residency === 'keep-all' && budgetMB > 0
+        ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (keep-all)`
+        : residency === 'evict' && budgetMB > 0 && !lodEnabled
+          ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (LOD off)`
+          : residency === 'evict' && budgetMB > 0 && manualLevel !== null
+            ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (manual)`
+            : `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)`,
     `switch    ${stats.switchCount}   pipelines ${pipelines.caches}/${pipelines.fragmentPrograms}`,
     `frame     ${frameTimeMs.toFixed(2)}ms  calls ${lastFrameCalls}`,
     '',
@@ -849,6 +881,7 @@ const api = {
       hysteresis,
       residency,
       evictDelayMs,
+      budgetMB,
       manualLevel,
       loadFailures: [...loadFailures],
       sourceCount: templates.length,
@@ -893,6 +926,7 @@ const api = {
     hysteresis?: number;
     residency?: ResidencyMode;
     evictDelayMs?: number;
+    budgetMB?: number;
     lodEnabled?: boolean;
     forceLevel?: number | null;
     autoCamera?: boolean;
@@ -910,6 +944,12 @@ const api = {
     ) {
       return false;
     }
+    if (
+      partial.budgetMB !== undefined &&
+      (!Number.isFinite(partial.budgetMB) || partial.budgetMB < 0 || partial.budgetMB > 256)
+    ) {
+      return false;
+    }
     if (partial.hysteresis !== undefined) {
       if (!recreateLod(partial.hysteresis)) return false;
       guiState.hysteresis = hysteresis;
@@ -918,10 +958,16 @@ const api = {
       residency = partial.residency;
       guiState.residency = residency;
       recreateManager();
+      updateBudgetController();
     }
     if (partial.evictDelayMs !== undefined) {
       evictDelayMs = clampNumber(partial.evictDelayMs, 0, 10000, evictDelayMs);
       guiState.evictDelayMs = evictDelayMs;
+      recreateManager();
+    }
+    if (partial.budgetMB !== undefined) {
+      budgetMB = Math.round(partial.budgetMB);
+      guiState.budgetMB = budgetMB;
       recreateManager();
     }
     if (partial.lodEnabled !== undefined) {

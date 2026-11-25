@@ -506,6 +506,136 @@ async function checkInstances(browser, backend, config) {
   return result;
 }
 
+async function checkBudget(browser, backend) {
+  // ?budget=32（既定3ソース+複製1）で上限キャッシュを検証する。evictDelay=5000 のため
+  // 段1（猶予破棄）は動かず、段2（上限破棄）だけが residentBytes を下げる。
+  const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+  const messages = [];
+  page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  const result = { backend, ok: false };
+  try {
+    await page.goto(
+      `${BASE_URL}/vrm.html?auto=0&evictDelay=5000&budget=32${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      { waitUntil: 'load' },
+    );
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 300000 },
+    );
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    result.status = status;
+    if (status !== 'ready') {
+      assert(false, `${backend} (budget): デモが ready にならなかった（status=${status}）`);
+      return result;
+    }
+    // 上限（32MB）以下まで段2が掃引するのを待つ。
+    await waitFrames(page, 20);
+    await sleep(1400);
+    const stats = await statsOf(page);
+    result.initial = {
+      budgetBytes: stats.manager.budgetBytes,
+      overBudgetBytes: stats.manager.overBudgetBytes,
+      residentBytes: stats.manager.residentBytes,
+      evictCount: stats.manager.evictCount,
+    };
+    assert(
+      stats.manager.budgetBytes === 32 * 1048576,
+      `${backend} (budget): budgetBytes が 32MB でない: ${stats.manager.budgetBytes}`,
+    );
+    assert(
+      stats.manager.overBudgetBytes === 0,
+      `${backend} (budget): overBudgetBytes が 0 でない: ${stats.manager.overBudgetBytes}`,
+    );
+    assert(
+      stats.manager.residentBytes <= stats.manager.budgetBytes,
+      `${backend} (budget): residentBytes が上限以下にならない: ${stats.manager.residentBytes} / ${stats.manager.budgetBytes}`,
+    );
+    assert(
+      stats.manager.evictCount > 0,
+      `${backend} (budget): 上限までの破棄が起きていない (evictCount=${stats.manager.evictCount})`,
+    );
+
+    // 上限を 8MB に締める。現用・最粗は守られるため超過が残り、レベル分布は変わらない。
+    const levelsBefore = stats.avatars.map((avatar) => avatar.level);
+    const setOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 8 }));
+    assert(setOk === true, `${backend} (budget): setSettings({ budgetMB: 8 }) が false`);
+    await waitFrames(page, 6);
+    const tight = await statsOf(page);
+    result.tight = {
+      budgetBytes: tight.manager.budgetBytes,
+      overBudgetBytes: tight.manager.overBudgetBytes,
+      residentBytes: tight.manager.residentBytes,
+      evictCount: tight.manager.evictCount,
+      levels: tight.avatars.map((avatar) => avatar.level),
+    };
+    assert(
+      tight.manager.budgetBytes === 8 * 1048576,
+      `${backend} (budget): 締め後の budgetBytes が 8MB でない: ${tight.manager.budgetBytes}`,
+    );
+    assert(
+      tight.manager.overBudgetBytes > 0,
+      `${backend} (budget): 締め後に overBudgetBytes > 0 にならない: ${tight.manager.overBudgetBytes}`,
+    );
+    assert(
+      tight.manager.evictCount > 0,
+      `${backend} (budget): 締め後の破棄が起きていない (evictCount=${tight.manager.evictCount})`,
+    );
+    assert(
+      JSON.stringify(tight.avatars.map((avatar) => avatar.level)) === JSON.stringify(levelsBefore),
+      `${backend} (budget): 上限変更でレベルが変化した: ${JSON.stringify(levelsBefore)} → ${JSON.stringify(tight.avatars.map((avatar) => avatar.level))}`,
+    );
+    // evictDelay=5000 のため段1は動かない。350ms 待って2回読んでも増え続けないこと。
+    await sleep(350);
+    const settled1 = (await statsOf(page)).manager.evictCount;
+    await sleep(350);
+    const settled2 = (await statsOf(page)).manager.evictCount;
+    result.settled = { first: settled1, second: settled2 };
+    assert(
+      settled2 === settled1,
+      `${backend} (budget): evictCount が増え続ける: ${settled1} → ${settled2}`,
+    );
+
+    // 上限を外す。例外なく無効化されること。
+    const unsetOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 0 }));
+    assert(unsetOk === true, `${backend} (budget): setSettings({ budgetMB: 0 }) が false`);
+    await waitFrames(page, 6);
+    const unset = await statsOf(page);
+    result.unset = {
+      budgetBytes: unset.manager.budgetBytes,
+      overBudgetBytes: unset.manager.overBudgetBytes,
+    };
+    assert(
+      unset.manager.budgetBytes === null,
+      `${backend} (budget): 解除後の budgetBytes が null でない: ${unset.manager.budgetBytes}`,
+    );
+    assert(
+      unset.manager.overBudgetBytes === 0,
+      `${backend} (budget): 解除後の overBudgetBytes が 0 でない: ${unset.manager.overBudgetBytes}`,
+    );
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    const noise = messages.filter((message) =>
+      /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+    );
+    result.consoleErrors = consoleErrors;
+    result.webgpuNoise = noise;
+    assert(consoleErrors.length === 0, `${backend} (budget): コンソールエラー ${consoleErrors.join(' | ')}`);
+    assert(noise.length === 0, `${backend} (budget): GPU関連の警告 ${noise.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (budget): 例外: ${String(error)}`);
+  } finally {
+    result.messages = messages.slice(-20);
+    await page.close();
+  }
+  return result;
+}
+
 async function checkBackend(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
@@ -699,9 +829,18 @@ async function main() {
         };
       }
 
+      const budgetBrowser = await launchBrowser();
+      let budget;
+      try {
+        budget = await checkBudget(budgetBrowser, backend);
+      } finally {
+        await budgetBrowser.close();
+      }
+
       single.fourSources = fourSources;
       single.default = defaultPage;
       single.clones = clones;
+      single.budget = budget;
       single.ok = failures.length === 0;
       results.push(single);
     }

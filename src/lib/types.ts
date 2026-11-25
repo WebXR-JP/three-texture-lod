@@ -149,9 +149,24 @@ export interface TextureLodManagerOptions {
   /**
    * `evict` 時に最終使用から破棄までの猶予（ミリ秒）。
    *
+   * `Infinity` を指定すると時間経過では破棄せず、`maxResidentBytes` による容量のみのキャッシュにできる。
+   *
    * @defaultValue `5000`（`TextureLodManager` が補う）。
    */
   readonly evictDelayMs?: number;
+  /**
+   * 常駐テクスチャ推定バイト数の上限。
+   *
+   * 超過時は未参照（`refs === 0`）かつ非ピン（`pins === 0`）のテクスチャを、
+   * 最終使用の古い順（同時刻なら推定バイトの大きい順）に、猶予 `evictDelayMs` を待たず破棄する。
+   * 現用中と最粗レベルのフォールバック先は破棄しないため、上限まで下げられない場合は超過を許容する
+   * （{@link TextureLodStats.overBudgetBytes} で確認する）。
+   * 判定は {@link TextureLodStats.residentBytes} と同じ推定値で行い、実VRAMではない。適用は `update()` 内のみ。
+   * `residency: 'keep-all'` との併用は不可。
+   *
+   * @defaultValue 上限なし
+   */
+  readonly maxResidentBytes?: number;
   /**
    * 時刻源。テストで時間を操作するために注入する。
    *
@@ -181,4 +196,10 @@ export interface TextureLodStats {
    * 実測値ではなく推定値である。破棄済みのテクスチャは含まない。
    */
   readonly residentBytes: number;
+  /** 設定された上限バイト数。未設定なら `null`。 */
+  readonly budgetBytes: number | null;
+  /** `max(0, residentBytes - budgetBytes)`。上限未設定なら 0。`stats()` 呼び出し時点の値。 */
+  readonly overBudgetBytes: number;
+  /** マネージャが `dispose()` したテクスチャの累計回数（猶予による破棄と上限による破棄の合計）。 */
+  readonly evictCount: number;
 }

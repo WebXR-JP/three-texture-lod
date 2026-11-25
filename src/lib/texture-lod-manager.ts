@@ -111,6 +111,8 @@ interface TrackedTexture {
 /**
  * テクスチャLODマネージャ。複数メッシュのレベル判定と常駐管理を受け持つ。
  *
+ * `maxResidentBytes` を指定すると、常駐推定バイト数に上限を設け、
+ * 超過分を未参照テクスチャから古い順に破棄する（現用中と最粗レベルは守る）。
  * 毎フレーム描画前に {@link TextureLodManager.update} を呼ぶこと。
  * ヒステリシス幅・境界はセット側が保持し（レベル定義とバンドは不可分でset生成時に検証できるため）、
  * マネージャは判定の実行と参照カウントのみを担当する。
@@ -121,6 +123,8 @@ export class TextureLodManager {
   private readonly distanceMode: DistanceMode;
   private readonly residency: ResidencyMode;
   private readonly evictDelayMs: number;
+  private readonly maxResidentBytes: number | null;
+  private evictCount = 0;
   private readonly now: () => number;
   private readonly groups = new Set<ManagedGroup>();
   private readonly groupOfMesh = new Map<Mesh, ManagedGroup>();
@@ -143,6 +147,18 @@ export class TextureLodManager {
     this.distanceMode = options?.distanceMode ?? 'surface';
     this.residency = options?.residency ?? 'evict';
     this.evictDelayMs = options?.evictDelayMs ?? 5000;
+    const maxResidentBytes = options?.maxResidentBytes;
+    if (maxResidentBytes !== undefined) {
+      if (!Number.isFinite(maxResidentBytes) || maxResidentBytes < 0) {
+        throw new RangeError(
+          `maxResidentBytes は0以上の有限値である必要があります: ${String(maxResidentBytes)}`,
+        );
+      }
+      if (this.residency === 'keep-all') {
+        throw new Error("maxResidentBytes は residency: 'keep-all' と併用できません");
+      }
+    }
+    this.maxResidentBytes = maxResidentBytes ?? null;
     this.now = options?.now ?? (() => performance.now());
   }
 
@@ -272,6 +288,7 @@ export class TextureLodManager {
    *
    * @param camera - 基準カメラ。
    * @remarks
+   * 判定後に `residency: 'evict'` の場合は猶予破棄と上限破棄（`maxResidentBytes` 指定時）を行う。
    * 判定前に anchor と `camera` の `updateWorldMatrix(true, false)` を呼ぶ。
    * アプリがまだ行列更新していないタイミングで呼ばれても正しくなるための措置である。
    * anchor の `visible === false` の間は判定を飛ばし、現在のレベルと参照を保持する。
@@ -334,8 +351,9 @@ export class TextureLodManager {
   /**
    * 稼働統計を返す。
    *
-   * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数。
+   * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数・上限と破棄回数。
    * `objectCount` と `levelCounts` はグループ単位で数える。
+   * `maxResidentBytes` 指定時は上限超過分を `overBudgetBytes` で確認できる。
    */
   stats(): TextureLodStats {
     let maxLevels = 0;
@@ -359,6 +377,10 @@ export class TextureLodManager {
       switchCount: this.switchCount,
       levelCounts,
       residentBytes,
+      budgetBytes: this.maxResidentBytes,
+      overBudgetBytes:
+        this.maxResidentBytes === null ? 0 : Math.max(0, residentBytes - this.maxResidentBytes),
+      evictCount: this.evictCount,
     };
   }
 
@@ -480,15 +502,60 @@ export class TextureLodManager {
     }
   }
 
-  /** 猶予を過ぎた未参照・非常駐テクスチャを破棄する。 */
+  /** テクスチャを1件破棄し、破棄回数を数える。 */
+  private evict(texture: Texture, tracked: TrackedTexture): void {
+    texture.dispose();
+    tracked.evicted = true;
+    this.evictCount++;
+  }
+
+  /**
+   * 未参照・非常駐テクスチャを破棄する。
+   *
+   * 段1で猶予切れを破棄し、段2で `maxResidentBytes` 指定時のみ上限超過分を
+   * 最終使用の古い順（同時刻なら推定バイトの大きい順）に破棄する。
+   * 現用中・ピン留め（最粗レベル）はどちらの段でも守る。
+   */
   private sweep(at: number): void {
+    // 段1（従来どおり）: 猶予切れの破棄。
     for (const [texture, tracked] of this.tracked) {
-      if (tracked.refs === 0 && tracked.pins === 0 && !tracked.evicted) {
+      if (tracked.evicted) {
+        continue;
+      }
+      if (tracked.refs === 0 && tracked.pins === 0) {
         if (at - tracked.lastUsedAt >= this.evictDelayMs) {
-          texture.dispose();
-          tracked.evicted = true;
+          this.evict(texture, tracked);
+          continue;
         }
       }
+    }
+    if (this.maxResidentBytes === null) {
+      return;
+    }
+    // 段2: 上限超過分の破棄。段1で残ったものの推定バイトを合計する。
+    let resident = 0;
+    const candidates: { texture: Texture; tracked: TrackedTexture; bytes: number }[] = [];
+    for (const [texture, tracked] of this.tracked) {
+      if (tracked.evicted) {
+        continue;
+      }
+      const bytes = estimateBytes(texture);
+      resident += bytes;
+      if (tracked.refs === 0 && tracked.pins === 0 && bytes > 0) {
+        candidates.push({ texture, tracked, bytes });
+      }
+    }
+    const budget = this.maxResidentBytes;
+    if (resident <= budget) {
+      return;
+    }
+    candidates.sort((a, b) => a.tracked.lastUsedAt - b.tracked.lastUsedAt || b.bytes - a.bytes);
+    for (const candidate of candidates) {
+      if (resident <= budget) {
+        break;
+      }
+      this.evict(candidate.texture, candidate.tracked);
+      resident -= candidate.bytes;
     }
   }
 }

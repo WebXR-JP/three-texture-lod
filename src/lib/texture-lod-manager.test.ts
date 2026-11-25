@@ -8,6 +8,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DataTexture, Material, Mesh, MeshStandardMaterial, PerspectiveCamera, PlaneGeometry, Texture } from 'three';
 import { createTextureLodSet } from './texture-lod-set.js';
+import { buildScaleLadder } from './threshold-scale.js';
 import { TextureLodManager } from './texture-lod-manager.js';
 import type { TextureLodLevel } from './types.js';
 
@@ -1490,6 +1491,757 @@ describe('TextureLodManager maxResidentBytes', () => {
       expect(after.objectCount).toBe(1);
       expect(after.residentBytes).toBeCloseTo(bytes(8) + bytes(2), 10);
       expect(after.overBudgetBytes).toBeCloseTo(bytes(8), 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+});
+
+describe('TextureLodManager thresholdScale（固定）', () => {
+  /** 境界 [0,3,6,12] の4段階セットを作る。 */
+  function set4(name: string, sizes = [8, 4, 2, 1]) {
+    const base = new MeshStandardMaterial({ name });
+    const maps = sizes.map((size) => dataTexture(size));
+    const levels: TextureLodLevel[] = maps.map((map, i) => ({
+      distance: [0, 3, 6, 12][i],
+      textures: { map },
+    }));
+    return { set: createTextureLodSet({ material: base, levels }), base, maps };
+  }
+
+  it('距離4・T=[0,3,6,12] で s=1→L1・s=0.5→L2。設定だけでは levelOf 不変', () => {
+    // 中心距離で厳密に測り、s=1 で d=4→L1、s=0.5 で d/s=8→L2 になることの確認。
+    const { set, base } = set4('fixed');
+    const manager = new TextureLodManager({ distanceMode: 'center' });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(4));
+      expect(manager.levelOf(mesh)).toBe(1);
+      manager.setThresholdScale(0.5);
+      // 設定だけでは判定が走らず、レベルは変わらない（スケール値自体は即時反映される）。
+      expect(manager.levelOf(mesh)).toBe(1);
+      expect(manager.stats().thresholdScale).toBe(0.5);
+      manager.update(cameraAt(4));
+      expect(manager.levelOf(mesh)).toBe(2);
+      expect(manager.stats().thresholdScale).toBe(0.5);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('setThresholdScale の不正値は RangeError、adaptive 中は Error', () => {
+    const { base } = set4('invalid');
+    const plain = new TextureLodManager();
+    try {
+      expect(() => plain.setThresholdScale(0)).toThrow(RangeError);
+      expect(() => plain.setThresholdScale(-1)).toThrow(RangeError);
+      expect(() => plain.setThresholdScale(NaN)).toThrow(RangeError);
+      expect(() => plain.setThresholdScale(Infinity)).toThrow(RangeError);
+    } finally {
+      plain.dispose();
+    }
+    const adaptive = new TextureLodManager({ adaptiveThresholdScale: true });
+    try {
+      expect(() => adaptive.setThresholdScale(0.5)).toThrow(Error);
+    } finally {
+      adaptive.dispose();
+    }
+    void base;
+  });
+
+  it('ヒステリシスの両端も T*s*(1±h) になる', () => {
+    // T=[0,10]・h=0.2・s=0.5 のとき上端 6・下端 4 のバンドになることの確認。
+    const base = new MeshStandardMaterial({ name: 'band' });
+    const maps = [dataTexture(8), dataTexture(2)];
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: maps[0] } },
+        { distance: 10, textures: { map: maps[1] } },
+      ],
+      hysteresis: 0.2,
+    });
+    const manager = new TextureLodManager({ distanceMode: 'center', thresholdScale: 0.5 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(3)); // 3/0.5=6 <10 → L0
+      expect(manager.levelOf(mesh)).toBe(0);
+      manager.update(cameraAt(5.9)); // 11.8 < 12 → 上端内なので L0 のまま
+      expect(manager.levelOf(mesh)).toBe(0);
+      manager.update(cameraAt(6.1)); // 12.2 > 12 → L1
+      expect(manager.levelOf(mesh)).toBe(1);
+      manager.update(cameraAt(4.1)); // 8.2 > 8 → 下端内なので L1 のまま
+      expect(manager.levelOf(mesh)).toBe(1);
+      manager.update(cameraAt(3.9)); // 7.8 < 8 → L0
+      expect(manager.levelOf(mesh)).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('スケール変更後も同じ base thresholds の addGroup が通る', () => {
+    // スケールは距離側の読み替えであり、境界配列自体は不変のため検証が壊れないことの確認。
+    const a = set4('a');
+    const b = set4('b');
+    const manager = new TextureLodManager({ distanceMode: 'center', thresholdScale: 0.5 });
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(b.base);
+    try {
+      manager.addGroup([
+        { mesh: meshA, set: a.set },
+        { mesh: meshB, set: b.set },
+      ]);
+      manager.update(cameraAt(4)); // 4/0.5=8 → L2 に連動する
+      expect(manager.levelOf(meshA)).toBe(2);
+      expect(manager.levelOf(meshB)).toBe(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('stats は既定 thresholdScale===1・requiredBytes・over を返す', () => {
+    // 未参照の非ピン留め分を含まない必要量と、掃引後の超過が required 基準と一致することの確認。
+    const manager = new TextureLodManager({ now: () => 0, evictDelayMs: 1_000_000 });
+    const { set, base } = set3('stats');
+    const mesh = sceneMesh(base);
+    try {
+      expect(manager.stats().thresholdScale).toBe(1);
+      expect(manager.stats().requiredBytes).toBe(0);
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // L0: 参照が L0、最粗ピンが L2
+      const stats = manager.stats();
+      expect(stats.thresholdScale).toBe(1);
+      expect(stats.requiredBytes).toBeCloseTo(bytes(8) + bytes(2), 10);
+    } finally {
+      manager.dispose();
+    }
+    // 超過時は掃引で未参照が落ち、resident==required になるため over==max(0, required-budget)。
+    const budget = bytes(8) + bytes(2) - 1;
+    const over = new TextureLodManager({
+      now: () => 0,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+    });
+    const fixture = set3('over');
+    const meshOver = sceneMesh(fixture.base);
+    try {
+      over.add(meshOver, fixture.set);
+      over.update(cameraAt(5));
+      const stats = over.stats();
+      expect(stats.requiredBytes).toBeCloseTo(bytes(8) + bytes(2), 10);
+      expect(stats.overBudgetBytes).toBeCloseTo(Math.max(0, stats.requiredBytes - budget), 10);
+      expect(stats.overBudgetBytes).toBeGreaterThan(0);
+    } finally {
+      over.dispose();
+    }
+  });
+});
+
+describe('TextureLodManager adaptiveThresholdScale', () => {
+  it('adaptive 初回 update 後は requiredBytes<=budget になる（超過フレームがない）', () => {
+    // 近距離でも初回 update 内で先にスケールを下げてから判定するため、超過が出ないことの確認。
+    const budget = bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => 0,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('first');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // s=1 なら L0 で超過する距離
+      const stats = manager.stats();
+      expect(stats.thresholdScale).toBeLessThan(1);
+      expect(stats.requiredBytes).toBeLessThanOrEqual(budget);
+      expect(manager.stats().scaleLowerCount).toBeGreaterThan(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('固定乱数距離列で毎 update 後に required<=budget || scale===minScale が成り立つ', () => {
+    // ヒステリシス付き予測と実判定が一致するため、選択後の必要量は予測どおりに収まることの確認。
+    // 疑似乱数で距離列を固定し、evictDelayMs: Infinity でも不変条件が成り立つ。
+    const runWithEvictDelay = (evictDelayMs: number): void => {
+      let now = 0;
+      const budget = bytes(4) + bytes(2);
+      const manager = new TextureLodManager({
+        distanceMode: 'center',
+        now: () => now,
+        evictDelayMs,
+        maxResidentBytes: budget,
+        adaptiveThresholdScale: true,
+      });
+      const fixtures = [set3('r0'), set3('r1'), set3('r2')];
+      const meshes = fixtures.map((fixture) => sceneMesh(fixture.base));
+      try {
+        for (const [i, fixture] of fixtures.entries()) {
+          manager.add(meshes[i] as Mesh, fixture.set);
+        }
+        let seed = 42;
+        const nextRandom = (): number => {
+          seed = (seed * 1664525 + 1013904223) >>> 0;
+          return seed / 0x100000000;
+        };
+        const minScale = 0.05;
+        for (let frame = 0; frame < 60; frame++) {
+          for (const mesh of meshes) {
+            (mesh as Mesh).position.z = 2 + nextRandom() * 40;
+          }
+          now += 16;
+          manager.update(cameraAt(0));
+          const stats = manager.stats();
+          const fits = stats.requiredBytes <= budget * (1 + 1e-12) + 1e-6;
+          expect(fits || stats.thresholdScale === minScale).toBe(true);
+        }
+      } finally {
+        manager.dispose();
+      }
+    };
+    runWithEvictDelay(5000);
+    runWithEvictDelay(Infinity);
+  });
+
+  it('下限では scale===min で止まり、over>0 でも例外にならない', () => {
+    // ピン留め合計より小さい予算ではどこまで下げても収まらず、末尾で頭打ちになることの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('floor');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      expect(() => manager.update(cameraAt(5))).not.toThrow();
+      expect(manager.stats().thresholdScale).toBe(0.05);
+      expect(manager.stats().overBudgetBytes).toBeGreaterThan(0);
+      now += 16;
+      expect(() => manager.update(cameraAt(5))).not.toThrow();
+      expect(manager.stats().thresholdScale).toBe(0.05);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('カメラを遠ざけると冷却3秒＋1秒ごとに1段上がる', () => {
+    // 引き下げ後に遠方へ移し、注入時計で冷却と間隔どおり段階的に戻ることの確認。
+    let now = 0;
+    const budget = bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('raise');
+    const mesh = sceneMesh(base);
+    const ladder = buildScaleLadder(0.05, 1, 4);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // L0 相当で超過し、L1 に収まる段 (index 4, s=0.5) へ
+      expect(manager.stats().thresholdScale).toBe(ladder[4]);
+      // 遠方へ移す。以降の予測は最粗＋ピンだけになり、上げ余裕が生まれる。
+      // PlaneGeometry の外接球を避けるため十分に遠ざける。
+      mesh.position.z = 500;
+      const raisesBefore = manager.stats().scaleRaiseCount;
+      now += 1000;
+      manager.update(cameraAt(0));
+      expect(manager.stats().thresholdScale).toBe(ladder[4]); // 冷却中 (1秒<3秒)
+      now += 1000;
+      manager.update(cameraAt(0));
+      expect(manager.stats().thresholdScale).toBe(ladder[4]); // 冷却中 (2秒<3秒)
+      now += 1000;
+      manager.update(cameraAt(0));
+      expect(manager.stats().thresholdScale).toBe(ladder[3]); // 冷却明けで1段
+      now += 1000;
+      manager.update(cameraAt(0));
+      expect(manager.stats().thresholdScale).toBe(ladder[2]); // 間隔ごとに1段
+      expect(manager.stats().scaleRaiseCount).toBe(raisesBefore + 2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('排他: adaptive×keep-all と adaptive×thresholdScale は Error', () => {
+    expect(
+      () => new TextureLodManager({ residency: 'keep-all', adaptiveThresholdScale: true }),
+    ).toThrow(Error);
+    expect(
+      () =>
+        new TextureLodManager({
+          residency: 'keep-all',
+          adaptiveThresholdScale: { minScale: 0.5 },
+        }),
+    ).toThrow(Error);
+    expect(
+      () => new TextureLodManager({ thresholdScale: 0.5, adaptiveThresholdScale: true }),
+    ).toThrow(Error);
+    expect(
+      () =>
+        new TextureLodManager({
+          thresholdScale: 0.5,
+          adaptiveThresholdScale: { minScale: 0.1 },
+        }),
+    ).toThrow(Error);
+    // 非自動の thresholdScale 単体と adaptive 単体は許容する。
+    expect(() => new TextureLodManager({ thresholdScale: 0.5 })).not.toThrow();
+    expect(() => new TextureLodManager({ adaptiveThresholdScale: true })).not.toThrow();
+  });
+
+  it('非表示 anchor・非有限距離は現レベル維持で予測に含まれ、例外にならない', () => {
+    // 維持グループが予測の和集合に参加しても落ちず、レベルも動かないことの確認。
+    let now = 0;
+    const budget = bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+      adaptiveThresholdScale: true,
+    });
+    const good = set3('good');
+    const bad = set3('bad');
+    const meshGood = sceneMesh(good.base);
+    const meshBad = sceneMesh(bad.base);
+    try {
+      manager.add(meshGood, good.set);
+      manager.add(meshBad, bad.set);
+      manager.update(cameraAt(5));
+      const levelBefore = manager.levelOf(meshBad);
+      meshBad.visible = false;
+      meshGood.position.set(Number.NaN, 0, 0);
+      now += 16;
+      expect(() => manager.update(cameraAt(5))).not.toThrow();
+      expect(manager.levelOf(meshBad)).toBe(levelBefore);
+      expect(manager.stats().thresholdScale).toBeGreaterThan(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('setMaxResidentBytes で下げると次の update で s が下がり、null で budgetBytes null・over 0', () => {
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(8) + bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('budget');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().thresholdScale).toBe(1);
+      manager.setMaxResidentBytes(bytes(4) + bytes(2));
+      // 設定だけでは変わらず、次の update で下がる。
+      expect(manager.stats().thresholdScale).toBe(1);
+      now += 16;
+      manager.update(cameraAt(5));
+      expect(manager.stats().thresholdScale).toBeLessThan(1);
+      manager.setMaxResidentBytes(null);
+      const stats = manager.stats();
+      expect(stats.budgetBytes).toBeNull();
+      expect(stats.overBudgetBytes).toBe(0);
+      expect(() => manager.setMaxResidentBytes(-1)).toThrow(RangeError);
+      expect(() => manager.setMaxResidentBytes(NaN)).toThrow(RangeError);
+      expect(() => manager.setMaxResidentBytes(Infinity)).toThrow(RangeError);
+    } finally {
+      manager.dispose();
+    }
+    const keepAll = new TextureLodManager({ residency: 'keep-all' });
+    try {
+      expect(() => keepAll.setMaxResidentBytes(1024)).toThrow(Error);
+      expect(() => keepAll.setMaxResidentBytes(null)).not.toThrow();
+    } finally {
+      keepAll.dispose();
+    }
+  });
+
+  it('adaptive の不正な調整値は RangeError になる', () => {
+    expect(() => new TextureLodManager({ adaptiveThresholdScale: { minScale: 0 } })).toThrow(
+      RangeError,
+    );
+    expect(() => new TextureLodManager({ adaptiveThresholdScale: { minScale: 2 } })).toThrow(
+      RangeError,
+    );
+    expect(
+      () => new TextureLodManager({ adaptiveThresholdScale: { stepsPerOctave: 1.5 } }),
+    ).toThrow(RangeError);
+    expect(() => new TextureLodManager({ adaptiveThresholdScale: { raiseHeadroom: 0 } })).toThrow(
+      RangeError,
+    );
+    expect(() => new TextureLodManager({ adaptiveThresholdScale: { raiseHeadroom: 2 } })).toThrow(
+      RangeError,
+    );
+    expect(() => new TextureLodManager({ thresholdScale: 0 })).toThrow(RangeError);
+    expect(() => new TextureLodManager({ thresholdScale: NaN })).toThrow(RangeError);
+    expect(() => new TextureLodManager({ adaptiveThresholdScale: { stepsPerOctave: 65 } })).toThrow(
+      RangeError,
+    );
+  });
+});
+
+describe('TextureLodManager adaptiveThresholdScale（レビュー追補）', () => {
+  it('末尾で floor が続いても scaleLowerCount が増えない', () => {
+    // 既に下限で動かない floor は変化なしのため数えないことの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('floorCount');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().thresholdScale).toBe(0.05);
+      const lowers = manager.stats().scaleLowerCount;
+      expect(lowers).toBeGreaterThan(0);
+      for (let frame = 0; frame < 10; frame++) {
+        now += 16;
+        manager.update(cameraAt(5));
+      }
+      expect(manager.stats().thresholdScale).toBe(0.05);
+      expect(manager.stats().scaleLowerCount).toBe(lowers);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('静止収束後は scaleLowerCount/scaleRaiseCount が増えない', () => {
+    // 変化のない入力では判定が hold に落ち着き、回数が動かないことの確認。
+    let now = 0;
+    const budget = bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('stable');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      // 冷却と判定間隔が開くまで進め、収束させる。
+      for (let frame = 0; frame < 500; frame++) {
+        now += 16;
+        manager.update(cameraAt(5));
+      }
+      const stats = manager.stats();
+      const lowers = stats.scaleLowerCount;
+      const raises = stats.scaleRaiseCount;
+      for (let frame = 0; frame < 500; frame++) {
+        now += 16;
+        manager.update(cameraAt(5));
+      }
+      expect(manager.stats().scaleLowerCount).toBe(lowers);
+      expect(manager.stats().scaleRaiseCount).toBe(raises);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('setMaxResidentBytes(null) 後に冷却＋1段/秒で thresholdScale が 1 に戻る', () => {
+    // 予算なしでは predict を呼ばず、間隔ごとに段階的に最大へ戻ることの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('restore');
+    const mesh = sceneMesh(base);
+    const ladder = buildScaleLadder(0.05, 1, 4);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      const lowered = manager.stats().thresholdScale;
+      expect(lowered).toBeLessThan(1);
+      manager.setMaxResidentBytes(null);
+      // 冷却中は上がらない。
+      now += 1000;
+      manager.update(cameraAt(5));
+      expect(manager.stats().thresholdScale).toBe(lowered);
+      // 冷却明け後は1秒ごとに1段上がり、やがて 1 に戻る。
+      let scale = lowered;
+      for (let step = 0; step < ladder.length; step++) {
+        now += 1000;
+        manager.update(cameraAt(5));
+        const next = manager.stats().thresholdScale;
+        expect(next).toBeGreaterThanOrEqual(scale);
+        scale = next;
+      }
+      expect(manager.stats().thresholdScale).toBe(1);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('adaptiveThresholdScale: null は false と同じく無効扱いになる', () => {
+    const manager = new TextureLodManager({
+      adaptiveThresholdScale: null as unknown as undefined,
+    });
+    const { set, base } = set3('nullAdaptive');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().thresholdScale).toBe(1);
+      expect(manager.stats().scaleLowerCount).toBe(0);
+      expect(manager.stats().scaleRaiseCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('極小スケールで distance/scale が非有限でも update 全体が止まらない', () => {
+    // 固定スケール 1e-310 では通常距離でも非有限になり、現レベル維持になることの確認。
+    const manager = new TextureLodManager({ distanceMode: 'center', thresholdScale: 1e-310 });
+    const { set, base } = set3('tiny');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      expect(() => manager.update(cameraAt(5))).not.toThrow();
+      // 一度も判定できていないためレベルは未割当のまま。
+      expect(manager.levelOf(mesh)).toBeNull();
+      // 十分大きいスケールに戻すと通常判定に戻る。
+      manager.setThresholdScale(1);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+      // 既に割当済みのレベルがある状態で極小化しても、現レベルを維持し例外にならない。
+      manager.setThresholdScale(1e-310);
+      expect(() => manager.update(cameraAt(30))).not.toThrow();
+      expect(manager.levelOf(mesh)).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+});
+
+describe('TextureLodManager requiredBytes の独立検証（過大評価検出）', () => {
+  /** 共有テクスチャを含む2セットの器具。両 set の L0 は同一 Texture を指す。 */
+  function sharedFixture() {
+    const shared = dataTexture(8);
+    const a1 = dataTexture(4);
+    const coarseA = dataTexture(2);
+    const b1 = dataTexture(4);
+    const coarseB = dataTexture(1);
+    const baseA = new MeshStandardMaterial({ name: 'a' });
+    const baseB = new MeshStandardMaterial({ name: 'b' });
+    const setA = createTextureLodSet({
+      material: baseA,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: a1 } },
+        { distance: 20, textures: { map: coarseA } },
+      ],
+      hysteresis: 0.1,
+    });
+    const setB = createTextureLodSet({
+      material: baseB,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: b1 } },
+        { distance: 20, textures: { map: coarseB } },
+      ],
+      hysteresis: 0.1,
+    });
+    return { setA, baseA, setB, baseB, shared, a1, b1, coarseA, coarseB };
+  }
+
+  it('requiredBytes は現用レベル∪全set最粗の和と一致する（共有は1回だけ）', () => {
+    // 過小評価（M1/M2/M3）だけでなく、共有テクスチャの二重計上のような過大評価も落とす。
+    // 期待値はテスト側で和集合として独立に計算し、実装の内部計算とは別経路にする。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+    });
+    const fixture = sharedFixture();
+    const meshA1 = sceneMesh(fixture.baseA);
+    meshA1.position.z = 5;
+    const meshA2 = sceneMesh(fixture.baseA);
+    meshA2.position.z = 5;
+    const meshB2 = sceneMesh(fixture.baseB);
+    const meshB3 = sceneMesh(fixture.baseB);
+    meshB3.position.z = 15;
+    const camera = cameraAt(0);
+    try {
+      manager.add(meshA1, fixture.setA);
+      manager.addGroup([
+        { mesh: meshA2, set: fixture.setA },
+        { mesh: meshB2, set: fixture.setB },
+      ]);
+      manager.add(meshB3, fixture.setB);
+      manager.update(camera); // g1=L0、g2=L0、g3=L1
+      expect(manager.levelOf(meshA1)).toBe(0);
+      expect(manager.levelOf(meshA2)).toBe(0);
+      expect(manager.levelOf(meshB3)).toBe(1);
+      // 現用 {shared, b1} ∪ 最粗 {coarseA, coarseB}。shared は2束縛で使っても1回だけ。
+      const expected1 = bytes(8) + bytes(4) + bytes(2) + bytes(1);
+      expect(manager.stats().requiredBytes).toBeCloseTo(expected1, 10);
+      // 未参照の a1 を含むため resident は required より大きい（required != resident の確認）。
+      expect(manager.stats().residentBytes).toBeCloseTo(expected1 + bytes(4), 10);
+      // g3 を隠して維持にし、g1 を L1 へ動かす。維持中の b1 も必要量に残る。
+      meshB3.visible = false;
+      meshA1.position.z = 15;
+      now += 16;
+      manager.update(camera); // g1=L1、g2=L0、g3=L1維持
+      expect(manager.levelOf(meshA1)).toBe(1);
+      expect(manager.levelOf(meshB3)).toBe(1);
+      // 現用 {a1, shared, b1} ∪ 最粗 {coarseA, coarseB}。
+      const expected2 = bytes(4) + bytes(8) + bytes(4) + bytes(2) + bytes(1);
+      expect(manager.stats().requiredBytes).toBeCloseTo(expected2, 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('予算が十分なら下げず scale===1・lower 0 を保つ', () => {
+    // 過大評価（常に下限へ落とす実装など）はここで落ちる。予算は全テクスチャ合計の1.5倍。
+    // 二重計上の変異では必要量が2倍に見えるため、この予算では超過して落ちる。
+    const fixture = sharedFixture();
+    const total = bytes(8) + bytes(4) + bytes(4) + bytes(2) + bytes(1);
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: total * 1.5,
+      adaptiveThresholdScale: true,
+    });
+    const meshA1 = sceneMesh(fixture.baseA);
+    const meshA2 = sceneMesh(fixture.baseA);
+    const meshB2 = sceneMesh(fixture.baseB);
+    const anchors = [meshA1, meshA2];
+    const camera = cameraAt(0);
+    try {
+      manager.add(meshA1, fixture.setA);
+      manager.addGroup([
+        { mesh: meshA2, set: fixture.setA },
+        { mesh: meshB2, set: fixture.setB },
+      ]);
+      const pattern = [3, 12, 25, 7, 30, 5];
+      for (let frame = 0; frame < 200; frame++) {
+        now += 16;
+        for (const [i, anchor] of anchors.entries()) {
+          anchor.position.z = pattern[(frame + i) % pattern.length] as number;
+          anchor.visible = frame % 7 !== 3 || i !== 0;
+        }
+        manager.update(camera);
+        const stats = manager.stats();
+        expect(stats.thresholdScale).toBe(1);
+        expect(stats.budgetBytes).toBe(total * 1.5);
+        expect(stats.requiredBytes).toBeLessThanOrEqual(total * 1.5);
+      }
+      expect(manager.stats().scaleLowerCount).toBe(0);
+      expect(manager.stats().scaleRaiseCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('予算が必要量ちょうどでも下げない（1バイトの過大評価も検出する）', () => {
+    // 更新後の現用レベル∪全set最粗の和をテスト側で独立に計算し、その値を上限に設定する。
+    // 実装が1バイトでも過大評価していれば `predict > budget` で scale が下がるため、
+    // `scale===1` で検出できる。逆に過小評価していれば不変条件テスト側で落ちる。
+    // 推定バイトが整数になるサイズ（3の倍数）を選び、浮動小数点の順序誤差を排除する。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1_000_000,
+      adaptiveThresholdScale: true,
+    });
+    const shared = dataTexture(12);
+    const a1 = dataTexture(6);
+    const coarseA = dataTexture(3);
+    const b1 = dataTexture(6);
+    const coarseB = dataTexture(3);
+    const baseA = new MeshStandardMaterial({ name: 'a' });
+    const baseB = new MeshStandardMaterial({ name: 'b' });
+    const setA = createTextureLodSet({
+      material: baseA,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: a1 } },
+        { distance: 20, textures: { map: coarseA } },
+      ],
+      hysteresis: 0.1,
+    });
+    const setB = createTextureLodSet({
+      material: baseB,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: b1 } },
+        { distance: 20, textures: { map: coarseB } },
+      ],
+      hysteresis: 0.1,
+    });
+    const meshA1 = sceneMesh(baseA);
+    meshA1.position.z = 5;
+    const meshA2 = sceneMesh(baseA);
+    meshA2.position.z = 5;
+    const meshB2 = sceneMesh(baseB);
+    const meshB3 = sceneMesh(baseB);
+    meshB3.position.z = 15;
+    const camera = cameraAt(0);
+    try {
+      manager.add(meshA1, setA);
+      manager.addGroup([
+        { mesh: meshA2, set: setA },
+        { mesh: meshB2, set: setB },
+      ]);
+      manager.add(meshB3, setB);
+      manager.update(camera); // g1=L0、g2=L0、g3=L1
+      expect(manager.levelOf(meshA1)).toBe(0);
+      expect(manager.levelOf(meshA2)).toBe(0);
+      expect(manager.levelOf(meshB3)).toBe(1);
+      // 現用 {shared, b1} ∪ 最粗 {coarseA, coarseB}。整数和のため順序誤差なし。
+      const sizeOf = new Map<Texture, number>([
+        [shared, 12],
+        [a1, 6],
+        [coarseA, 3],
+        [b1, 6],
+        [coarseB, 3],
+      ]);
+      const expected = new Set([shared, b1, coarseA, coarseB]);
+      let expectedBytes = 0;
+      for (const texture of expected) {
+        expectedBytes += bytes(sizeOf.get(texture) as number);
+      }
+      expect(manager.stats().requiredBytes).toBe(expectedBytes);
+      manager.setMaxResidentBytes(expectedBytes);
+      // シーンは静止させる。predict が1バイトでも多ければ初回で下がる。
+      for (let frame = 0; frame < 50; frame++) {
+        now += 16;
+        manager.update(camera);
+        expect(manager.stats().thresholdScale).toBe(1);
+        expect(manager.stats().requiredBytes).toBe(expectedBytes);
+      }
+      expect(manager.stats().scaleLowerCount).toBe(0);
+      expect(manager.stats().scaleRaiseCount).toBe(0);
     } finally {
       manager.dispose();
     }

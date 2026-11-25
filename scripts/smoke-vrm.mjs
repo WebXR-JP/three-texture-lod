@@ -526,7 +526,7 @@ async function checkBudget(browser, backend) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?auto=0&evictDelay=5000&budget=32&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?auto=0&evictDelay=5000&budget=32&wander=0&adaptive=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -577,6 +577,7 @@ async function checkBudget(browser, backend) {
       budgetBytes: tight.manager.budgetBytes,
       overBudgetBytes: tight.manager.overBudgetBytes,
       residentBytes: tight.manager.residentBytes,
+      requiredBytes: tight.manager.requiredBytes,
       evictCount: tight.manager.evictCount,
       levels: tight.avatars.map((avatar) => avatar.level),
     };
@@ -591,6 +592,13 @@ async function checkBudget(browser, backend) {
     assert(
       tight.manager.evictCount > 0,
       `${backend} (budget): 締め後の破棄が起きていない (evictCount=${tight.manager.evictCount})`,
+    );
+    // 予算 < 必要量なので、破棄可能（未参照・非最粗）はすべて消え、
+    // resident と required が一致する。
+    // 浮動小数の和の順序差に備え、絶対差 1 バイト未満で比較する。
+    assert(
+      Math.abs(tight.manager.residentBytes - tight.manager.requiredBytes) < 1,
+      `${backend} (budget): resident と required が不一致: ${tight.manager.residentBytes} / ${tight.manager.requiredBytes}`,
     );
     assert(
       JSON.stringify(tight.avatars.map((avatar) => avatar.level)) === JSON.stringify(levelsBefore),
@@ -639,6 +647,285 @@ async function checkBudget(browser, backend) {
   } catch (error) {
     result.error = String(error?.stack ?? error);
     assert(false, `${backend} (budget): 例外: ${String(error)}`);
+  } finally {
+    result.messages = messages.slice(-20);
+    await page.close();
+  }
+  return result;
+}
+
+async function checkAdaptiveBudget(browser, backend) {
+  // 予算適応スケール（既定ON）。`?budget=8` で予測常駐が必要量以下に収まるまで
+  // scale が下がり、解除後は 1 に戻ることを検証する。
+  const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+  const messages = [];
+  page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  const result = { backend, ok: false };
+  try {
+    await page.goto(
+      `${BASE_URL}/vrm.html?auto=0&wander=0&budget=8&evictDelay=1000${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      { waitUntil: 'load' },
+    );
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 300000 },
+    );
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    result.status = status;
+    if (status !== 'ready') {
+      assert(false, `${backend} (adaptive): デモが ready にならなかった（status=${status}）`);
+      return result;
+    }
+    const adaptiveFlag = await page.evaluate(() => window.__vrmDemo.stats().adaptiveEnabled);
+    assert(adaptiveFlag === true, `${backend} (adaptive): adaptiveEnabled が true でない: ${adaptiveFlag}`);
+
+    // 収束を最大15秒待つ。下げは即時・複数段のため、数秒で落ち着く想定。
+    // 下限張り付きの判定に下限値の直書きは使わない。収束条件を満たさず
+    // required が予算を上回ったままなら、下限で頭打ちとみなす。
+    let converged = null;
+    const convergeStart = Date.now();
+    while (Date.now() - convergeStart < 15000) {
+      const sample = await statsOf(page);
+      const m = sample.manager;
+      if (
+        m.requiredBytes <= (m.budgetBytes ?? Infinity) &&
+        m.overBudgetBytes === 0
+      ) {
+        converged = sample;
+        break;
+      }
+      await sleep(500);
+    }
+    const stats = converged ?? (await statsOf(page));
+    // 下限張り付き: 収束条件を満たさなくても、required が予算超過のままなら
+    // 下限で頭打ちとみなして受け入れる（下限値の直書きは使わない）。
+    const floored = stats.manager.requiredBytes > (stats.manager.budgetBytes ?? Infinity);
+    if (converged === null && floored) converged = stats;
+    result.initial = {
+      budgetBytes: stats.manager.budgetBytes,
+      requiredBytes: stats.manager.requiredBytes,
+      residentBytes: stats.manager.residentBytes,
+      overBudgetBytes: stats.manager.overBudgetBytes,
+      thresholdScale: stats.manager.thresholdScale,
+      scaleLowerCount: stats.manager.scaleLowerCount,
+      scaleRaiseCount: stats.manager.scaleRaiseCount,
+      levelCounts: stats.levelCounts,
+      managerGeneration: stats.managerGeneration,
+      waitMs: Date.now() - convergeStart,
+    };
+    assert(converged !== null, `${backend} (adaptive): 15秒で収束しなかった: ${JSON.stringify(result.initial)}`);
+    assert(
+      stats.manager.budgetBytes === 8 * 1048576,
+      `${backend} (adaptive): budgetBytes が 8MB でない: ${stats.manager.budgetBytes}`,
+    );
+    assert(
+      stats.manager.requiredBytes <= stats.manager.budgetBytes || floored,
+      `${backend} (adaptive): required が予算以下にならない: ${stats.manager.requiredBytes} / ${stats.manager.budgetBytes}`,
+    );
+    if (!floored) {
+      assert(
+        stats.manager.overBudgetBytes === 0,
+        `${backend} (adaptive): overBudgetBytes が 0 でない: ${stats.manager.overBudgetBytes}`,
+      );
+    }
+    // 起動直後の scale<1 は必須にしない（手順2の強制下げで確定的に取る）。
+    // lower が起きたこと自体はここで確認する。
+    assert(
+      stats.manager.scaleLowerCount > 0,
+      `${backend} (adaptive): scaleLowerCount が 0 のまま: ${stats.manager.scaleLowerCount}`,
+    );
+    assert(
+      stats.levelCounts[3] !== stats.avatars.length,
+      `${backend} (adaptive): 全体が L3 まで粗くなった: ${JSON.stringify(stats.levelCounts)}`,
+    );
+
+    // 手順2: 予算を 2MB に締めて強制的に下げる。定常の必要量（約5MB）を下回るため下げが起きる。
+    // 初期収束の残りで scale<1 のままの可能性があるため、数フレーム進めてから
+    // scale<1 かつ required≤予算（または下限張り付き）になるまで最大15秒待つ。
+    const forceOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 2 }));
+    assert(forceOk === true, `${backend} (adaptive): setSettings({ budgetMB: 2 }) が false`);
+    await waitFrames(page, 6);
+    let forcedSample = null;
+    let lastForcedScale = null;
+    let lastForcedScaleAt = Date.now();
+    const forceStart = Date.now();
+    while (Date.now() - forceStart < 15000) {
+      const sample = await statsOf(page);
+      const m = sample.manager;
+      if (
+        m.thresholdScale < 1 &&
+        m.requiredBytes <= (m.budgetBytes ?? Infinity) &&
+        m.overBudgetBytes === 0
+      ) {
+        forcedSample = sample;
+        break;
+      }
+      // 下限張り付き: scale が2秒間変わらず required が超過のままなら頭打ちとみなす（下限値の直書きは使わない）。
+      if (m.thresholdScale !== lastForcedScale) {
+        lastForcedScale = m.thresholdScale;
+        lastForcedScaleAt = Date.now();
+      } else if (
+        m.requiredBytes > (m.budgetBytes ?? Infinity) &&
+        Date.now() - lastForcedScaleAt >= 2000
+      ) {
+        forcedSample = sample;
+        break;
+      }
+      await sleep(500);
+    }
+    const forced = forcedSample ?? (await statsOf(page));
+    const forcedFloored = forced.manager.requiredBytes > (forced.manager.budgetBytes ?? Infinity);
+    result.forced = {
+      budgetBytes: forced.manager.budgetBytes,
+      requiredBytes: forced.manager.requiredBytes,
+      residentBytes: forced.manager.residentBytes,
+      overBudgetBytes: forced.manager.overBudgetBytes,
+      thresholdScale: forced.manager.thresholdScale,
+      scaleLowerCount: forced.manager.scaleLowerCount,
+      scaleRaiseCount: forced.manager.scaleRaiseCount,
+      levelCounts: forced.levelCounts,
+      waitMs: Date.now() - forceStart,
+    };
+    assert(forcedSample !== null, `${backend} (adaptive): 2MB 締めで15秒待っても scale<1 かつ required≤予算にならない: ${JSON.stringify(result.forced)}`);
+    assert(
+      forced.manager.budgetBytes === 2 * 1048576,
+      `${backend} (adaptive): 締め後の budgetBytes が 2MB でない: ${forced.manager.budgetBytes}`,
+    );
+    assert(
+      forced.manager.requiredBytes <= forced.manager.budgetBytes || forcedFloored,
+      `${backend} (adaptive): 2MB 締めで required が予算以下にならない: ${forced.manager.requiredBytes} / ${forced.manager.budgetBytes}`,
+    );
+    if (!forcedFloored) {
+      assert(
+        forced.manager.overBudgetBytes === 0,
+        `${backend} (adaptive): 2MB 締め後の overBudgetBytes が 0 でない: ${forced.manager.overBudgetBytes}`,
+      );
+    }
+
+    // 手順3: 予算を解除し、scale === 1 になるまで最大40秒待つ（下限からの復帰経路を実際に通す）。
+    // 下限 0.05 からは冷却3秒＋18段×1秒 ≈ 21秒かかるため余裕を持たせる。早すぎる場合は失敗にする。
+    const raiseBeforeRestore = forced.manager.scaleRaiseCount;
+    const unsetOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 0 }));
+    assert(unsetOk === true, `${backend} (adaptive): setSettings({ budgetMB: 0 }) が false`);
+    let restored = null;
+    const restoreStart = Date.now();
+    while (Date.now() - restoreStart < 40000) {
+      const sample = await statsOf(page);
+      if (sample.manager.thresholdScale === 1) {
+        restored = sample;
+        break;
+      }
+      await sleep(500);
+    }
+    const after = restored ?? (await statsOf(page));
+    result.restored = {
+      thresholdScale: after.manager.thresholdScale,
+      scaleRaiseCount: after.manager.scaleRaiseCount,
+      scaleRaiseDelta: after.manager.scaleRaiseCount - raiseBeforeRestore,
+      scaleLowerCount: after.manager.scaleLowerCount,
+      requiredBytes: after.manager.requiredBytes,
+      overBudgetBytes: after.manager.overBudgetBytes,
+      levelCounts: after.levelCounts,
+      waitMs: Date.now() - restoreStart,
+    };
+    assert(restored !== null, `${backend} (adaptive): 40秒で scale が 1 に戻らなかった: ${JSON.stringify(result.restored)}`);
+    assert(
+      after.manager.thresholdScale === 1,
+      `${backend} (adaptive): 解除後の scale が 1 でない: ${after.manager.thresholdScale}`,
+    );
+    assert(
+      after.manager.scaleRaiseCount > raiseBeforeRestore,
+      `${backend} (adaptive): 解除後に scaleRaiseCount が増えていない: ${raiseBeforeRestore} → ${after.manager.scaleRaiseCount}`,
+    );
+
+    // 手順4: 解除後に5秒間、scale・カウンタ・切替が不変であること。
+    const stableAnchor = {
+      thresholdScale: after.manager.thresholdScale,
+      scaleLowerCount: after.manager.scaleLowerCount,
+      scaleRaiseCount: after.manager.scaleRaiseCount,
+      switchCount: after.manager.switchCount,
+    };
+    await sleep(5000);
+    const stableSample = await statsOf(page);
+    result.stable = {
+      thresholdScale: stableSample.manager.thresholdScale,
+      scaleLowerCount: stableSample.manager.scaleLowerCount,
+      scaleRaiseCount: stableSample.manager.scaleRaiseCount,
+      switchCount: stableSample.manager.switchCount,
+      requiredBytes: stableSample.manager.requiredBytes,
+      residentBytes: stableSample.manager.residentBytes,
+      overBudgetBytes: stableSample.manager.overBudgetBytes,
+      levelCounts: stableSample.levelCounts,
+    };
+    assert(
+      stableSample.manager.thresholdScale === stableAnchor.thresholdScale,
+      `${backend} (adaptive): 解除後5秒で scale が変化した: ${stableAnchor.thresholdScale} → ${stableSample.manager.thresholdScale}`,
+    );
+    assert(
+      stableSample.manager.scaleLowerCount === stableAnchor.scaleLowerCount,
+      `${backend} (adaptive): 解除後5秒で scaleLowerCount が変化した: ${stableAnchor.scaleLowerCount} → ${stableSample.manager.scaleLowerCount}`,
+    );
+    assert(
+      stableSample.manager.scaleRaiseCount === stableAnchor.scaleRaiseCount,
+      `${backend} (adaptive): 解除後5秒で scaleRaiseCount が変化した: ${stableAnchor.scaleRaiseCount} → ${stableSample.manager.scaleRaiseCount}`,
+    );
+    assert(
+      stableSample.manager.switchCount === stableAnchor.switchCount,
+      `${backend} (adaptive): 解除後5秒で switchCount が変化した: ${stableAnchor.switchCount} → ${stableSample.manager.switchCount}`,
+    );
+
+    // 手順5: 予算 0→8MB の再適用。`setMaxResidentBytes` で作り直さないため、
+    // マネージャ世代番号は進まない。初回割当でも増える switchCount だけでは作り直しを見抜けないため、
+    // 世代番号の不変で判定する（作り直していたら世代が進む）。
+    const generationBeforeReapply = after.managerGeneration;
+    const lowerBeforeReapply = after.manager.scaleLowerCount;
+    const switchBeforeReapply = after.manager.switchCount;
+    const reapplyOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 8 }));
+    assert(reapplyOk === true, `${backend} (adaptive): setSettings({ budgetMB: 8 }) が false`);
+    let reapplied = null;
+    const reapplyStart = Date.now();
+    while (Date.now() - reapplyStart < 10000) {
+      const sample = await statsOf(page);
+      const m = sample.manager;
+      if (m.requiredBytes <= (m.budgetBytes ?? Infinity) && m.overBudgetBytes === 0) {
+        reapplied = sample;
+        break;
+      }
+      await sleep(500);
+    }
+    const reagain = reapplied ?? (await statsOf(page));
+    result.reapplied = {
+      thresholdScale: reagain.manager.thresholdScale,
+      requiredBytes: reagain.manager.requiredBytes,
+      residentBytes: reagain.manager.residentBytes,
+      overBudgetBytes: reagain.manager.overBudgetBytes,
+      scaleLowerCount: reagain.manager.scaleLowerCount,
+      switchCount: reagain.manager.switchCount,
+      managerGeneration: reagain.managerGeneration,
+      waitMs: Date.now() - reapplyStart,
+    };
+    assert(reapplied !== null, `${backend} (adaptive): 再適用後に10秒で収束しなかった: ${JSON.stringify(result.reapplied)}`);
+    assert(
+      reagain.managerGeneration === generationBeforeReapply,
+      `${backend} (adaptive): 再適用でマネージャ世代が進んだ（作り直しの疑い）: ${generationBeforeReapply} → ${reagain.managerGeneration}`,
+    );
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    const noise = messages.filter((message) =>
+      /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+    );
+    result.consoleErrors = consoleErrors;
+    result.webgpuNoise = noise;
+    assert(consoleErrors.length === 0, `${backend} (adaptive): コンソールエラー ${consoleErrors.join(' | ')}`);
+    assert(noise.length === 0, `${backend} (adaptive): GPU関連の警告 ${noise.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (adaptive): 例外: ${String(error)}`);
   } finally {
     result.messages = messages.slice(-20);
     await page.close();
@@ -976,7 +1263,7 @@ async function main() {
       await sleep(100);
     }
 
-    // 検証ごとに状態を分離するため、1体・既定・複製・4ソース・budget・crowd は
+    // 検証ごとに状態を分離するため、1体・既定・複製・4ソース・budget・adaptive・crowd は
     // それぞれ新しい Chrome で実行する（0.6.0 の共有レンダラーでコンテキスト数はソース数に比例しない）。
     const launchBrowser = () =>
       chromium.launch({
@@ -1038,6 +1325,14 @@ async function main() {
         await budgetBrowser.close();
       }
 
+      const adaptiveBrowser = await launchBrowser();
+      let adaptive;
+      try {
+        adaptive = await checkAdaptiveBudget(adaptiveBrowser, backend);
+      } finally {
+        await adaptiveBrowser.close();
+      }
+
       const crowdBrowser = await launchBrowser();
       let crowd;
       try {
@@ -1050,6 +1345,7 @@ async function main() {
       single.default = defaultPage;
       single.clones = clones;
       single.budget = budget;
+      single.adaptive = adaptive;
       single.crowd = crowd;
       single.ok = failures.length === 0;
       results.push(single);

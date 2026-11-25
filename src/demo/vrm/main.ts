@@ -19,7 +19,9 @@
  * - `?auto=0` 自動カメラを停止
  * - `?residency=keep-all` 常駐モード
  * - `?evictDelay=1000` evict の猶予ms
- * - `?budget=32` 常駐上限MB（0で無効、既定0）
+ * - `?budget=32` 常駐上限MB（0で無効、既定0。0〜4096）
+ * - `?adaptive=0` 予算適応の距離しきい値スケールを無効化（既定は有効）
+ * - `?scale=0.5` 固定の距離しきい値倍率（0.05〜4。範囲外はクランプ、非数値は無視。指定時は adaptive より優先）
  */
 import GUI from 'lil-gui';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -66,10 +68,29 @@ const atlasResolution = clampNumber(Math.round(Number(params.get('atlas') ?? 102
 let hysteresis = clampNumber(Number(params.get('h') ?? 0.15), 0, 0.3, 0.15);
 let residency: ResidencyMode = params.get('residency') === 'keep-all' ? 'keep-all' : 'evict';
 let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 10000, 1000);
-let budgetMB = clampNumber(Math.round(Number(params.get('budget') ?? 0)), 0, 256, 0);
+let budgetMB = clampNumber(Math.round(Number(params.get('budget') ?? 0)), 0, 4096, 0);
 let lodEnabled = params.get('lod') !== '0';
 let autoCamera = params.get('auto') !== '0';
 let wanderEnabled = params.get('wander') !== '0';
+// 予算適応の距離しきい値スケール。既定で有効（予算0では実質無効。
+// 予算がなくても manager には adaptive を渡し、後から `setMaxResidentBytes` で
+// 予算を設定できる（作り直し不要）。`?adaptive=0` で無効。
+// `?scale` 指定時は固定倍率を優先し、adaptive を無効化する。
+let adaptiveEnabled = params.get('adaptive') !== '0';
+const scaleParamRaw = params.get('scale');
+// `?scale` が範囲外なら 0.05〜4 にクランプする。非数値・空文字は無視して adaptive のままにする。
+let fixedScale: number | null = null;
+if (scaleParamRaw !== null && scaleParamRaw.trim() !== '') {
+  const parsed = Number(scaleParamRaw);
+  if (Number.isFinite(parsed)) fixedScale = clampNumber(parsed, 0.05, 4, parsed);
+}
+if (fixedScale !== null) adaptiveEnabled = false;
+
+/** adaptive が実際に manager へ渡る条件。固定 scale・keep-all・LOD無効では効かない。
+ * 予算0でも adaptive 自体は渡す（引き上げのみで実質無効）。予算の後付けは作り直し不要。 */
+function isAdaptiveActive(): boolean {
+  return adaptiveEnabled && fixedScale === null && residency === 'evict' && lodEnabled;
+}
 
 const modelSpecs = (params.get('models') ?? 'A,B,C')
   .split(',')
@@ -148,6 +169,9 @@ for (let index = 0; index < MAX_LABELS; index++) {
 }
 
 let manager = createManager();
+// マネージャの世代番号。`recreateManager()`/`recreateLod()` で置き換えるたびに進む。
+// `setMaxResidentBytes` では進まないため、予算再適用が作り直しか否かの判定に使える。
+let managerGeneration = 0;
 let manualLevel: number | null = null;
 let frame = 0;
 let elapsed = 0;
@@ -163,11 +187,14 @@ let busy = false;
 let labelsDirty = true;
 
 function createManager(): TextureLodManager {
+  const adaptive = isAdaptiveActive();
   return new TextureLodManager({
     distanceMode: 'surface',
     residency,
     evictDelayMs,
     maxResidentBytes: residency === 'evict' && budgetMB > 0 ? budgetMB * 1048576 : undefined,
+    ...(adaptive ? { adaptiveThresholdScale: true as const } : {}),
+    ...(!adaptive && fixedScale !== null ? { thresholdScale: fixedScale } : {}),
   });
 }
 
@@ -419,6 +446,7 @@ function recreateLod(nextHysteresis: number): boolean {
   manualLevel = null;
   guiState.forceLevel = 'auto';
   manager = createManager();
+  managerGeneration++;
   if (lodEnabled) for (const avatar of avatars) addGroup(avatar);
   return true;
 }
@@ -427,6 +455,7 @@ function recreateLod(nextHysteresis: number): boolean {
 function recreateManager(): void {
   manager.dispose();
   manager = createManager();
+  managerGeneration++;
   if (lodEnabled && manualLevel === null) {
     for (const avatar of avatars) addGroup(avatar);
   }
@@ -703,6 +732,8 @@ const guiState = {
   residency,
   evictDelayMs,
   budgetMB,
+  adaptive: adaptiveEnabled,
+  thresholdScaleDisplay: fixedScale !== null ? `fixed ${fixedScale.toFixed(2)}` : '1.000',
   autoCamera,
   avatarCount: avatars.length,
   wander: wanderEnabled,
@@ -712,6 +743,17 @@ const guiState = {
   removeClone,
   reload: () => location.reload(),
 };
+
+/** 予算上限をマネージャへ反映する。作り直しはしない（adaptive 切替時を除く）。 */
+function applyBudgetToManager(): void {
+  if (!lodEnabled || manualLevel !== null || residency !== 'evict') return;
+  try {
+    manager.setMaxResidentBytes(budgetMB > 0 ? budgetMB * 1048576 : null);
+  } catch (error) {
+    // keep-all との併用など。manager 側の条件と食い違う場合は作り直し側に任せる。
+    console.warn(`[Texture LOD] setMaxResidentBytes に失敗: ${String(error)}`);
+  }
+}
 
 // 自動カメラ中でもドラッグ開始で自動を止め、ユーザー操作を優先する。
 controls.addEventListener('start', () => {
@@ -754,18 +796,44 @@ gui
   })
   .listen();
 const budgetController = gui
-  .add(guiState, 'budgetMB', 0, 256, 1)
+  .add(guiState, 'budgetMB', 0, 4096, 1)
   .name('メモリ上限(MB)')
   .onFinishChange((value: number) => {
-    budgetMB = value;
-    recreateManager();
+    budgetMB = clampNumber(Math.round(value), 0, 4096, budgetMB);
+    guiState.budgetMB = budgetMB;
+    applyBudgetToManager();
   })
   .listen();
 
-/** `keep-all` 選択中と LOD off 中は上限スライダーを無効化する。 */
+const adaptiveController = gui
+  .add(guiState, 'adaptive')
+  .name('自動スケール')
+  .onChange((value: boolean) => {
+    adaptiveEnabled = value;
+    if (adaptiveEnabled) fixedScale = null;
+    guiState.thresholdScaleDisplay =
+      fixedScale !== null ? `fixed ${fixedScale.toFixed(2)}` : adaptiveEnabled ? guiState.thresholdScaleDisplay : 'off';
+    recreateManager();
+    updateBudgetController();
+  })
+  .listen();
+
+const thresholdScaleController = gui
+  .add(guiState, 'thresholdScaleDisplay')
+  .name('しきい値倍率')
+  .disable()
+  .listen();
+
+/** `keep-all` 選択中と LOD off 中は上限・自動スケールのスライダーを無効化する。 */
 function updateBudgetController(): void {
-  if (residency === 'keep-all' || !lodEnabled) budgetController.disable();
-  else budgetController.enable();
+  if (residency === 'keep-all' || !lodEnabled) {
+    budgetController.disable();
+    adaptiveController.disable();
+  } else {
+    budgetController.enable();
+    adaptiveController.enable();
+  }
+  thresholdScaleController.disable();
 }
 updateBudgetController();
 gui.add(guiState, 'autoCamera').name('自動カメラ').onChange((value: boolean) => {
@@ -904,6 +972,12 @@ function updateHud(): void {
   const levelText = [0, 1, 2, 3].map((level) => `L${level} ${counts[level] ?? 0}`).join('  ');
   const pipelines = pipelineInfo();
   const resident = manualLevel !== null || !lodEnabled ? atlasBytes : stats.residentBytes;
+  // GUIの読み取り専用「しきい値倍率」を250ms HUD更新に合わせて反映する。
+  // adaptive が無効な条件（keep-all / LOD無効 / 手動固定 / 固定scale）では古い値を残さず明示する。
+  if (fixedScale !== null) guiState.thresholdScaleDisplay = `fixed ${fixedScale.toFixed(2)}`;
+  else if (isAdaptiveActive() && manualLevel === null)
+    guiState.thresholdScaleDisplay = stats.thresholdScale.toFixed(3);
+  else guiState.thresholdScaleDisplay = 'off';
   const rows = avatars.slice(0, 12).map((avatar, index) => {
     const level = levelOfAvatar(index);
     const distance = computeLodDistance(avatar.anchor, camera, 'surface');
@@ -926,7 +1000,9 @@ function updateHud(): void {
     manualLevel === null &&
     residency === 'evict' &&
     budgetMB > 0
-      ? `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}`
+      ? isAdaptiveActive()
+        ? `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}  scale ${stats.thresholdScale.toFixed(3)}  need ${(stats.requiredBytes / 1048576).toFixed(1)} MB${stats.requiredBytes > (stats.budgetBytes ?? Infinity) && stats.thresholdScale === 0.05 ? ' FLOOR' : ''}`
+        : `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}`
       : residency === 'keep-all' && budgetMB > 0
         ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (keep-all)`
         : residency === 'evict' && budgetMB > 0 && !lodEnabled
@@ -1023,6 +1099,10 @@ const api = {
       residency,
       evictDelayMs,
       budgetMB,
+      adaptiveEnabled,
+      fixedScale,
+      managerGeneration,
+      scale: manager.stats().thresholdScale,
       manualLevel,
       wander: wanderEnabled,
       wanderRadius: WANDER_TUNING.radius,
@@ -1078,6 +1158,8 @@ const api = {
     residency?: ResidencyMode;
     evictDelayMs?: number;
     budgetMB?: number;
+    adaptive?: boolean;
+    thresholdScale?: number;
     lodEnabled?: boolean;
     forceLevel?: number | null;
     autoCamera?: boolean;
@@ -1098,16 +1180,55 @@ const api = {
     }
     if (
       partial.budgetMB !== undefined &&
-      (!Number.isFinite(partial.budgetMB) || partial.budgetMB < 0 || partial.budgetMB > 256)
+      (!Number.isFinite(partial.budgetMB) || partial.budgetMB < 0 || partial.budgetMB > 4096)
+    ) {
+      return false;
+    }
+    if (partial.adaptive !== undefined && typeof partial.adaptive !== 'boolean') {
+      return false;
+    }
+    if (
+      partial.thresholdScale !== undefined &&
+      (!Number.isFinite(partial.thresholdScale) ||
+        partial.thresholdScale < 0.05 ||
+        partial.thresholdScale > 4)
     ) {
       return false;
     }
     if (partial.wander !== undefined && typeof partial.wander !== 'boolean') {
       return false;
     }
+    // 固定 scale と adaptive の同時指定は不可。固定があれば adaptive は無効扱いになるため、
+    // 両方を同時に有効化しようとした場合は拒否する。
+    // なお `setSettings({thresholdScale})` 単体は adaptive 有効時も拒否される。
+    // `{adaptive: false, thresholdScale}` の同時指定でも拒否されるため、
+    // 固定化には `setSettings({adaptive: false})` の後に `setSettings({thresholdScale})` の2段階が必要（非対称だが仕様）。
+    if (
+      partial.thresholdScale !== undefined &&
+      (partial.adaptive === true || (partial.adaptive === undefined && adaptiveEnabled))
+    ) {
+      return false;
+    }
     if (partial.hysteresis !== undefined) {
       if (!recreateLod(partial.hysteresis)) return false;
       guiState.hysteresis = hysteresis;
+    }
+    if (partial.thresholdScale !== undefined) {
+      fixedScale = partial.thresholdScale;
+      adaptiveEnabled = false;
+      guiState.adaptive = adaptiveEnabled;
+      guiState.thresholdScaleDisplay = `fixed ${fixedScale.toFixed(2)}`;
+      recreateManager();
+      updateBudgetController();
+    }
+    if (partial.adaptive !== undefined) {
+      if (partial.adaptive !== adaptiveEnabled) {
+        adaptiveEnabled = partial.adaptive;
+        if (adaptiveEnabled) fixedScale = null;
+        guiState.adaptive = adaptiveEnabled;
+        recreateManager();
+        updateBudgetController();
+      }
     }
     if (partial.residency !== undefined) {
       residency = partial.residency;
@@ -1121,9 +1242,10 @@ const api = {
       recreateManager();
     }
     if (partial.budgetMB !== undefined) {
-      budgetMB = Math.round(partial.budgetMB);
+      budgetMB = clampNumber(Math.round(partial.budgetMB), 0, 4096, budgetMB);
       guiState.budgetMB = budgetMB;
-      recreateManager();
+      // 予算の再設定は作り直し不要。adaptive の有効/無効は変わらないため上限だけ差し替える。
+      applyBudgetToManager();
     }
     if (partial.lodEnabled !== undefined) {
       lodEnabled = partial.lodEnabled;

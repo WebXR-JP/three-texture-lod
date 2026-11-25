@@ -8,6 +8,7 @@
  * @packageDocumentation
  */
 export type {
+  AdaptiveThresholdScaleOptions,
   DistanceMode,
   KnownTextureSlot,
   ResidencyMode,

@@ -5,9 +5,22 @@
  */
 import { computeLodDistance } from './lod-distance.js';
 import { selectLevel } from './select-level.js';
+import {
+  DEFAULT_MAX_SCALE,
+  DEFAULT_MIN_SCALE,
+  DEFAULT_RAISE_COOLDOWN_MS,
+  DEFAULT_RAISE_HEADROOM,
+  DEFAULT_RAISE_INTERVAL_MS,
+  DEFAULT_STEPS_PER_OCTAVE,
+  buildScaleLadder,
+  stepThresholdScale,
+  validateScaleOptions,
+} from './threshold-scale.js';
+import type { ScaleControllerState } from './threshold-scale.js';
 import type { TextureLodSet } from './texture-lod-set.js';
 import type { Camera, Material, Mesh, Texture } from 'three';
 import type {
+  AdaptiveThresholdScaleOptions,
   DistanceMode,
   ResidencyMode,
   TextureLodManagerOptions,
@@ -92,6 +105,13 @@ interface ManagedGroup {
   /** 全束縛セットで一致していることが登録時に検証済みのヒステリシス幅。 */
   readonly hysteresis: number;
   level: number | null;
+  /**
+   * 直近の `update()` の pass1 で測った距離。`null` は維持を表す。
+   *
+   * `anchor.visible === false` または非有限距離のとき `null` になり、
+   * pass2 の判定と予測の両方で現在レベルを保つ。
+   */
+  distance: number | null;
 }
 
 /** 追跡中のテクスチャ1件分の常駐状態。 */
@@ -123,7 +143,28 @@ export class TextureLodManager {
   private readonly distanceMode: DistanceMode;
   private readonly residency: ResidencyMode;
   private readonly evictDelayMs: number;
-  private readonly maxResidentBytes: number | null;
+  private maxResidentBytes: number | null;
+  /**
+   * 現在の距離しきい値スケール。判定は `distance / scale` で行う。
+   *
+   * ADR: しきい値配列を掛け算で書き換えず距離側を割るのは、`addGroup` の base thresholds
+   * 一致検証をそのまま保つためである。`scale = 1` のとき `d / 1` は厳密に `d` であり、
+   * 既定挙動はビット単位で不変になる（`thresholds[0] === 0` も不変）。
+   */
+  private thresholdScaleValue: number;
+  /**
+   * 自動スケールの正規化済み調整値。非自動時は `null`。
+   *
+   * ADR: `Required<...>` に正規化して保持するのは、`update()` 内の毎フレーム判定で
+   * 既定値の補完を繰り返さないためである。検証は生成時に済ませる。
+   */
+  private readonly adaptiveOptions: Required<AdaptiveThresholdScaleOptions> | null;
+  /** 自動スケール用のラダー。非自動時は `null`。 */
+  private readonly scaleLadder: readonly number[] | null;
+  /** 自動スケール用の制御状態。非自動時は `null`。 */
+  private scaleState: ScaleControllerState | null;
+  private scaleLowerCount = 0;
+  private scaleRaiseCount = 0;
   private evictCount = 0;
   private readonly now: () => number;
   private readonly groups = new Set<ManagedGroup>();
@@ -159,7 +200,89 @@ export class TextureLodManager {
       }
     }
     this.maxResidentBytes = maxResidentBytes ?? null;
+    const adaptiveRaw = options?.adaptiveThresholdScale;
+    // ADR: `null` は `false` と同じく無効扱いにする。型上は `boolean | オブジェクト` だが、
+    // 実行時に `null` が渡っても分かりにくく落ちないよう、明示的に無効として受け入れる。
+    const adaptiveEnabled =
+      adaptiveRaw !== undefined && adaptiveRaw !== false && adaptiveRaw !== null;
+    if (adaptiveEnabled && this.residency === 'keep-all') {
+      throw new Error("adaptiveThresholdScale は residency: 'keep-all' と併用できません");
+    }
+    if (options?.thresholdScale !== undefined && adaptiveEnabled) {
+      throw new Error('thresholdScale と adaptiveThresholdScale は同時指定できません');
+    }
+    if (options?.thresholdScale !== undefined) {
+      if (!Number.isFinite(options.thresholdScale) || options.thresholdScale <= 0) {
+        throw new RangeError(
+          `thresholdScale は0より大きい有限値である必要があります: ${String(options.thresholdScale)}`,
+        );
+      }
+    }
+    // 直接比較で書くのは、後段の分岐で `adaptiveRaw` の型絞り込みを保つためである。
+    if (adaptiveRaw === undefined || adaptiveRaw === false || adaptiveRaw === null) {
+      this.adaptiveOptions = null;
+      this.scaleLadder = null;
+      this.scaleState = null;
+      this.thresholdScaleValue = options?.thresholdScale ?? 1;
+    } else {
+      const source: AdaptiveThresholdScaleOptions = adaptiveRaw === true ? {} : adaptiveRaw;
+      const normalized: Required<AdaptiveThresholdScaleOptions> = {
+        minScale: source.minScale ?? DEFAULT_MIN_SCALE,
+        maxScale: source.maxScale ?? DEFAULT_MAX_SCALE,
+        stepsPerOctave: source.stepsPerOctave ?? DEFAULT_STEPS_PER_OCTAVE,
+        raiseIntervalMs: source.raiseIntervalMs ?? DEFAULT_RAISE_INTERVAL_MS,
+        raiseCooldownMs: source.raiseCooldownMs ?? DEFAULT_RAISE_COOLDOWN_MS,
+        raiseHeadroom: source.raiseHeadroom ?? DEFAULT_RAISE_HEADROOM,
+      };
+      // ADR: `buildScaleLadder` 経由の検証にするのは、不正な刻みでもラダー生成と同じ
+      // `RangeError` で弾くためである。残りの範囲は `validateScaleOptions` で検査する。
+      validateScaleOptions(normalized);
+      this.adaptiveOptions = normalized;
+      this.scaleLadder = buildScaleLadder(
+        normalized.minScale,
+        normalized.maxScale,
+        normalized.stepsPerOctave,
+      );
+      this.scaleState = { index: 0, lastLowerAt: null, lastRaiseCheckAt: null };
+      this.thresholdScaleValue = this.scaleLadder[0] as number;
+    }
     this.now = options?.now ?? (() => performance.now());
+  }
+
+  /**
+   * 固定の距離しきい値スケールを変える。次の `update()` から有効になる。
+   *
+   * @param scale - 有限かつ `0` より大きいこと。
+   * @throws `RangeError` — 非有限または `0` 以下の場合。
+   * @throws `Error` — 自動スケール (`adaptiveThresholdScale`) 有効時の場合。
+   */
+  setThresholdScale(scale: number): void {
+    if (this.adaptiveOptions !== null) {
+      throw new Error('adaptiveThresholdScale 有効時は setThresholdScale を使えません');
+    }
+    if (!Number.isFinite(scale) || scale <= 0) {
+      throw new RangeError(`thresholdScale は0より大きい有限値である必要があります: ${String(scale)}`);
+    }
+    this.thresholdScaleValue = scale;
+  }
+
+  /**
+   * 常駐上限を変える。次の `update()` から有効になる。
+   *
+   * @param bytes - `0` 以上の有限値、または上限なしの `null`。
+   * @throws `RangeError` — 負・非有限の場合。
+   * @throws `Error` — `residency: 'keep-all'` で非 `null` の場合。
+   */
+  setMaxResidentBytes(bytes: number | null): void {
+    if (bytes !== null) {
+      if (!Number.isFinite(bytes) || bytes < 0) {
+        throw new RangeError(`maxResidentBytes は0以上の有限値である必要があります: ${String(bytes)}`);
+      }
+      if (this.residency === 'keep-all') {
+        throw new Error("maxResidentBytes は residency: 'keep-all' と併用できません");
+      }
+    }
+    this.maxResidentBytes = bytes;
   }
 
   /**
@@ -240,6 +363,7 @@ export class TextureLodManager {
       thresholds: reference.thresholds,
       hysteresis: reference.hysteresis,
       level: null,
+      distance: null,
     };
     this.groups.add(group);
     for (const binding of bindings) {
@@ -286,6 +410,10 @@ export class TextureLodManager {
   /**
    * 全グループのレベル判定を行い、変化があればマテリアルを差し替える。描画前に毎フレーム呼ぶ。
    *
+   * 処理は3段である。pass1で全グループの `computeLodDistance` を測って保持し、
+   * 自動スケール時は `stepThresholdScale` を1回だけ呼んでスケールを決め、
+   * pass2で `distance / scale` の判定に従来どおり retain/release/差し替えを行う。最後に掃引する。
+   *
    * @param camera - 基準カメラ。
    * @remarks
    * 判定後に `residency: 'evict'` の場合は猶予破棄と上限破棄（`maxResidentBytes` 指定時）を行う。
@@ -298,12 +426,14 @@ export class TextureLodManager {
   update(camera: Camera): void {
     const at = this.now();
     camera.updateWorldMatrix(true, false);
+    // pass1: 距離の計測。維持の場合は `distance` に `null` を残す。
     for (const group of this.groups) {
       // ADR: ワールド行列の更新はマネージャ側で行う。
       // アプリの render 呼び出し前に update される保証はなく、古い行列で判定すると
       // 1フレーム遅れではなく誤ったLODに張り付く恐れがあるため、判定の前提として自前で更新する。
       group.anchor.updateWorldMatrix(true, false);
       if (group.anchor.visible === false) {
+        group.distance = null;
         continue;
       }
       const distance = computeLodDistance(group.anchor, camera, this.distanceMode);
@@ -311,9 +441,109 @@ export class TextureLodManager {
       // 後続グループが更新されなくなるのを防ぐため、非有限距離はスキップする。
       // 不正な transform は本来シーン側のバグだが、1グループで全LOD更新を止めない。
       if (!Number.isFinite(distance)) {
+        group.distance = null;
         continue;
       }
-      const next = selectLevel(group.level, distance, group.thresholds, group.hysteresis);
+      group.distance = distance;
+    }
+    // 自動スケール: 予測常駐量と予算を比べて1回だけ切り替える。
+    if (this.adaptiveOptions !== null && this.scaleLadder !== null && this.scaleState !== null) {
+      // ADR: `set.levels` は登録後に不変のため、レベルごとのテクスチャ配列を update 内で使い回す。
+      // `predict` はラダー走査で複数回呼ばれるため、毎回の `Object.values` 走査を抑える。
+      // 過度な最適化はせず、update を抜けたら捨てる一時キャッシュに留める。
+      const levelCache = new Map<TextureLodSetContract<Material>, (readonly Texture[])[]>();
+      const texturesOfLevel = (
+        set: TextureLodSetContract<Material>,
+        level: number,
+      ): readonly Texture[] => {
+        let perLevel = levelCache.get(set);
+        if (perLevel === undefined) {
+          perLevel = [];
+          levelCache.set(set, perLevel);
+        }
+        let cached = perLevel[level];
+        if (cached === undefined) {
+          cached = [...TextureLodManager.texturesOf(set, level)];
+          perLevel[level] = cached;
+        }
+        return cached;
+      };
+      // ADR: 予算未設定時は `predict` が呼ばれず段階上げだけになるため Map は作られない。
+      // 予算ありでは超過判定で現スケールを必ず1回予測するため、初回呼び出し時に作る。
+      let bytesOf: Map<Texture, number> | null = null;
+      const predict = (scale: number): number => {
+        // ADR: 候補レベルのテクスチャと全 set の最粗（pins 常駐分）の和集合で予測する。
+        // `release` 後に参照0になったテクスチャも `pins` が残れば常駐するため、
+        // 最粗分は候補によらず必ず含める。
+        const union = new Set<Texture>();
+        for (const group of this.groups) {
+          let predicted: number | null;
+          if (group.distance === null) {
+            predicted = group.level;
+          } else {
+            const scaled = (group.distance as number) / scale;
+            // ADR: 極小スケールでは `distance / scale` が非有限になり得る。
+            // `selectLevel` の RangeError で1グループのために全LOD更新を止めないよう、
+            // pass2 と同じく現レベル維持として予測に含める。
+            predicted = Number.isFinite(scaled)
+              ? selectLevel(group.level, scaled, group.thresholds, group.hysteresis)
+              : group.level;
+          }
+          for (const binding of group.bindings) {
+            if (predicted !== null) {
+              for (const texture of texturesOfLevel(binding.set, predicted)) {
+                union.add(texture);
+              }
+            }
+            const coarsest = binding.set.levels.length - 1;
+            for (const texture of texturesOfLevel(binding.set, coarsest)) {
+              union.add(texture);
+            }
+          }
+        }
+        if (bytesOf === null) {
+          bytesOf = new Map<Texture, number>();
+          for (const texture of this.tracked.keys()) {
+            bytesOf.set(texture, estimateBytes(texture));
+          }
+        }
+        let total = 0;
+        for (const texture of union) {
+          total += bytesOf.get(texture) ?? estimateBytes(texture);
+        }
+        return total;
+      };
+      const before = this.scaleState.index;
+      const result = stepThresholdScale(
+        this.scaleLadder,
+        this.scaleState,
+        { now: at, budgetBytes: this.maxResidentBytes, predict },
+        this.adaptiveOptions,
+      );
+      this.scaleState = result.state;
+      this.thresholdScaleValue = this.scaleLadder[result.state.index] as number;
+      // ADR: 回数は実際に段が動いたときだけ数える。末尾での連続 `floor` は変化なしのため数えない。
+      // ラダーは先頭が最大のため、下げは index 増加・上げは index 減少になる。
+      if (result.state.index > before) {
+        this.scaleLowerCount++;
+      } else if (result.state.index < before) {
+        this.scaleRaiseCount++;
+      }
+    }
+    // pass2: `distance / scale` の判定。維持グループは飛ばす。
+    for (const group of this.groups) {
+      const distance = group.distance;
+      if (distance === null) {
+        continue;
+      }
+      const scaled = (distance as number) / this.thresholdScaleValue;
+      // ADR: 極小スケール（例: 1e-310）では `distance / scale` が非有限になり得る。
+      // `selectLevel` の RangeError で1グループのために全LOD更新を止めないよう、
+      // 予測と同じく現レベル維持として飛ばす。
+      if (!Number.isFinite(scaled)) {
+        continue;
+      }
+      const next = selectLevel(group.level, scaled, group.thresholds, group.hysteresis);
       if (group.level !== next) {
         if (group.level !== null) {
           for (const binding of group.bindings) {
@@ -351,7 +581,7 @@ export class TextureLodManager {
   /**
    * 稼働統計を返す。
    *
-   * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数・上限と破棄回数。
+   * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数・上限と破棄回数・スケールと必要量。
    * `objectCount` と `levelCounts` はグループ単位で数える。
    * `maxResidentBytes` 指定時は上限超過分を `overBudgetBytes` で確認できる。
    */
@@ -367,9 +597,17 @@ export class TextureLodManager {
       }
     }
     let residentBytes = 0;
+    let requiredBytes = 0;
     for (const [texture, tracked] of this.tracked) {
       if (!tracked.evicted) {
-        residentBytes += estimateBytes(texture);
+        const bytes = estimateBytes(texture);
+        residentBytes += bytes;
+        // ADR: `release` 後に参照0になったテクスチャも `pins` が残れば常駐のため、
+        // 必要量には `refs > 0 || pins > 0` の両方を含める。set の最粗テクスチャは
+        // `pins` で常駐し、予測の和集合にも必ず含まれる側である。
+        if (tracked.refs > 0 || tracked.pins > 0) {
+          requiredBytes += bytes;
+        }
       }
     }
     return {
@@ -381,6 +619,10 @@ export class TextureLodManager {
       overBudgetBytes:
         this.maxResidentBytes === null ? 0 : Math.max(0, residentBytes - this.maxResidentBytes),
       evictCount: this.evictCount,
+      thresholdScale: this.thresholdScaleValue,
+      requiredBytes,
+      scaleLowerCount: this.scaleLowerCount,
+      scaleRaiseCount: this.scaleRaiseCount,
     };
   }
 

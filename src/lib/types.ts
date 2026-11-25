@@ -131,6 +131,55 @@ export interface TextureLodSetOptions<M extends Material> {
 export type ResidencyMode = 'keep-all' | 'evict';
 
 /**
+ * 距離しきい値の自動スケールの調整項目。
+ *
+ * `TextureLodManager` の `adaptiveThresholdScale` に `true` またはこのオブジェクトを渡すと、
+ * `update()` ごとに予測常駐量と `maxResidentBytes` を比べてスケールを切り替える。
+ * スケール `s` は判定距離を `d/s` に読み替え、境界配列の `s` 倍と等価になる。
+ * `s = 1` のとき `d/1` は厳密に `d` のため、既定挙動はビット単位で不変である。
+ */
+export interface AdaptiveThresholdScaleOptions {
+  /**
+   * ラダーの下限。`0` より大きく `maxScale` 以下、有限であること。
+   *
+   * @defaultValue `0.05`
+   */
+  readonly minScale?: number;
+  /**
+   * ラダーの上限。有限であり `minScale` 以上であること。
+   *
+   * @defaultValue `1`
+   */
+  readonly maxScale?: number;
+  /**
+   * 1オクターブあたりの段数。`1` 以上 `64` 以下の整数であること。
+   *
+   * @defaultValue `4`
+   */
+  readonly stepsPerOctave?: number;
+  /**
+   * 引き上げ判定の最小間隔（ミリ秒）。`0` 以上の有限値であること。
+   *
+   * @defaultValue `1000`
+   */
+  readonly raiseIntervalMs?: number;
+  /**
+   * 引き下げ後の冷却期間（ミリ秒）。`0` 以上の有限値であること。
+   * この期間内は引き上げ判定を行わない。引き下げ自体に間隔制限はない。
+   *
+   * @defaultValue `3000`
+   */
+  readonly raiseCooldownMs?: number;
+  /**
+   * 引き上げ余裕。`predict(1段上) <= raiseHeadroom * budget` のときだけ引き上げる。
+   * `(0, 1]` の範囲であること。
+   *
+   * @defaultValue `0.9`
+   */
+  readonly raiseHeadroom?: number;
+}
+
+/**
  * {@link TextureLodManager} の生成オプション。
  */
 export interface TextureLodManagerOptions {
@@ -168,6 +217,27 @@ export interface TextureLodManagerOptions {
    */
   readonly maxResidentBytes?: number;
   /**
+   * 固定の距離しきい値スケール。有限かつ `0` より大きいこと。
+   *
+   * 判定距離を `d/scale` に読み替え、`thresholds` の `scale` 倍と等価になる。
+   * `1` のとき既定挙動と同一である。設定だけでは `levelOf` は変わらず、次の `update()` から有効になる。
+   * `adaptiveThresholdScale` との同時指定は不可。
+   *
+   * @defaultValue `1`
+   */
+  readonly thresholdScale?: number;
+  /**
+   * 距離しきい値の自動スケールの有効化。
+   *
+   * `true` で既定値による自動スケール、`false`（既定）で無効、オブジェクトで調整値の指定になる。
+   * 有効時は予測常駐量が `maxResidentBytes` に収まるようラダー上を移動する。
+   * `residency: 'keep-all'` および `thresholdScale` との併用は不可。
+   * `maxResidentBytes` 未設定（`null`）の場合は引き上げだけを行う。
+   *
+   * @defaultValue `false`
+   */
+  readonly adaptiveThresholdScale?: boolean | AdaptiveThresholdScaleOptions;
+  /**
    * 時刻源。テストで時間を操作するために注入する。
    *
    * @defaultValue `() => performance.now()`（`TextureLodManager` が補う）。
@@ -200,6 +270,26 @@ export interface TextureLodStats {
   readonly budgetBytes: number | null;
   /** `max(0, residentBytes - budgetBytes)`。上限未設定なら 0。`stats()` 呼び出し時点の値。 */
   readonly overBudgetBytes: number;
+  /**
+   * 現在の距離しきい値スケール。
+   *
+   * 固定時は `thresholdScale`/`setThresholdScale` の値、自動時はラダー上の現在位置の値である。
+   * 既定は `1` であり、このとき判定は従来どおりである。
+   */
+  readonly thresholdScale: number;
+  /**
+   * 必要常駐量の推定バイト数。
+   *
+   * 追跡中のうち `!evicted && (refs > 0 || pins > 0)` の `estimateBytes` 合計である。
+   * `residentBytes` と違い、未参照の非ピン留めテクスチャ（いずれ破棄される分）を含まない。
+   * `update()` 直後の値であり、`update` と `stats()` の間の `addGroup` や画像差し替えでは
+   * 一時的に予算を超え得る（次の `update()` で解消する）。
+   */
+  readonly requiredBytes: number;
+  /** 自動スケールで引き下げた累計回数（実際に段が下がった回数）。非自動時は `0`。 */
+  readonly scaleLowerCount: number;
+  /** 自動スケールで引き上げた累計回数。非自動時は `0`。 */
+  readonly scaleRaiseCount: number;
   /** マネージャが `dispose()` したテクスチャの累計回数（猶予による破棄と上限による破棄の合計）。 */
   readonly evictCount: number;
 }

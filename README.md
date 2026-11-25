@@ -87,8 +87,13 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
   MToon の `shadeMultiplyTexture` なども `as` なしで指定できる。
 - `TextureLodManager` — 複数メッシュのレベル判定と常駐管理。
   `add(mesh, set)` / `addGroup(bindings, { anchor })` / `remove(mesh)` /
-  `update(camera)` / `levelOf(mesh)` / `stats()` / `dispose()`。
+  `update(camera)` / `levelOf(mesh)` / `stats()` / `dispose()` /
+  `setThresholdScale(scale)` / `setMaxResidentBytes(bytes | null)`。
   `addGroup` は複数メッシュを1つの距離で連動させ、統計もグループ単位になる。
+  `setThresholdScale` は固定倍率の更新（自動スケール有効時は `Error`）。
+  `setMaxResidentBytes` は予算の再設定（作り直し不要、`keep-all` で非 `null` は `Error`）。
+  `stats()` には `thresholdScale`（現在の倍率）/ `requiredBytes`（update直後の現用＋最粗の必要量。
+  `overBudgetBytes` は resident 基準の超過量で別物）/ `scaleLowerCount` / `scaleRaiseCount` が出る。
 - `selectLevel(previous, distance, thresholds, hysteresis)` — ヒステリシス付き判定の純粋関数。
 - `computeLodDistance(object, camera, mode)` — 中心距離（`center`）または
   バウンディング球表面からの距離（`surface`、0クランプ）を返す。
@@ -122,6 +127,8 @@ stateDiagram-v2
 | `residency` | `'evict'` | `'evict'` は未使用テクスチャを破棄、`'keep-all'` は全保持 |
 | `evictDelayMs` | `5000` | `evict` 時の最終使用からの猶予。`0` で即時破棄。`Infinity` で時間破棄を止め容量のみのキャッシュにできる |
 | `maxResidentBytes` | 上限なし | 常駐推定バイト数の上限。超過時は未参照・非ピンを古い順に破棄。`keep-all` と併用不可。推定値で判定し、`update()` 内でのみ適用 |
+| `thresholdScale` | `1` | 固定の距離しきい値倍率。有限かつ `> 0`。`adaptiveThresholdScale` との同時指定は不可 |
+| `adaptiveThresholdScale` | `false` | `true`（または調整値 object）で予算適応の距離スケールを有効化。`keep-all`・`thresholdScale` との併用不可。`maxResidentBytes` 未設定時は引き上げだけを行う |
 | `now` | `performance.now` | 時刻源。テストで時間を操作するための注入点 |
 
 ### evict の補足
@@ -136,6 +143,17 @@ stateDiagram-v2
   最終使用の古い順（同時刻なら推定バイトの大きい順）に、猶予を待たず破棄する。
   現用中と最粗レベルは守られるため、上限まで下げられない場合は超過を許容する
   （`stats().overBudgetBytes` で確認する）。破棄の累計は `stats().evictCount` に出る。
+- `adaptiveThresholdScale: true`（または調整値 object）を指定すると、
+  予算に収まる最も細かい距離スケールを予測常駐量（`stats().requiredBytes`）から選ぶ。
+  判定距離を `d/scale` に読み替え、しきい値の `scale` 倍と等価にする。
+  下げは即時・複数段、上げは `predict(1段上) <= 0.9 * budget` のときだけ1段上げる
+  （1段/秒・引き下げ後の冷却3秒・余裕 `0.9`）。
+  `need`（`requiredBytes`、現用＋最粗の必要量）と
+  `over`（`residentBytes` 基準の上限超過量）は別物である。
+- 予算が最粗レベルの合計より小さい場合や、近接個体で下げても足りない場合は
+  下限（既定 `0.05`）に張り付き、超過が残る（保証ではない）。
+  デモの起動オプション（`?adaptive=0` / `?scale`）はデモ節を参照。
+  固定・自動の同時指定と `keep-all` との併用は `Error` である。
 - `evictDelayMs: Infinity` と `maxResidentBytes` の併用で、時間では破棄せず容量だけで破棄するキャッシュになる。
 - 非表示（`visible === false`）のグループは判定を飛ばして参照を保持するため、
   そのテクスチャは上限破棄でも解放できない。隠したまま上限を締めると超過が残る。
@@ -177,7 +195,11 @@ pnpm dev
 
 URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大4）、`?avatars=4`（総体数、既定4、1〜100）、`?backend=webgl`、
 `?lod=0`（LOD無効）、`?wander=0`（徘徊無効。全員を配置位置に固定）、`?h=0.15`、`?atlas=256..4096`（既定1024）、`?auto=0`（自動カメラ停止）、
-`?residency=keep-all`、`?evictDelay=1000`、`?budget=32`（常駐上限MB、`0` で無効、既定 `0`）。
+`?residency=keep-all`、`?evictDelay=1000`、`?budget=32`（常駐上限MB、`0` で無効、既定 `0`、`0〜4096`。
+GUIスライダーも `0〜4096`）、
+`?adaptive=0`（予算適応の距離しきい値スケールを無効化。既定で有効。予算0では実質無効だが、
+manager には adaptive を渡すため、`setMaxResidentBytes` で後から予算を設定できる。作り直しは不要）、
+`?scale=0.5`（固定の距離しきい値倍率、`0.05〜4`。範囲外はクランプ、非数値は無視して adaptive。指定時は adaptive より優先）。
 
 ### 方式
 
@@ -216,9 +238,19 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
   ONに戻すと、待機を短縮してその場から動き出す。
   瞬間移動しないのは home がずれた場合（末尾以外の複製削除で後続の home が前に詰まるなど）で、
   そのときはその場から配置円内への歩行を始める。
-- GUIの「メモリ上限(MB)」スライダー（`0` で無効、既定 `0`）で `maxResidentBytes` を変えられる。
-  `keep-all` 選択中と LOD 無効中は無効化される。上限が効いている間、HUD の `VRAM` 行に
+- GUIの「メモリ上限(MB)」スライダー（`0` で無効、既定 `0`、範囲 `0〜4096`）で `maxResidentBytes` を変えられる。
+  変更は `setMaxResidentBytes` で反映し、作り直しはしない（`adaptive` の有効/無効が切り替わるときだけ作り直す）。
+  `keep-all` 選択中と LOD無効中は無効化される。上限が効いている間、HUD の `VRAM` 行に
   `上限 / 超過 / 破棄回数` が出る（`keep-all` では `budget off (keep-all)` と出る）。
+  予算適応が有効なときは `scale`（現在の距離しきい値倍率）と `need`（必要量）も出て、
+  `need` が予算を上回ったまま下限に張り付くと `FLOOR` が付く（例: 4096・予算1MB。
+  1024・1MB では成立しない）。`?adaptive=0` では従来の表示のまま。
+  近接個体で下げても足りない場合も同様に下限に張り付く（保証ではない）。
+- GUIの「自動スケール」チェックボックス（`?adaptive=0` で起動時OFF、既定で有効。予算0では実質無効）で予算適応を切り替える。
+  変更時はマネージャを作り直す。`keep-all` 選択中と LOD無効中は無効化される。
+  「しきい値倍率」は読み取り専用の表示で、`?scale` 固定時は `fixed 0.50` のように出し、
+  適応時は現在の `scale` を250msごとに反映し、無効条件（keep-all / LOD無効 / 手動固定）では `off` を出す。
+  手動の倍率変更は `?scale=0.05..4` で行う（スライダーはない。範囲外はクランプ、非数値は無視）。
 - 複製は最適化を再実行せず、アトラス・テクスチャ・マテリアル・LODセットを
   テンプレートと共有する。メッシュと束縛だけを複製ごとに持つため、
   複製を増やしても `Too many active WebGL contexts` 警告は出ない。
@@ -260,7 +292,12 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
 | 実GPUテクスチャ数（1体、近景→遠景） | 21 → 17（evictで実際に減少） |
 | 複製時（ソース1 + 複製3、L0/L1/L2/L3 が1体ずつ） | 最適化1回、常駐はソース1体分の約1.33倍 |
 | 既定（3ソース + 複製1） | mesh 319 → 36（rendered 48）、material 272 → 12、atlas 40.0MB、常駐 18.1MB |
-| 上限キャッシュ `?budget=32&evictDelay=5000`（3ソース + 複製1、WebGPU/WebGL とも同値） | 常駐 29.5MB（上限32MB以下、over 0、evict 17）。8MBに締めると常駐 18.1MB・over 10.1MB（= 18.1 - 8）・evict 24、レベル [0,1,2,3] 不変。350ms間隔2回で evict 増加なし。解除で上限なし・over 0。既定行の 18.1MB とは `evictDelay`（1000/5000）の条件が違う |
+| 上限キャッシュ `?budget=32&evictDelay=5000`（3ソース + 複製1、WebGPU/WebGL とも同値） | 常駐 29.5MB（上限32MB以下、over 0、evict 17）。8MBに締めると常駐 18.1MB・over 10.1MB（= 18.1 - 8）・evict 24、レベル [0,1,2,3] 不変。350ms間隔2回で evict 増加なし。解除で上限なし・over 0。既定行の 18.1MB とは `evictDelay`（1000/5000）の条件が違う。`&adaptive=0` 付きで従来のベストエフォートを確認 |
+| 予算適応 `?budget=8`（3ソース + 複製1、smoke で WebGPU/WebGL とも同値） | 起動直後に scale 0.841 まで下げ（lower 1）required 5.0MB ≤ 8MB・over 0。2MB 締めで scale 0.354 まで下げ（lower 2）required 1.5MB ≤ 2MB。解除で scale 1 に復帰（raise +6、約8秒）。復帰後に5秒無変化で静定。再適用（0→8MB）は即時収束し、マネージャ世代番号が不変（作り直しなしの証拠） |
+| 4096・3ソース・50体・予算256MB・徘徊ON（WebGPU、Xvfb） | scale は 0.84〜1.0 で推移、`requiredBytes` 103〜156.7MiB、`residentBytes` 156.7MiB、`over` 0、frame p50 16.67ms / p95 16.7〜18.0ms / max は初期フレームのみ 42〜49ms、`upd` 平均0.94ms、収束後10秒の `switch` 増分0〜2、`lower 1〜2 / raise 1`（単回計測の例。値は実行ごとに振れる）。`scale` が 1 に戻っても、ヒステリシスにより粗いレベルが残ることがある（必要量は現用＋最粗なので、画質と必要量は一致しない） |
+| 同条件・予算なし | resident 316.7MiB（全レベル常駐の850MiB推定とは条件差） |
+| 同条件・`adaptive=0&budget=256` | over 60.7MiB のまま（従来のベストエフォート） |
+| `?scale=0.5`（固定倍率） | `lower`/`raise` 0、予算超過分は evict のみで処理 |
 | 100体（3ソース + 複製97、Xvfb） | rendered 1200 mesh、常駐 19.8MB（full 40.0MB の0.49倍）、レベル [1,1,11,87]、ringCount 100、警告0。WebGPU・静止時 frame 34.5ms / upd 1.1ms / calls 1046 / pipelines 22、徘徊時 frame 36.2ms / upd 1.1ms / calls 1056。WebGL・静止時 frame 33.6ms / upd 1.1ms / calls 1046、徘徊時 frame 35.7ms / upd 1.1ms / calls 1056（Xvfb、run間で±1.5ms程度）。起動（読込開始〜ready）約4.4秒、`setAvatarCount(4)` 26ms・`(100)` 47ms |
 
 ### 注意
@@ -288,6 +325,8 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
   ready 約2.7秒（1024は約2.0秒）、`optimizeMs` 約0.6秒（1024は約0.4秒）で、
   描画フレームは 16.7ms のまま（Xvfb、1ソース）。
   4096を使う場合はソース1体を推奨し、3ソースはVRAM・起動時間・GCで現実的でない可能性が高い。
+  50体でも resident はソース数分しか増えない。3ソース・4096・予算256MBなら
+  adaptive により全員L1前後まで落ちる（推定）。
   コンテキスト数は0.6.0の共有レンダラーによりソース数に比例しないが、VRAMは比例する。
   2048を使う場合はソース2〜3体を推奨する。
 - `matcap` はUV非依存なのでLOD対象外（元テクスチャのまま）。

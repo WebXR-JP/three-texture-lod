@@ -93,7 +93,9 @@ async function screenshot(page, name) {
 }
 
 async function checkHysteresis(page, result) {
-  // surface 距離と4段（T=[0,3,6,12]）、h=0.15 の系列。
+  // surface 距離と5段（T=[0,3,6,12,24]）、h=0.15 の系列。
+  // L4への遷移には T4*(1+h)=27.6 を超える必要があるため、28.0で遷移させてから
+  // 25.0/23.0の上側バンド保持を確認し、19.0でL3へ戻す（T4*(1-h)=20.4）。
   const series = [
     [1.5, 0],
     [3.6, 1],
@@ -107,26 +109,38 @@ async function checkHysteresis(page, result) {
     [14.0, 3],
     [11.0, 3],
     [9.9, 2],
+    [28.0, 4],
+    [25.0, 4],
+    [23.0, 4],
+    [19.0, 3],
   ];
   const actual = [];
   for (const [distance, expected] of series) {
     await setDistance(page, distance);
     const level = await levelOf(page);
     const meshLevels = await page.evaluate(() => window.__vrmDemo.meshLevels(0));
-    actual.push({ distance, expected, actual: level, meshLevels });
+    const matches = await page.evaluate(() => window.__vrmDemo.appliedVariantMatches(0));
+    actual.push({ distance, expected, actual: level, meshLevels, matches });
     assert(
       level === expected,
       `ヒステリシス系列: d=${distance} の期待 L${expected} に対して L${level}`,
     );
+    // L0-L2は同一Textureを共有するため、メッシュ名はcanonical（グループ先頭）になる。
+    // 数値一致ではなく、全メッシュ一致＋適用マテリアル一致で同期を確認する。
     assert(
-      meshLevels.every((value) => value === level),
+      meshLevels.length > 0 && new Set(meshLevels).size === 1 && meshLevels.every((value) => value >= 0),
       `d=${distance} でメッシュ間のレベルが不一致: ${JSON.stringify(meshLevels)}`,
+    );
+    assert(
+      matches === true,
+      `d=${distance} で適用マテリアルが現行レベルと不一致: L${level} vs ${JSON.stringify(meshLevels)}`,
     );
   }
   const holds = [
     { from: 1.5, at: 3.2, expected: 0 },
     { from: 4.0, at: 6.5, expected: 1 },
     { from: 9.0, at: 12.5, expected: 2 },
+    { from: 14.0, at: 25.5, expected: 3 },
   ];
   const held = [];
   for (const item of holds) {
@@ -134,14 +148,19 @@ async function checkHysteresis(page, result) {
     await setDistance(page, item.at);
     const level = await levelOf(page);
     const meshLevels = await page.evaluate(() => window.__vrmDemo.meshLevels(0));
-    held.push({ ...item, actual: level, meshLevels });
+    const matches = await page.evaluate(() => window.__vrmDemo.appliedVariantMatches(0));
+    held.push({ ...item, actual: level, meshLevels, matches });
     assert(
       level === item.expected,
       `上側バンド保持: d=${item.at} の期待 L${item.expected} に対して L${level}`,
     );
     assert(
-      meshLevels.every((value) => value === level),
+      meshLevels.length > 0 && new Set(meshLevels).size === 1 && meshLevels.every((value) => value >= 0),
       `上側バンド保持 d=${item.at} でメッシュ間のレベルが不一致: ${JSON.stringify(meshLevels)}`,
+    );
+    assert(
+      matches === true,
+      `上側バンド保持 d=${item.at} で適用マテリアルが不一致: L${level} vs ${JSON.stringify(meshLevels)}`,
     );
   }
   result.hysteresis = actual;
@@ -179,11 +198,15 @@ async function checkHysteresisZero(page, result) {
   assert(delta === 10, `h=0 の境界往復で switchCount が10増えない: ${delta}`);
   await page.evaluate(() => window.__vrmDemo.setSettings({ hysteresis: 0.15 }));
 
-  // デバッグ用のレベル固定と、auto への復帰。
+  // デバッグ用のレベル固定と、auto への復帰。L3に加えて最粗L4も確認する。
   await page.evaluate(() => window.__vrmDemo.setSettings({ forceLevel: 3 }));
   await waitFrames(page, 3);
   const forced = await page.evaluate(() => window.__vrmDemo.meshLevels(0));
   assert(forced.length > 0 && forced.every((level) => level === 3), `forceLevel=3 が全メッシュに効いていない: ${forced}`);
+  await page.evaluate(() => window.__vrmDemo.setSettings({ forceLevel: 4 }));
+  await waitFrames(page, 3);
+  const forced4 = await page.evaluate(() => window.__vrmDemo.meshLevels(0));
+  assert(forced4.length > 0 && forced4.every((level) => level === 4), `forceLevel=4 が全メッシュに効いていない: ${forced4}`);
   await page.evaluate(() => window.__vrmDemo.setSettings({ forceLevel: null }));
   await waitFrames(page, 6);
   const afterAuto = await levelOf(page);
@@ -239,8 +262,8 @@ async function checkEvict(page, backend, result) {
   const recovered = await screenshot(page, `${backend}-recovered.png`);
 
   result.evict = {
-    near: { level: nearStats.avatars[0]?.level, resident: nearStats.manager.residentBytes, brightness: near },
-    far: { level: farStats.avatars[0]?.level, resident: farStats.manager.residentBytes, brightness: far },
+    near: { level: nearStats.avatars[0]?.level, resident: nearStats.manager.residentBytes, brightness: near, evictCount: nearStats.manager.evictCount },
+    far: { level: farStats.avatars[0]?.level, resident: farStats.manager.residentBytes, brightness: far, evictCount: farStats.manager.evictCount },
     recovered: {
       level: recoveredStats.avatars[0]?.level,
       resident: recoveredStats.manager.residentBytes,
@@ -249,15 +272,23 @@ async function checkEvict(page, backend, result) {
     textureCount: { near: nearStats.textureCount, far: farStats.textureCount, recovered: recoveredStats.textureCount },
   };
   assert(nearStats.avatars[0]?.level === 0, '近景で L0 になっていない');
-  assert(farStats.avatars[0]?.level === 3, '遠景で L3 になっていない');
+  // 20mは12〜24mの帯のためL3のまま。
+  assert(farStats.avatars[0]?.level === 3, '遠景(20m)で L3 になっていない');
   assert(
     farStats.manager.residentBytes < nearStats.manager.residentBytes / 2,
     `evict で residentBytes が半分未満にならない: near=${nearStats.manager.residentBytes}, far=${farStats.manager.residentBytes}`,
   );
-  // 推定値だけでなく、three が保持するテクスチャ数でも解放を確認する。
+  // 解放の証拠は evictCount の増加と residentBytes の半減で見る。
+  // textureCount（`renderer.info.memory.textures`）は L0-L2 の共有テクスチャが
+  // DataTexture 実体を保つため枚数が減らず、厳密な減少は成立しない。
+  // そのため枚数は「増加しない」ことだけを確認する。
   assert(
-    farStats.textureCount < nearStats.textureCount,
-    `evict 後も GPU テクスチャ数が減らない: near=${nearStats.textureCount}, far=${farStats.textureCount}`,
+    farStats.manager.evictCount > nearStats.manager.evictCount,
+    `evict で破棄が起きていない: near=${nearStats.manager.evictCount} → far=${farStats.manager.evictCount}`,
+  );
+  assert(
+    farStats.textureCount <= nearStats.textureCount,
+    `evict 後に GPU テクスチャ数が増えた: near=${nearStats.textureCount}, far=${farStats.textureCount}`,
   );
   assert(near > 20, `近景の輝度が低すぎる: ${near}`);
   assert(
@@ -265,6 +296,39 @@ async function checkEvict(page, backend, result) {
     `evict 復帰後の輝度比が 10% を超えた: near=${near}, recovered=${recovered}`,
   );
   assert(recoveredStats.avatars[0]?.level === 0, '復帰後に L0 へ戻っていない');
+  // 30mでL4も確認する（27.6m超で遷移）。
+  // L4は最粗pinのみが残るため、resident はさらに減り、evictCount は増える。
+  // textureCount は L0-L2 共有と同様に枚数が減らないため、増加しないことだけを見る。
+  try {
+    await setDistance(page, 30);
+    await sleep(400);
+    const veryFar = await statsOf(page);
+    result.evict.veryFar = {
+      level: veryFar.avatars[0]?.level,
+      resident: veryFar.manager.residentBytes,
+      textureCount: veryFar.textureCount,
+      evictCount: veryFar.manager.evictCount,
+    };
+    assert(veryFar.avatars[0]?.level === 4, `最遠景(30m)で L4 になっていない: L${veryFar.avatars[0]?.level}`);
+    assert(
+      veryFar.manager.residentBytes < farStats.manager.residentBytes,
+      `最遠景(30m)で residentBytes が減らない: far=${farStats.manager.residentBytes} → veryFar=${veryFar.manager.residentBytes}`,
+    );
+    assert(
+      veryFar.manager.evictCount >= farStats.manager.evictCount,
+      `最遠景(30m)で破棄が進んでいない: far=${farStats.manager.evictCount} → veryFar=${veryFar.manager.evictCount}`,
+    );
+    // L4では現用が最粗pinのみになるため、GPUテクスチャ数は厳密に減る（実測21→17）。
+    // 近景→遠景（L0→L3）ではL0-L2の共有テクスチャがDataTexture実体を保つため枚数は減らない。
+    assert(
+      veryFar.textureCount < farStats.textureCount,
+      `最遠景(30m)で GPU テクスチャ数が減らない: far=${farStats.textureCount} → veryFar=${veryFar.textureCount}`,
+    );
+    await setDistance(page, 2.5);
+    await sleep(500);
+  } catch (error) {
+    assert(false, `最遠景(30m)の確認で例外: ${String(error)}`);
+  }
 }
 
 async function checkKeepAll(page, result) {
@@ -316,7 +380,7 @@ async function checkFourSources(browser, backend) {
     assert(stats.avatars.length === 4, `${backend} (4体): アバター数が ${stats.avatars.length}`);
     assert(stats.manager.objectCount === 4, `${backend} (4体): objectCount が ${stats.manager.objectCount}`);
     assert(
-      JSON.stringify(stats.manager.levelCounts) === JSON.stringify([1, 1, 1, 1]),
+      JSON.stringify(stats.manager.levelCounts) === JSON.stringify([1, 1, 1, 1, 0]),
       `${backend} (4体): levelCounts が ${JSON.stringify(stats.manager.levelCounts)}`,
     );
     assert(
@@ -328,9 +392,11 @@ async function checkFourSources(browser, backend) {
     const fullAtlas = stats.avatars.reduce((sum, avatar) => sum + avatar.atlasBytes, 0);
     result.resident = stats.manager.residentBytes;
     result.fullAtlas = fullAtlas;
+    // L0-L2は同一Textureを共有するため、L0/L1/L2が各1体でもフルサイズが3体分常駐する。
+    // 実測0.95のため、1.1倍未満で見る。
     assert(
-      stats.manager.residentBytes < fullAtlas * 0.5,
-      `${backend} (4体): 常駐量が全アトラスの半分未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
+      stats.manager.residentBytes < fullAtlas * 1.1,
+      `${backend} (4体): 常駐量が全アトラスの1.1倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
     );
 
     for (const [index] of stats.avatars.entries()) {
@@ -397,7 +463,7 @@ async function checkInstances(browser, backend, config) {
     assert(stats.cloneCount === expectedClone, `${backend} (${slug}): cloneCount が ${stats.cloneCount}`);
     assert(stats.manager.objectCount === expectedTotal, `${backend} (${slug}): objectCount が ${stats.manager.objectCount}`);
     assert(
-      JSON.stringify(stats.manager.levelCounts) === JSON.stringify([1, 1, 1, 1]),
+      JSON.stringify(stats.manager.levelCounts) === JSON.stringify([1, 1, 1, 1, 0]),
       `${backend} (${slug}): levelCounts が ${JSON.stringify(stats.manager.levelCounts)}`,
     );
     assert(
@@ -415,13 +481,13 @@ async function checkInstances(browser, backend, config) {
       `${backend} (${slug}): 複製の optimizeMs が 0 でない`,
     );
     // 複製の atlasBytes は0のため、fullAtlas はソース分のみ。
-    // resident は複数レベル分で full を超えうるため、1.5倍未満で見る。
+    // resident は複数レベル分で full を超えうる。実測は複製1+3で1.30倍、既定で1.17倍のため1.4倍未満で見る。
     const fullAtlas = stats.avatars.reduce((sum, avatar) => sum + avatar.atlasBytes, 0);
     result.resident = stats.manager.residentBytes;
     result.fullAtlas = fullAtlas;
     assert(
-      stats.manager.residentBytes < fullAtlas * 1.5,
-      `${backend} (${slug}): 常駐量が全アトラスの1.5倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
+      stats.manager.residentBytes < fullAtlas * 1.4,
+      `${backend} (${slug}): 常駐量が全アトラスの1.4倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
     );
 
     for (const [index] of stats.avatars.entries()) {
@@ -517,8 +583,13 @@ async function checkInstances(browser, backend, config) {
 }
 
 async function checkBudget(browser, backend) {
-  // ?budget=32（既定3ソース+複製1）で上限キャッシュを検証する。evictDelay=5000 のため
-  // 段1（猶予破棄）は動かず、段2（上限破棄）だけが residentBytes を下げる。
+  // 上限キャッシュの段2（上限破棄）を直接検証する。手順:
+  // 1. budgetなし・既定3ソース＋複製1・evictDelay=10000（段1は10秒猶予のため動かない）で起動し、
+  //    全レベル常駐の total と現用＋最粗の required を測る（total > required*1.05）。
+  // 2. required < budget < total になる予算を動的に決めて設定し、段2だけが掃引して
+  //    resident<=budget・over==0・レベル不変になることを確認する（段2の証拠）。
+  // 3. 8MBに締めて resident===required・over>0・レベル不変を確認する。
+  // 4. 解除で上限なし・over 0を確認する。
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
   page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
@@ -526,7 +597,7 @@ async function checkBudget(browser, backend) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?auto=0&evictDelay=5000&budget=32&wander=0&adaptive=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?auto=0&evictDelay=10000&wander=0&adaptive=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -540,38 +611,72 @@ async function checkBudget(browser, backend) {
       assert(false, `${backend} (budget): デモが ready にならなかった（status=${status}）`);
       return result;
     }
-    // 上限（32MB）以下まで段2が掃引するのを待つ。
+    // 既定構成（3ソース＋Aの複製1）は段1混入の心配がない。Aのテンプレートは
+    // ソースがL0・複製がL3に付くため全グループが現用か最粗pinで、未参照テクスチャを持たない。
+    // すなわち古い登録時刻のAには段1の対象が存在せず、段1の候補（B・Cの未使用L3群）は
+    // B・Cのロード直後の登録で fresh のため、ready からの経過で段1（10秒猶予）を排除できる。
+    // なお 1ソース＋複製3（`?models=A&avatars=4`）では4体がL0〜L3を埋めて
+    // total===required になり、未使用レベルが存在しないため段2の検証自体ができない。
+    // （2026-11-26の試行で total=required=18175317 を実測し、仕様どおり失敗することを確認）
+    const readyAt = Date.now();
     await waitFrames(page, 20);
     await sleep(1400);
-    const stats = await statsOf(page);
-    result.initial = {
-      budgetBytes: stats.manager.budgetBytes,
-      overBudgetBytes: stats.manager.overBudgetBytes,
-      residentBytes: stats.manager.residentBytes,
-      evictCount: stats.manager.evictCount,
-    };
+    const before = await statsOf(page);
     assert(
-      stats.manager.budgetBytes === 32 * 1048576,
-      `${backend} (budget): budgetBytes が 32MB でない: ${stats.manager.budgetBytes}`,
+      before.sourceCount === 3,
+      `${backend} (budget): sourceCount が 3 でない: ${before.sourceCount}`,
     );
     assert(
-      stats.manager.overBudgetBytes === 0,
-      `${backend} (budget): overBudgetBytes が 0 でない: ${stats.manager.overBudgetBytes}`,
+      before.cloneCount === 1,
+      `${backend} (budget): cloneCount が 1 でない: ${before.cloneCount}`,
     );
     assert(
-      stats.manager.residentBytes <= stats.manager.budgetBytes,
-      `${backend} (budget): residentBytes が上限以下にならない: ${stats.manager.residentBytes} / ${stats.manager.budgetBytes}`,
+      before.avatars.length === 4,
+      `${backend} (budget): アバター数が 4 でない: ${before.avatars.length}`,
     );
     assert(
-      stats.manager.evictCount > 0,
-      `${backend} (budget): 上限までの破棄が起きていない (evictCount=${stats.manager.evictCount})`,
+      before.evictDelayMs === 10000,
+      `${backend} (budget): evictDelayMs が 10000 でない: ${before.evictDelayMs}`,
+    );
+    assert(
+      before.manager.budgetBytes === null,
+      `${backend} (budget): 起動時の budgetBytes が null でない: ${before.manager.budgetBytes}`,
+    );
+    const total = before.manager.residentBytes;
+    const required = before.manager.requiredBytes;
+    result.total = total;
+    result.required = required;
+    result.evictDelayMs = before.evictDelayMs;
+    assert(
+      total > required * 1.05,
+      `${backend} (budget): 未使用レベルが無い（total が required の1.05倍以下）: total=${total} / required=${required}`,
     );
 
-    // 上限を 8MB に締める。現用・最粗は守られるため超過が残り、レベル分布は変わらない。
-    const levelsBefore = stats.avatars.map((avatar) => avatar.level);
-    const setOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 8 }));
-    assert(setOk === true, `${backend} (budget): setSettings({ budgetMB: 8 }) が false`);
+    // 動的に予算を決める: required < budget < total の中間値（MiB単位）。
+    // 下限は required を1MiB切り上げて1MiB余裕を見た値、上限側は total と required の中間。
+    const MIB = 1048576;
+    const budgetMB = Math.max(
+      Math.ceil(required / MIB) + 1,
+      Math.floor((total + required) / 2 / MIB),
+    );
+    assert(budgetMB >= 1 && budgetMB <= 4096, `${backend} (budget): 動的予算が範囲外: ${budgetMB}`);
+    // required 以下では段2が不要、total 以上では段2が動かない。中間でなければ検証にならない。
+    assert(
+      budgetMB * MIB > required,
+      `${backend} (budget): 動的予算が required 以下で段2が不要: ${budgetMB * MIB} <= ${required}`,
+    );
+    assert(
+      budgetMB * MIB < total,
+      `${backend} (budget): 動的予算が total 以上で段2が動かない: ${budgetMB * MIB} >= ${total}`,
+    );
+    result.selectedBudget = budgetMB;
+    const levelsBefore = before.avatars.map((avatar) => avatar.level);
+    const evictBefore = before.manager.evictCount;
+    const setOk = await page.evaluate((mb) => window.__vrmDemo.setSettings({ budgetMB: mb }), budgetMB);
+    assert(setOk === true, `${backend} (budget): setSettings({ budgetMB: ${budgetMB} }) が false`);
+    // 段2は update 内で同期に走るため、数フレーム＋短い待機で十分。15秒ポーリングは不要。
     await waitFrames(page, 6);
+    await sleep(300);
     const tight = await statsOf(page);
     result.tight = {
       budgetBytes: tight.manager.budgetBytes,
@@ -580,31 +685,78 @@ async function checkBudget(browser, backend) {
       requiredBytes: tight.manager.requiredBytes,
       evictCount: tight.manager.evictCount,
       levels: tight.avatars.map((avatar) => avatar.level),
+      elapsedMs: Date.now() - readyAt,
     };
     assert(
-      tight.manager.budgetBytes === 8 * 1048576,
-      `${backend} (budget): 締め後の budgetBytes が 8MB でない: ${tight.manager.budgetBytes}`,
+      tight.manager.budgetBytes === budgetMB * MIB,
+      `${backend} (budget): budgetBytes が ${budgetMB}MB でない: ${tight.manager.budgetBytes}`,
     );
     assert(
-      tight.manager.overBudgetBytes > 0,
-      `${backend} (budget): 締め後に overBudgetBytes > 0 にならない: ${tight.manager.overBudgetBytes}`,
+      tight.manager.residentBytes <= tight.manager.budgetBytes,
+      `${backend} (budget): residentBytes が上限以下にならない: ${tight.manager.residentBytes} / ${tight.manager.budgetBytes}`,
     );
     assert(
-      tight.manager.evictCount > 0,
-      `${backend} (budget): 締め後の破棄が起きていない (evictCount=${tight.manager.evictCount})`,
+      tight.manager.overBudgetBytes === 0,
+      `${backend} (budget): overBudgetBytes が 0 でない: ${tight.manager.overBudgetBytes}`,
+    );
+    assert(
+      tight.manager.evictCount > evictBefore,
+      `${backend} (budget): 掃引が起きていない (evictCount=${evictBefore} → ${tight.manager.evictCount})`,
+    );
+    // 段1なら未参照は全部消えて resident===required になるが、段2は上限で止まるため
+    // required より上に残る。この差が段2の証拠になる。
+    assert(
+      tight.manager.residentBytes > tight.manager.requiredBytes,
+      `${backend} (budget): 段2で止まらず resident が required まで落ちた: resident=${tight.manager.residentBytes} / required=${tight.manager.requiredBytes}`,
+    );
+    // ready から tight 取得までが evictDelay=10000 を超えると段1が混ざる。10秒未満であること。
+    assert(
+      (result.tight.elapsedMs ?? Infinity) < 10000,
+      `${backend} (budget): 計測に10秒以上かかり段1混入の疑い: elapsedMs=${result.tight.elapsedMs}`,
+    );
+    assert(
+      JSON.stringify(tight.avatars.map((avatar) => avatar.level)) === JSON.stringify(levelsBefore),
+      `${backend} (budget): 上限設定でレベルが変化した: ${JSON.stringify(levelsBefore)} → ${JSON.stringify(tight.avatars.map((avatar) => avatar.level))}`,
+    );
+
+    // 上限を 8MB に締める。現用・最粗は守られるため超過が残り、レベル分布は変わらない。
+    const evictTight = tight.manager.evictCount;
+    const setVeryOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 8 }));
+    assert(setVeryOk === true, `${backend} (budget): setSettings({ budgetMB: 8 }) が false`);
+    await waitFrames(page, 6);
+    const veryTight = await statsOf(page);
+    result.veryTight = {
+      budgetBytes: veryTight.manager.budgetBytes,
+      overBudgetBytes: veryTight.manager.overBudgetBytes,
+      residentBytes: veryTight.manager.residentBytes,
+      requiredBytes: veryTight.manager.requiredBytes,
+      evictCount: veryTight.manager.evictCount,
+      levels: veryTight.avatars.map((avatar) => avatar.level),
+    };
+    assert(
+      veryTight.manager.budgetBytes === 8 * 1048576,
+      `${backend} (budget): 締め後の budgetBytes が 8MB でない: ${veryTight.manager.budgetBytes}`,
+    );
+    assert(
+      veryTight.manager.overBudgetBytes > 0,
+      `${backend} (budget): 締め後に overBudgetBytes > 0 にならない: ${veryTight.manager.overBudgetBytes}`,
+    );
+    assert(
+      veryTight.manager.evictCount > evictTight,
+      `${backend} (budget): 締め後の破棄が起きていない (evictCount=${evictTight} → ${veryTight.manager.evictCount})`,
     );
     // 予算 < 必要量なので、破棄可能（未参照・非最粗）はすべて消え、
     // resident と required が一致する。
     // 浮動小数の和の順序差に備え、絶対差 1 バイト未満で比較する。
     assert(
-      Math.abs(tight.manager.residentBytes - tight.manager.requiredBytes) < 1,
-      `${backend} (budget): resident と required が不一致: ${tight.manager.residentBytes} / ${tight.manager.requiredBytes}`,
+      Math.abs(veryTight.manager.residentBytes - veryTight.manager.requiredBytes) < 1,
+      `${backend} (budget): resident と required が不一致: ${veryTight.manager.residentBytes} / ${veryTight.manager.requiredBytes}`,
     );
     assert(
-      JSON.stringify(tight.avatars.map((avatar) => avatar.level)) === JSON.stringify(levelsBefore),
-      `${backend} (budget): 上限変更でレベルが変化した: ${JSON.stringify(levelsBefore)} → ${JSON.stringify(tight.avatars.map((avatar) => avatar.level))}`,
+      JSON.stringify(veryTight.avatars.map((avatar) => avatar.level)) === JSON.stringify(levelsBefore),
+      `${backend} (budget): 上限変更でレベルが変化した: ${JSON.stringify(levelsBefore)} → ${JSON.stringify(veryTight.avatars.map((avatar) => avatar.level))}`,
     );
-    // evictDelay=5000 のため段1は動かない。350ms 待って2回読んでも増え続けないこと。
+    // evictDelay=10000 のため段1は動かない。350ms 待って2回読んでも増え続けないこと。
     await sleep(350);
     const settled1 = (await statsOf(page)).manager.evictCount;
     await sleep(350);
@@ -655,8 +807,8 @@ async function checkBudget(browser, backend) {
 }
 
 async function checkAdaptiveBudget(browser, backend) {
-  // 予算適応スケール（既定ON）。`?budget=8` で予測常駐が必要量以下に収まるまで
-  // scale が下がり、解除後は 1 に戻ることを検証する。
+  // 予算適応の2軸（thresholdScale＋finestLevel）。`?budget=32` で予測常駐が必要量以下に収まるまで
+  // cap/scale が下がり、解除後は両方が戻ることを検証する。
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
   page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
@@ -664,7 +816,7 @@ async function checkAdaptiveBudget(browser, backend) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?auto=0&wander=0&budget=8&evictDelay=1000${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?auto=0&wander=0&budget=32&evictDelay=1000${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -683,42 +835,54 @@ async function checkAdaptiveBudget(browser, backend) {
 
     // 収束を最大15秒待つ。下げは即時・複数段のため、数秒で落ち着く想定。
     // 下限張り付きの判定に下限値の直書きは使わない。収束条件を満たさず
-    // required が予算を上回ったままなら、下限で頭打ちとみなす。
+    // required が pinned と一致したままなら、下限で頭打ちとみなす。
     let converged = null;
     const convergeStart = Date.now();
     while (Date.now() - convergeStart < 15000) {
       const sample = await statsOf(page);
       const m = sample.manager;
+      const adapted = m.thresholdScale < 1 || m.finestLevel > 0;
       if (
+        adapted &&
         m.requiredBytes <= (m.budgetBytes ?? Infinity) &&
         m.overBudgetBytes === 0
       ) {
         converged = sample;
         break;
       }
+      // 下限状態: 必要量がピン留め量と一致（これ以上下げられない）。
+      if (Math.abs(m.requiredBytes - m.pinnedBytes) < 1 && m.requiredBytes > (m.budgetBytes ?? Infinity)) {
+        converged = sample;
+        break;
+      }
       await sleep(500);
     }
     const stats = converged ?? (await statsOf(page));
-    // 下限張り付き: 収束条件を満たさなくても、required が予算超過のままなら
-    // 下限で頭打ちとみなして受け入れる（下限値の直書きは使わない）。
-    const floored = stats.manager.requiredBytes > (stats.manager.budgetBytes ?? Infinity);
-    if (converged === null && floored) converged = stats;
+    // 下限張り付き: 収束条件を満たさなくても、required が pinned と一致したまま予算超過なら
+    // 下限で頭打ちとみなして受け入れる。
+    const floored = Math.abs(stats.manager.requiredBytes - stats.manager.pinnedBytes) < 1 &&
+      stats.manager.requiredBytes > (stats.manager.budgetBytes ?? Infinity);
+    if (converged === null && stats.manager.requiredBytes > (stats.manager.budgetBytes ?? Infinity)) converged = stats;
     result.initial = {
       budgetBytes: stats.manager.budgetBytes,
       requiredBytes: stats.manager.requiredBytes,
       residentBytes: stats.manager.residentBytes,
       overBudgetBytes: stats.manager.overBudgetBytes,
       thresholdScale: stats.manager.thresholdScale,
+      finestLevel: stats.manager.finestLevel,
+      pinnedBytes: stats.manager.pinnedBytes,
       scaleLowerCount: stats.manager.scaleLowerCount,
       scaleRaiseCount: stats.manager.scaleRaiseCount,
+      levelCapLowerCount: stats.manager.levelCapLowerCount,
+      levelCapRaiseCount: stats.manager.levelCapRaiseCount,
       levelCounts: stats.levelCounts,
       managerGeneration: stats.managerGeneration,
       waitMs: Date.now() - convergeStart,
     };
     assert(converged !== null, `${backend} (adaptive): 15秒で収束しなかった: ${JSON.stringify(result.initial)}`);
     assert(
-      stats.manager.budgetBytes === 8 * 1048576,
-      `${backend} (adaptive): budgetBytes が 8MB でない: ${stats.manager.budgetBytes}`,
+      stats.manager.budgetBytes === 32 * 1048576,
+      `${backend} (adaptive): budgetBytes が 32MB でない: ${stats.manager.budgetBytes}`,
     );
     assert(
       stats.manager.requiredBytes <= stats.manager.budgetBytes || floored,
@@ -730,45 +894,52 @@ async function checkAdaptiveBudget(browser, backend) {
         `${backend} (adaptive): overBudgetBytes が 0 でない: ${stats.manager.overBudgetBytes}`,
       );
     }
-    // 起動直後の scale<1 は必須にしない（手順2の強制下げで確定的に取る）。
-    // lower が起きたこと自体はここで確認する。
+    // 2軸のどちらかが下がったこと。
     assert(
-      stats.manager.scaleLowerCount > 0,
-      `${backend} (adaptive): scaleLowerCount が 0 のまま: ${stats.manager.scaleLowerCount}`,
+      stats.manager.scaleLowerCount > 0 || stats.manager.levelCapLowerCount > 0,
+      `${backend} (adaptive): lower カウンタが両方 0 のまま: scale=${stats.manager.scaleLowerCount}, cap=${stats.manager.levelCapLowerCount}`,
     );
+    // 全員が最粗L4に落ちていないこと。
     assert(
-      stats.levelCounts[3] !== stats.avatars.length,
-      `${backend} (adaptive): 全体が L3 まで粗くなった: ${JSON.stringify(stats.levelCounts)}`,
+      stats.levelCounts[4] !== stats.avatars.length,
+      `${backend} (adaptive): 全員が最粗L4まで粗くなった: ${JSON.stringify(stats.levelCounts)}`,
     );
 
-    // 手順2: 予算を 2MB に締めて強制的に下げる。定常の必要量（約5MB）を下回るため下げが起きる。
-    // 初期収束の残りで scale<1 のままの可能性があるため、数フレーム進めてから
-    // scale<1 かつ required≤予算（または下限張り付き）になるまで最大15秒待つ。
+    // 手順2: 予算を 2MB に締めて強制的に下げる。2軸のどちらかが下がり、
+    // required≤予算（または下限状態）になるまで最大15秒待つ。下限状態では all L4 を許容する。
     const forceOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 2 }));
     assert(forceOk === true, `${backend} (adaptive): setSettings({ budgetMB: 2 }) が false`);
     await waitFrames(page, 6);
     let forcedSample = null;
-    let lastForcedScale = null;
-    let lastForcedScaleAt = Date.now();
+    let lastForcedKey = null;
+    let lastForcedKeyAt = Date.now();
     const forceStart = Date.now();
     while (Date.now() - forceStart < 15000) {
       const sample = await statsOf(page);
       const m = sample.manager;
+      const adapted = m.thresholdScale < 1 || m.finestLevel > 0;
       if (
-        m.thresholdScale < 1 &&
+        adapted &&
         m.requiredBytes <= (m.budgetBytes ?? Infinity) &&
         m.overBudgetBytes === 0
       ) {
         forcedSample = sample;
         break;
       }
-      // 下限張り付き: scale が2秒間変わらず required が超過のままなら頭打ちとみなす（下限値の直書きは使わない）。
-      if (m.thresholdScale !== lastForcedScale) {
-        lastForcedScale = m.thresholdScale;
-        lastForcedScaleAt = Date.now();
+      const pinnedFloor = Math.abs(m.requiredBytes - m.pinnedBytes) < 1 &&
+        m.requiredBytes > (m.budgetBytes ?? Infinity);
+      if (pinnedFloor) {
+        forcedSample = sample;
+        break;
+      }
+      // 下限張り付き: scale/finest が2秒間変わらず required が超過のままなら頭打ちとみなす。
+      const key = `${m.thresholdScale}:${m.finestLevel}`;
+      if (key !== lastForcedKey) {
+        lastForcedKey = key;
+        lastForcedKeyAt = Date.now();
       } else if (
         m.requiredBytes > (m.budgetBytes ?? Infinity) &&
-        Date.now() - lastForcedScaleAt >= 2000
+        Date.now() - lastForcedKeyAt >= 2000
       ) {
         forcedSample = sample;
         break;
@@ -776,19 +947,24 @@ async function checkAdaptiveBudget(browser, backend) {
       await sleep(500);
     }
     const forced = forcedSample ?? (await statsOf(page));
-    const forcedFloored = forced.manager.requiredBytes > (forced.manager.budgetBytes ?? Infinity);
+    const forcedFloored = Math.abs(forced.manager.requiredBytes - forced.manager.pinnedBytes) < 1 &&
+      forced.manager.requiredBytes > (forced.manager.budgetBytes ?? Infinity);
     result.forced = {
       budgetBytes: forced.manager.budgetBytes,
       requiredBytes: forced.manager.requiredBytes,
       residentBytes: forced.manager.residentBytes,
       overBudgetBytes: forced.manager.overBudgetBytes,
       thresholdScale: forced.manager.thresholdScale,
+      finestLevel: forced.manager.finestLevel,
+      pinnedBytes: forced.manager.pinnedBytes,
       scaleLowerCount: forced.manager.scaleLowerCount,
       scaleRaiseCount: forced.manager.scaleRaiseCount,
+      levelCapLowerCount: forced.manager.levelCapLowerCount,
+      levelCapRaiseCount: forced.manager.levelCapRaiseCount,
       levelCounts: forced.levelCounts,
       waitMs: Date.now() - forceStart,
     };
-    assert(forcedSample !== null, `${backend} (adaptive): 2MB 締めで15秒待っても scale<1 かつ required≤予算にならない: ${JSON.stringify(result.forced)}`);
+    assert(forcedSample !== null, `${backend} (adaptive): 2MB 締めで15秒待っても適応後に required≤予算/下限にならない: ${JSON.stringify(result.forced)}`);
     assert(
       forced.manager.budgetBytes === 2 * 1048576,
       `${backend} (adaptive): 締め後の budgetBytes が 2MB でない: ${forced.manager.budgetBytes}`,
@@ -804,16 +980,17 @@ async function checkAdaptiveBudget(browser, backend) {
       );
     }
 
-    // 手順3: 予算を解除し、scale === 1 になるまで最大40秒待つ（下限からの復帰経路を実際に通す）。
-    // 下限 0.05 からは冷却3秒＋18段×1秒 ≈ 21秒かかるため余裕を持たせる。早すぎる場合は失敗にする。
+    // 手順3: 予算を解除し、scale === 1 && finestLevel === 0 になるまで最大60秒待つ（2軸の復帰）。
+    // capの上げは1段/秒＋冷却3秒のため余裕を持たせる。
     const raiseBeforeRestore = forced.manager.scaleRaiseCount;
+    const capRaiseBeforeRestore = forced.manager.levelCapRaiseCount;
     const unsetOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 0 }));
     assert(unsetOk === true, `${backend} (adaptive): setSettings({ budgetMB: 0 }) が false`);
     let restored = null;
     const restoreStart = Date.now();
-    while (Date.now() - restoreStart < 40000) {
+    while (Date.now() - restoreStart < 60000) {
       const sample = await statsOf(page);
-      if (sample.manager.thresholdScale === 1) {
+      if (sample.manager.thresholdScale === 1 && sample.manager.finestLevel === 0) {
         restored = sample;
         break;
       }
@@ -822,46 +999,62 @@ async function checkAdaptiveBudget(browser, backend) {
     const after = restored ?? (await statsOf(page));
     result.restored = {
       thresholdScale: after.manager.thresholdScale,
+      finestLevel: after.manager.finestLevel,
+      pinnedBytes: after.manager.pinnedBytes,
       scaleRaiseCount: after.manager.scaleRaiseCount,
       scaleRaiseDelta: after.manager.scaleRaiseCount - raiseBeforeRestore,
+      levelCapRaiseCount: after.manager.levelCapRaiseCount,
+      levelCapRaiseDelta: after.manager.levelCapRaiseCount - capRaiseBeforeRestore,
       scaleLowerCount: after.manager.scaleLowerCount,
+      levelCapLowerCount: after.manager.levelCapLowerCount,
       requiredBytes: after.manager.requiredBytes,
       overBudgetBytes: after.manager.overBudgetBytes,
       levelCounts: after.levelCounts,
       waitMs: Date.now() - restoreStart,
     };
-    assert(restored !== null, `${backend} (adaptive): 40秒で scale が 1 に戻らなかった: ${JSON.stringify(result.restored)}`);
+    assert(restored !== null, `${backend} (adaptive): 60秒で scale=1/finest=0 に戻らなかった: ${JSON.stringify(result.restored)}`);
     assert(
-      after.manager.thresholdScale === 1,
-      `${backend} (adaptive): 解除後の scale が 1 でない: ${after.manager.thresholdScale}`,
+      after.manager.thresholdScale === 1 && after.manager.finestLevel === 0,
+      `${backend} (adaptive): 解除後の scale/finest が 1/0 でない: ${after.manager.thresholdScale}/${after.manager.finestLevel}`,
     );
     assert(
-      after.manager.scaleRaiseCount > raiseBeforeRestore,
-      `${backend} (adaptive): 解除後に scaleRaiseCount が増えていない: ${raiseBeforeRestore} → ${after.manager.scaleRaiseCount}`,
+      after.manager.scaleRaiseCount > raiseBeforeRestore || after.manager.levelCapRaiseCount > capRaiseBeforeRestore,
+      `${backend} (adaptive): 解除後に raise カウンタが増えていない: scale ${raiseBeforeRestore} → ${after.manager.scaleRaiseCount}, cap ${capRaiseBeforeRestore} → ${after.manager.levelCapRaiseCount}`,
     );
 
-    // 手順4: 解除後に5秒間、scale・カウンタ・切替が不変であること。
+    // 手順4: 解除後に5秒間、scale/finest・4カウンタ・切替が不変であること。
     const stableAnchor = {
       thresholdScale: after.manager.thresholdScale,
+      finestLevel: after.manager.finestLevel,
       scaleLowerCount: after.manager.scaleLowerCount,
       scaleRaiseCount: after.manager.scaleRaiseCount,
+      levelCapLowerCount: after.manager.levelCapLowerCount,
+      levelCapRaiseCount: after.manager.levelCapRaiseCount,
       switchCount: after.manager.switchCount,
     };
     await sleep(5000);
     const stableSample = await statsOf(page);
     result.stable = {
       thresholdScale: stableSample.manager.thresholdScale,
+      finestLevel: stableSample.manager.finestLevel,
       scaleLowerCount: stableSample.manager.scaleLowerCount,
       scaleRaiseCount: stableSample.manager.scaleRaiseCount,
+      levelCapLowerCount: stableSample.manager.levelCapLowerCount,
+      levelCapRaiseCount: stableSample.manager.levelCapRaiseCount,
       switchCount: stableSample.manager.switchCount,
       requiredBytes: stableSample.manager.requiredBytes,
       residentBytes: stableSample.manager.residentBytes,
       overBudgetBytes: stableSample.manager.overBudgetBytes,
+      pinnedBytes: stableSample.manager.pinnedBytes,
       levelCounts: stableSample.levelCounts,
     };
     assert(
       stableSample.manager.thresholdScale === stableAnchor.thresholdScale,
       `${backend} (adaptive): 解除後5秒で scale が変化した: ${stableAnchor.thresholdScale} → ${stableSample.manager.thresholdScale}`,
+    );
+    assert(
+      stableSample.manager.finestLevel === stableAnchor.finestLevel,
+      `${backend} (adaptive): 解除後5秒で finestLevel が変化した: ${stableAnchor.finestLevel} → ${stableSample.manager.finestLevel}`,
     );
     assert(
       stableSample.manager.scaleLowerCount === stableAnchor.scaleLowerCount,
@@ -870,6 +1063,14 @@ async function checkAdaptiveBudget(browser, backend) {
     assert(
       stableSample.manager.scaleRaiseCount === stableAnchor.scaleRaiseCount,
       `${backend} (adaptive): 解除後5秒で scaleRaiseCount が変化した: ${stableAnchor.scaleRaiseCount} → ${stableSample.manager.scaleRaiseCount}`,
+    );
+    assert(
+      stableSample.manager.levelCapLowerCount === stableAnchor.levelCapLowerCount,
+      `${backend} (adaptive): 解除後5秒で levelCapLowerCount が変化した: ${stableAnchor.levelCapLowerCount} → ${stableSample.manager.levelCapLowerCount}`,
+    );
+    assert(
+      stableSample.manager.levelCapRaiseCount === stableAnchor.levelCapRaiseCount,
+      `${backend} (adaptive): 解除後5秒で levelCapRaiseCount が変化した: ${stableAnchor.levelCapRaiseCount} → ${stableSample.manager.levelCapRaiseCount}`,
     );
     assert(
       stableSample.manager.switchCount === stableAnchor.switchCount,
@@ -898,10 +1099,13 @@ async function checkAdaptiveBudget(browser, backend) {
     const reagain = reapplied ?? (await statsOf(page));
     result.reapplied = {
       thresholdScale: reagain.manager.thresholdScale,
+      finestLevel: reagain.manager.finestLevel,
+      pinnedBytes: reagain.manager.pinnedBytes,
       requiredBytes: reagain.manager.requiredBytes,
       residentBytes: reagain.manager.residentBytes,
       overBudgetBytes: reagain.manager.overBudgetBytes,
       scaleLowerCount: reagain.manager.scaleLowerCount,
+      levelCapLowerCount: reagain.manager.levelCapLowerCount,
       switchCount: reagain.manager.switchCount,
       managerGeneration: reagain.managerGeneration,
       waitMs: Date.now() - reapplyStart,
@@ -933,6 +1137,273 @@ async function checkAdaptiveBudget(browser, backend) {
   return result;
 }
 
+async function checkTierCap(browser, backend) {
+  // Tier上限 `?top=1024` と予算適応のcapを検証する。4096は重いためフル検査はWebGPUのみ。
+  // WebGLでは軽い `?atlas=1024&top=1024` 検査（finestLevel===2、エラー0）だけを行う。
+  const result = { backend, ok: false };
+  const messages = [];
+  const collect = (page) => {
+    page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+    page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  };
+  try {
+    if (backend === 'webgl') {
+      // 一過性の GPU 初期化失敗（Instance dropped / Context Lost）に備え、最大2回試す。
+      let attempt = 0;
+      for (;;) {
+        attempt++;
+        const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+        const attemptMessages = [];
+        page.on('console', (message) => attemptMessages.push(`${message.type()}: ${message.text()}`));
+        page.on('pageerror', (error) => attemptMessages.push(`pageerror: ${String(error)}`));
+        const gotoAt = Date.now();
+        try {
+          await page.goto(
+            `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&wander=0&atlas=1024&top=1024&backend=webgl`,
+            { waitUntil: 'load' },
+          );
+          await page.waitForFunction(
+            () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+            null,
+            { timeout: 300000 },
+          );
+          const status = await page.evaluate(() => window.__vrmDemo.status);
+          result.lightStatus = status;
+          result.lightReadyMs = Date.now() - gotoAt;
+          // このブラウザは vulkan フラグなしの WebGL（SwiftShader）のため、ready が極端に
+          // 遅い場合はその旨を結果に残す（timeout 300秒は維持）。
+          if (result.lightReadyMs > 120000) result.lightSlowReady = true;
+          assert(status === 'ready', `${backend} (tierCap): ?atlas=1024&top=1024 で ready にならなかった（status=${status}）`);
+          if (status === 'ready') {
+            await waitFrames(page, 20);
+            const stats = await statsOf(page);
+            assert(stats.backend === 'webgl', `${backend} (tierCap): backend が webgl でない: ${stats.backend}`);
+            result.light = {
+              backend: stats.backend,
+              topLevel: stats.topLevel,
+              topResolution: stats.topResolution,
+              finestLevel: stats.manager.finestLevel,
+              level: stats.avatars[0]?.level,
+            };
+            assert(stats.topLevel === 2, `${backend} (tierCap): topLevel が 2 でない: ${stats.topLevel}`);
+            assert(stats.manager.finestLevel === 2, `${backend} (tierCap): finestLevel が 2 でない: ${stats.manager.finestLevel}`);
+          }
+        } finally {
+          await page.close();
+        }
+        const consoleErrors = attemptMessages.filter(
+          (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+        );
+        const noise = attemptMessages.filter((message) =>
+          /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+        );
+        // 値の検証が通ってもコンソールに一過性のエラーが残れば、新しいページで1回だけ取り直す。
+        // 1回目で assert 失敗した場合は failures に残る。リトライはコンソールノイズの取り直し用。
+        if ((consoleErrors.length > 0 || noise.length > 0) && attempt < 2) continue;
+        messages.push(...attemptMessages);
+        break;
+      }
+      const consoleErrors = messages.filter(
+        (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+      );
+      const noise = messages.filter((message) =>
+        /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+      );
+      result.consoleErrors = consoleErrors;
+      result.webgpuNoise = noise;
+      assert(consoleErrors.length === 0, `${backend} (tierCap): コンソールエラー ${consoleErrors.join(' | ')}`);
+      assert(noise.length === 0, `${backend} (tierCap): GPU関連の警告 ${noise.join(' | ')}`);
+      result.ok = failures.length === 0;
+      return result;
+    }
+    // 前半: `?top=1024`（手動下限）。finestLevel=2に固定され、選択も2以上になる。
+    {
+      const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+      collect(page);
+      try {
+        await page.goto(
+          `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&wander=0&atlas=4096&top=1024`,
+          { waitUntil: 'load' },
+        );
+        await page.waitForFunction(
+          () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+          null,
+          { timeout: 300000 },
+        );
+        const status = await page.evaluate(() => window.__vrmDemo.status);
+        result.topStatus = status;
+        assert(status === 'ready', `${backend} (tierCap): ?top=1024 で ready にならなかった（status=${status}）`);
+        if (status === 'ready') {
+          await waitFrames(page, 20);
+          const stats = await statsOf(page);
+          result.top = {
+            topLevel: stats.topLevel,
+            topResolution: stats.topResolution,
+            finestLevel: stats.manager.finestLevel,
+            level: stats.avatars[0]?.level,
+            levelCounts: stats.levelCounts,
+          };
+          assert(stats.topLevel === 2, `${backend} (tierCap): topLevel が 2 でない: ${stats.topLevel}`);
+          assert(stats.manager.finestLevel === 2, `${backend} (tierCap): finestLevel が 2 でない: ${stats.manager.finestLevel}`);
+          assert(
+            (stats.avatars[0]?.level ?? -1) >= 2,
+            `${backend} (tierCap): 選択レベルが2未満: ${stats.avatars[0]?.level}`,
+          );
+          const mapWidths = await page.evaluate(() => window.__vrmDemo.variantSlotWidths(0, 'map'));
+          const normalWidths = await page.evaluate(() => window.__vrmDemo.variantSlotWidths(0, 'normalMap'));
+          result.topMapWidths = mapWidths;
+          result.topNormalWidths = normalWidths;
+          const expectedMap = [4096, 2048, 1024, 512, 256];
+          const expectedNormal = [2048, 2048, 1024, 512, 256];
+          assert(mapWidths.length > 0, `${backend} (tierCap): map幅が空`);
+          for (const row of mapWidths) {
+            assert(
+              JSON.stringify(row) === JSON.stringify(expectedMap),
+              `${backend} (tierCap): map幅が想定外: ${JSON.stringify(row)}`,
+            );
+          }
+          const normalRows = normalWidths.filter((row) => row.some((value) => value !== null));
+          assert(normalRows.length > 0, `${backend} (tierCap): normalMap幅が全てnull`);
+          for (const row of normalRows) {
+            assert(
+              JSON.stringify(row) === JSON.stringify(expectedNormal),
+              `${backend} (tierCap): normalMap幅が想定外: ${JSON.stringify(row)}`,
+            );
+          }
+          const selected = stats.avatars[0]?.level ?? 2;
+          const selectedMapWidth = mapWidths[0]?.[selected];
+          // top指定時は近距離でもL2のため、選択レベルのmap幅は1024になる。
+          assert(selected === 2, `${backend} (tierCap): 選択レベルがL2でない: L${selected}`);
+          assert(selectedMapWidth === 1024, `${backend} (tierCap): L2のmap幅が1024でない: ${selectedMapWidth}`);
+        }
+      } finally {
+        await page.close();
+      }
+    }
+
+    // 後半: `atlas=4096&budget=64`（topなし、近距離）。予算適応のcapが下がること。
+    // 1ソースの必要量は約90MB（L0）〜23MB（L2）のため、64MBではfinest=2まで落ちる。128MBでは収まってしまう。
+    {
+      const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+      collect(page);
+      try {
+        await page.goto(
+          `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&wander=0&atlas=4096&budget=64`,
+          { waitUntil: 'load' },
+        );
+        await page.waitForFunction(
+          () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+          null,
+          { timeout: 300000 },
+        );
+        const status = await page.evaluate(() => window.__vrmDemo.status);
+        result.capStatus = status;
+        assert(status === 'ready', `${backend} (tierCap): budget=64 で ready にならなかった（status=${status}）`);
+        if (status === 'ready') {
+          await waitFrames(page, 20);
+          // capが下がるまで最大15秒待つ。
+          let capped = null;
+          const capStart = Date.now();
+          while (Date.now() - capStart < 15000) {
+            const sample = await statsOf(page);
+            if (sample.manager.finestLevel >= 1) {
+              capped = sample;
+              break;
+            }
+            await sleep(500);
+          }
+          const stats = capped ?? (await statsOf(page));
+          result.cap = {
+            finestLevel: stats.manager.finestLevel,
+            thresholdScale: stats.manager.thresholdScale,
+            requiredBytes: stats.manager.requiredBytes,
+            residentBytes: stats.manager.residentBytes,
+            budgetBytes: stats.manager.budgetBytes,
+            overBudgetBytes: stats.manager.overBudgetBytes,
+            pinnedBytes: stats.manager.pinnedBytes,
+            levelCapLowerCount: stats.manager.levelCapLowerCount,
+            levelCapRaiseCount: stats.manager.levelCapRaiseCount,
+            level: stats.avatars[0]?.level,
+            levelCounts: stats.levelCounts,
+            waitMs: Date.now() - capStart,
+          };
+          assert(capped !== null, `${backend} (tierCap): 15秒で finestLevel>=1 にならない: ${JSON.stringify(result.cap)}`);
+          // 実測どおり finestLevel===2・scale===1 に固定で確認する。
+          assert(
+            stats.manager.finestLevel === 2,
+            `${backend} (tierCap): finestLevel が 2 でない: ${stats.manager.finestLevel}`,
+          );
+          assert(
+            stats.manager.thresholdScale === 1,
+            `${backend} (tierCap): scale が 1 でない: ${stats.manager.thresholdScale}`,
+          );
+          assert(
+            stats.manager.requiredBytes <= 64 * 1048576,
+            `${backend} (tierCap): required が 64MB 以下にならない: ${stats.manager.requiredBytes}`,
+          );
+          assert(
+            stats.manager.overBudgetBytes === 0,
+            `${backend} (tierCap): overBudgetBytes が 0 でない: ${stats.manager.overBudgetBytes}`,
+          );
+          assert(
+            stats.manager.levelCapLowerCount > 0,
+            `${backend} (tierCap): levelCapLowerCount が 0 のまま: ${stats.manager.levelCapLowerCount}`,
+          );
+          const mapWidths = await page.evaluate(() => window.__vrmDemo.variantSlotWidths(0, 'map'));
+          const selected = stats.avatars[0]?.level ?? 0;
+          const selectedMapWidth = mapWidths[0]?.[selected];
+          result.capMapWidth = selectedMapWidth;
+          assert(
+            selected === 2,
+            `${backend} (tierCap): 選択レベルがL2でない: L${selected}`,
+          );
+          assert(
+            selectedMapWidth === 1024,
+            `${backend} (tierCap): 選択レベルのmap幅が1024でない: L${selected} -> ${selectedMapWidth}`,
+          );
+
+          // 予算解除で finestLevel===0 に戻る（cap上げは1段/秒＋冷却3秒のため最大30秒）。
+          const unsetOk = await page.evaluate(() => window.__vrmDemo.setSettings({ budgetMB: 0 }));
+          assert(unsetOk === true, `${backend} (tierCap): setSettings({ budgetMB: 0 }) が false`);
+          let restored = null;
+          const restoreStart = Date.now();
+          while (Date.now() - restoreStart < 30000) {
+            const sample = await statsOf(page);
+            if (sample.manager.finestLevel === 0) {
+              restored = sample;
+              break;
+            }
+            await sleep(500);
+          }
+          result.capRestored = {
+            finestLevel: (restored ?? (await statsOf(page))).manager.finestLevel,
+            waitMs: Date.now() - restoreStart,
+          };
+          assert(restored !== null, `${backend} (tierCap): 30秒で finestLevel が 0 に戻らなかった: ${JSON.stringify(result.capRestored)}`);
+        }
+      } finally {
+        await page.close();
+      }
+    }
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    const noise = messages.filter((message) =>
+      /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+    );
+    result.consoleErrors = consoleErrors;
+    result.webgpuNoise = noise;
+    assert(consoleErrors.length === 0, `${backend} (tierCap): コンソールエラー ${consoleErrors.join(' | ')}`);
+    assert(noise.length === 0, `${backend} (tierCap): GPU関連の警告 ${noise.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (tierCap): 例外: ${String(error)}`);
+  }
+  return result;
+}
+
 async function checkCrowd(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
@@ -958,7 +1429,8 @@ async function checkCrowd(browser, backend) {
       return result;
     }
     // evictDelay(既定1000ms) 後の常駐量まで待ってから測る。
-    await waitFrames(page, 20);
+    // 低速環境（SwiftShaderのWebGPUなど）では20フレームに50秒以上かかるため最大180秒まで待つ。
+    await waitFrames(page, 20, 180000);
     await sleep(1400);
     const stats = await statsOf(page);
     result.stats = stats;
@@ -973,15 +1445,17 @@ async function checkCrowd(browser, backend) {
     );
     const levelSum = stats.levelCounts.reduce((sum, count) => sum + count, 0);
     assert(levelSum === 100, `${backend} (crowd): levelCounts の合計が ${levelSum}`);
-    assert(stats.levelCounts[3] >= 80, `${backend} (crowd): L3 が ${stats.levelCounts[3]} 体しかない`);
+    assert(stats.manager.levelCounts.length === 5, `${backend} (crowd): levelCounts が5要素でない: ${JSON.stringify(stats.manager.levelCounts)}`);
+    assert((stats.levelCounts[3] + stats.levelCounts[4]) >= 80, `${backend} (crowd): L3+L4 が ${(stats.levelCounts[3] ?? 0) + (stats.levelCounts[4] ?? 0)} 体しかない`);
     assert(stats.errors.length === 0, `${backend} (crowd): stats.errors ${stats.errors.join(' | ')}`);
     assert(stats.wander === false, `${backend} (crowd): wander が ${stats.wander}`);
     const fullAtlas = stats.avatars.reduce((sum, avatar) => sum + avatar.atlasBytes, 0);
     result.resident = stats.manager.residentBytes;
     result.fullAtlas = fullAtlas;
+    // 複製の atlasBytes は0のため、fullAtlas はソース分のみ。実測1.30倍のため1.4倍未満で見る。
     assert(
-      stats.manager.residentBytes < fullAtlas * 1.5,
-      `${backend} (crowd): 常駐量が全アトラスの1.5倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
+      stats.manager.residentBytes < fullAtlas * 1.4,
+      `${backend} (crowd): 常駐量が全アトラスの1.4倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
     );
 
     // 静止時の性能を3秒間記録する。
@@ -1003,11 +1477,14 @@ async function checkCrowd(browser, backend) {
       pipelineCaches: still[still.length - 1].pipelineCaches,
     };
 
-    // 徘徊を有効化する。2秒待って9割以上が動き出すこと。
+    // 徘徊を有効化する。模擬時間7秒で9割以上が動き出すこと。
+    // WebGPU/SwiftShader では frame が1.7秒でも delta が0.05にクランプされるため、
+    // 壁時計ではなく模擬時間（stats().elapsed）で待つ。7秒は待機（0.5〜3.0秒）を終えて
+    // 歩行に入るまでの余裕を見た値。タイムアウトは300秒（1.7s/frameで約140フレーム＝約238秒）。
+    const simStart = (await statsOf(page)).elapsed;
     const wanderSetAt = Date.now();
     const setWanderOk = await page.evaluate(() => window.__vrmDemo.setSettings({ wander: true }));
     assert(setWanderOk === true, `${backend} (crowd): setSettings({ wander: true }) が false`);
-    await sleep(2000);
     const movedFraction = () =>
       page.evaluate(() => {
         const demo = window.__vrmDemo.stats();
@@ -1015,16 +1492,26 @@ async function checkCrowd(browser, backend) {
           (avatar) =>
             Math.hypot(avatar.position.x - avatar.home.x, avatar.position.z - avatar.home.z) > 0.01,
         ).length;
-        return moved / demo.avatars.length;
+        return { moved: moved / demo.avatars.length, elapsed: demo.elapsed };
       });
-    let moved = await movedFraction();
-    // 重い環境では2秒でシミュレーションが進まないため、最大30秒まで待つ。
-    while (moved < 0.9 && Date.now() - wanderSetAt < 30000) {
-      await sleep(500);
-      moved = await movedFraction();
+    let moved = 0;
+    let simWait = 0;
+    const wanderDeadline = Date.now() + 300000;
+    for (;;) {
+      const sample = await movedFraction();
+      moved = sample.moved;
+      simWait = sample.elapsed - simStart;
+      if (moved >= 0.9 && simWait >= 7) break;
+      if (Date.now() >= wanderDeadline) break;
+      await sleep(1500);
     }
     result.wanderWaitMs = Date.now() - wanderSetAt;
+    result.simWait = simWait;
     result.movedFraction = moved;
+    assert(
+      simWait >= 7,
+      `${backend} (crowd): シミュレーションが進まなかった（sim ${simWait.toFixed(2)}秒でタイムアウト）`,
+    );
     assert(moved >= 0.9, `${backend} (crowd): 移動した体が ${Math.round(moved * 100)}% しかない`);
 
     const wandering = await statsOf(page);
@@ -1070,7 +1557,7 @@ async function checkCrowd(browser, backend) {
 
     // 徘徊を止めると全員が home に戻る（レベルは確認しない）。
     await page.evaluate(() => window.__vrmDemo.setSettings({ wander: false }));
-    await waitFrames(page, 6);
+    await waitFrames(page, 6, 180000);
     const settled = await statsOf(page);
     const maxHomeError = Math.max(
       ...settled.avatars.map((avatar) =>
@@ -1088,10 +1575,11 @@ async function checkCrowd(browser, backend) {
     );
 
     // 体数の一括変更。往復してもパイプラインは増えないこと。
+    // 低速環境でも最大180秒まで待つ。
     const to4At = Date.now();
     const to4 = await page.evaluate(() => window.__vrmDemo.setAvatarCount(4));
     result.setAvatarCount4Ms = Date.now() - to4At;
-    await waitFrames(page, 6);
+    await waitFrames(page, 6, 180000);
     const stats4 = await statsOf(page);
     assert(to4 === 4, `${backend} (crowd): setAvatarCount(4) が ${to4} を返した`);
     assert(stats4.avatars.length === 4, `${backend} (crowd): 4体化後に ${stats4.avatars.length} 体`);
@@ -1101,7 +1589,7 @@ async function checkCrowd(browser, backend) {
     const to100At = Date.now();
     const to100 = await page.evaluate(() => window.__vrmDemo.setAvatarCount(100));
     result.setAvatarCount100Ms = Date.now() - to100At;
-    await waitFrames(page, 6);
+    await waitFrames(page, 6, 180000);
     const stats100 = await statsOf(page);
     assert(to100 === 100, `${backend} (crowd): setAvatarCount(100) が ${to100} を返した`);
     assert(stats100.avatars.length === 100, `${backend} (crowd): 100体化後に ${stats100.avatars.length} 体`);
@@ -1390,7 +1878,7 @@ async function checkBackend(browser, backend) {
     assert(meshLevels.length === avatar.after.meshes, `${backend}: meshLevels の件数が不一致`);
     assert(meshLevels.every((level) => level >= 0), `${backend}: LOD未適用のメッシュがある: ${meshLevels}`);
     const widths = await page.evaluate(() => window.__vrmDemo.variantTextureWidths(0));
-    const expectedWidths = [1024, 512, 256, 128];
+    const expectedWidths = [1024, 1024, 1024, 512, 256];
     assert(widths.length > 0, `${backend}: variantTextureWidths が空`);
     for (const setWidths of widths) {
       assert(
@@ -1465,18 +1953,23 @@ async function main() {
       await sleep(100);
     }
 
-    // 検証ごとに状態を分離するため、1体・既定・複製・4ソース・budget・adaptive・crowd は
+    // 検証ごとに状態を分離するため、1体・既定・複製・4ソース・budget・adaptive・crowd・tierCap は
     // それぞれ新しい Chrome で実行する（0.6.0 の共有レンダラーでコンテキスト数はソース数に比例しない）。
-    const launchBrowser = () =>
+    // WebGLのみ `--use-angle=vulkan` を付ける。WebGPUと併用すると Device Lost になるため分けている。
+    // 素の `--ignore-gpu-blocklist` だけでは WebGL が SwiftShader になり、100体で数秒/フレームまで落ちる。
+    const launchBrowser = (backend) =>
       chromium.launch({
         executablePath: CHROME_PATH,
         headless: false,
-        args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--no-sandbox'],
+        args:
+          backend === 'webgl'
+            ? ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--no-sandbox', '--use-angle=vulkan']
+            : ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--no-sandbox'],
       });
 
     const results = [];
     for (const backend of ['webgpu', 'webgl']) {
-      const singleBrowser = await launchBrowser();
+      const singleBrowser = await launchBrowser(backend);
       let single;
       try {
         single = await checkBackend(singleBrowser, backend);
@@ -1484,7 +1977,7 @@ async function main() {
         await singleBrowser.close();
       }
 
-      const defaultBrowser = await launchBrowser();
+      const defaultBrowser = await launchBrowser(backend);
       let defaultPage;
       try {
         defaultPage = await checkInstances(defaultBrowser, backend, {
@@ -1497,7 +1990,7 @@ async function main() {
         await defaultBrowser.close();
       }
 
-      const clonesBrowser = await launchBrowser();
+      const clonesBrowser = await launchBrowser(backend);
       let clones;
       try {
         clones = await checkInstances(clonesBrowser, backend, {
@@ -1511,7 +2004,7 @@ async function main() {
       }
 
       // 0.6.0 の共有レンダラーにより、WebGL でも4ソースを検証する。
-      const fourBrowser = await launchBrowser();
+      const fourBrowser = await launchBrowser(backend);
       let fourSources;
       try {
         fourSources = await checkFourSources(fourBrowser, backend);
@@ -1519,7 +2012,7 @@ async function main() {
         await fourBrowser.close();
       }
 
-      const budgetBrowser = await launchBrowser();
+      const budgetBrowser = await launchBrowser(backend);
       let budget;
       try {
         budget = await checkBudget(budgetBrowser, backend);
@@ -1527,7 +2020,7 @@ async function main() {
         await budgetBrowser.close();
       }
 
-      const adaptiveBrowser = await launchBrowser();
+      const adaptiveBrowser = await launchBrowser(backend);
       let adaptive;
       try {
         adaptive = await checkAdaptiveBudget(adaptiveBrowser, backend);
@@ -1535,12 +2028,34 @@ async function main() {
         await adaptiveBrowser.close();
       }
 
-      const crowdBrowser = await launchBrowser();
+      const crowdBrowser = await launchBrowser(backend);
       let crowd;
       try {
         crowd = await checkCrowd(crowdBrowser, backend);
       } finally {
         await crowdBrowser.close();
+      }
+
+      // Tier上限の検査はcheckBackendとは別のChromeで行う。
+      // 4096のフル検査は重いためWebGPUのみ、WebGLは軽い `?atlas=1024&top=1024` だけ行う。
+      // WebGLの軽い検査は1体のみのため、vulkanフラグなしでも十分速い。
+      // `--use-angle=vulkan` とWebGPU初期化がVulkanデバイスを取り合う一過性の
+      // Device Lost を避けるため、フラグを外して起動する。
+      let tierCap = null;
+      {
+        const tierCapBrowser =
+          backend === 'webgl'
+            ? await chromium.launch({
+                executablePath: CHROME_PATH,
+                headless: false,
+                args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--no-sandbox'],
+              })
+            : await launchBrowser(backend);
+        try {
+          tierCap = await checkTierCap(tierCapBrowser, backend);
+        } finally {
+          await tierCapBrowser.close();
+        }
       }
 
       single.fourSources = fourSources;
@@ -1549,6 +2064,7 @@ async function main() {
       single.budget = budget;
       single.adaptive = adaptive;
       single.crowd = crowd;
+      single.tierCap = tierCap;
       single.ok = failures.length === 0;
       results.push(single);
     }

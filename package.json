@@ -2,7 +2,7 @@
   "name": "three-texture-lod",
   "private": true,
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "three.js向け距離ベース・テクスチャLOD（マテリアルバリアント切替方式）",
   "module": "./dist/lib/three-texture-lod.js",
   "types": "./dist/lib/index.d.ts",

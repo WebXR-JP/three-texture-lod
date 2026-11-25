@@ -13,10 +13,10 @@ import {
   DEFAULT_RAISE_INTERVAL_MS,
   DEFAULT_STEPS_PER_OCTAVE,
   buildScaleLadder,
-  stepThresholdScale,
+  stepLodBudget,
   validateScaleOptions,
 } from './threshold-scale.js';
-import type { ScaleControllerState } from './threshold-scale.js';
+import type { LodBudgetState } from './threshold-scale.js';
 import type { TextureLodSet } from './texture-lod-set.js';
 import type { Camera, Material, Mesh, Texture } from 'three';
 import type {
@@ -162,10 +162,32 @@ export class TextureLodManager {
   /** 自動スケール用のラダー。非自動時は `null`。 */
   private readonly scaleLadder: readonly number[] | null;
   /** 自動スケール用の制御状態。非自動時は `null`。 */
-  private scaleState: ScaleControllerState | null;
+  private scaleState: LodBudgetState | null;
   private scaleLowerCount = 0;
   private scaleRaiseCount = 0;
   private evictCount = 0;
+  /**
+   * 選択できる最も細かいレベル。既定は `0`。
+   *
+   * ADR: ライブラリは解像度を知らないためレベル番号で上限をかける。
+   * 予算適応時はこの値を下限とする自動上限の起点になり、
+   * 予測・選択・保持のすべてに一貫して適用する。
+   */
+  private finestLevelValue: number;
+  /** 上限を粗くした累計回数（`cap` 増加時）。非自動時は `0`。 */
+  private levelCapLowerCount = 0;
+  /** 上限を細かく戻した累計回数（`cap` 減少時）。非自動時は `0`。 */
+  private levelCapRaiseCount = 0;
+  /**
+   * 効果のある上限候補。昇順、先頭は手動下限、末尾は最粗である。
+   *
+   * ADR: 前後で予測が変わらない上限は候補に入れない。引き上げ時に
+   * 効果のない段を踏むと予測が同じで `hold` が続き、収束判定がぶれるためである。
+   * 登録・解除・`setFinestLevel` で汚し、次の `update` 前に作り直す。
+   */
+  private budgetCaps: readonly number[] = [0];
+  /** `budgetCaps` を作り直す必要がある場合に `true`。 */
+  private capsDirty = true;
   private readonly now: () => number;
   private readonly groups = new Set<ManagedGroup>();
   private readonly groupOfMesh = new Map<Mesh, ManagedGroup>();
@@ -233,6 +255,7 @@ export class TextureLodManager {
         raiseIntervalMs: source.raiseIntervalMs ?? DEFAULT_RAISE_INTERVAL_MS,
         raiseCooldownMs: source.raiseCooldownMs ?? DEFAULT_RAISE_COOLDOWN_MS,
         raiseHeadroom: source.raiseHeadroom ?? DEFAULT_RAISE_HEADROOM,
+        levelCap: source.levelCap ?? true,
       };
       // ADR: `buildScaleLadder` 経由の検証にするのは、不正な刻みでもラダー生成と同じ
       // `RangeError` で弾くためである。残りの範囲は `validateScaleOptions` で検査する。
@@ -243,10 +266,170 @@ export class TextureLodManager {
         normalized.maxScale,
         normalized.stepsPerOctave,
       );
-      this.scaleState = { index: 0, lastLowerAt: null, lastRaiseCheckAt: null };
+      this.scaleState = { index: 0, cap: 0, lastLowerAt: null, lastRaiseCheckAt: null };
       this.thresholdScaleValue = this.scaleLadder[0] as number;
     }
     this.now = options?.now ?? (() => performance.now());
+    const finestLevel = options?.finestLevel ?? 0;
+    if (!Number.isInteger(finestLevel) || finestLevel < 0) {
+      throw new RangeError(`finestLevel は0以上の整数である必要があります: ${String(finestLevel)}`);
+    }
+    this.finestLevelValue = finestLevel;
+    if (this.adaptiveOptions !== null) {
+      this.refreshBudgetCaps();
+    }
+  }
+
+  /**
+   * 選択できる最も細かいレベルを変える。次の `update()` から有効になる。
+   *
+   * 設定だけでは `levelOf` は変わらない。非表示で保持中のグループにも
+   * 次の `update()` で上限をかける。
+   *
+   * @param level - 上限レベル番号。整数かつ `0` 以上。
+   * @throws `RangeError` — 非整数または負の場合。
+   */
+  setFinestLevel(level: number): void {
+    if (!Number.isInteger(level) || level < 0) {
+      throw new RangeError(`finestLevel は0以上の整数である必要があります: ${String(level)}`);
+    }
+    this.finestLevelValue = level;
+    if (this.adaptiveOptions !== null) {
+      // ADR: 手動下限の上昇で旧 `cap` が下限より細く残らないよう、候補を作り直して寄せる。
+      // 下降時は旧 `cap` を保ち、次の `update` での収束に任せる。
+      this.refreshBudgetCaps();
+    }
+  }
+
+  /**
+   * グループに効く上限を求める。
+   *
+   * ADR: レベル数の少ないセットでは最粗（`length - 1`）でクランプする。
+   * 上限番号より粗い側だけを使うための措置であり、範囲外レベルを作らない。
+   */
+  private effectiveCap(thresholdsLength: number): number {
+    const cap =
+      this.adaptiveOptions !== null && this.scaleState !== null
+        ? this.scaleState.cap
+        : this.finestLevelValue;
+    return Math.min(cap, thresholdsLength - 1);
+  }
+
+  /**
+   * 統計に載せる実効上限を求める。
+   *
+   * グループがないときは候補の起点である手動値そのままを返し、空の上限を指さない。
+   * グループがあるときは適応中であれば `caps` に正規化された自動状態の値を返し、
+   * 非適応時は手動値を最大レベルで丸めた値を返す。
+   */
+  private currentFinestLevel(): number {
+    // ADR: `stats()` は表示用の純粋計算だけを行い、次回 update の状態を変えない。
+    // 汚れていても `budgetCaps` / `scaleState.cap` を書き換えず、その場で候補を求めて丸める。
+    // HUD が高頻度で `stats()` を呼んでも、体数操作の前後で `update` の判定は変わらない。
+    if (this.groups.size === 0) {
+      return this.finestLevelValue;
+    }
+    if (this.adaptiveOptions !== null && this.scaleState !== null) {
+      const caps = this.capsDirty ? this.computeBudgetCaps() : this.budgetCaps;
+      const current = this.scaleState.cap;
+      let next = caps[0] as number;
+      for (const c of caps) {
+        if (c <= current) {
+          next = c;
+        } else {
+          break;
+        }
+      }
+      return next;
+    }
+    let maxLevel = 0;
+    for (const group of this.groups) {
+      maxLevel = Math.max(maxLevel, group.thresholds.length - 1);
+    }
+    return Math.min(this.finestLevelValue, maxLevel);
+  }
+
+  /**
+   * 効果のある上限候補を求める（純粋計算）。
+   *
+   * グループがあるときは実効 `maxLevel`（グループの段数の最大-1）と
+   * `base = min(finestLevel, maxLevel)` を起点に、`base+1..maxLevel` のうち
+   * いずれかの登録setで前段と1スロットでも異なる段だけを残す。
+   * グループがないときは `maxLevel` を使わず `base = finestLevel` とし、`caps=[base]` にする。
+   * 候補が空の上限を指さないための措置である。
+   * `levelCap: false` のときはグループ有無にかかわらず `[base]` 固定でスケールのみにする。
+   */
+  private computeBudgetCaps(): readonly number[] {
+    if (this.groups.size === 0) {
+      return [this.finestLevelValue];
+    }
+    let maxLevel = 0;
+    for (const group of this.groups) {
+      maxLevel = Math.max(maxLevel, group.thresholds.length - 1);
+    }
+    const base = Math.min(this.finestLevelValue, maxLevel);
+    if (this.adaptiveOptions !== null && this.adaptiveOptions.levelCap === false) {
+      return [base];
+    }
+    const effective: number[] = [base];
+    for (let c = base + 1; c <= maxLevel; c++) {
+      if (this.isEffectiveCap(c)) {
+        effective.push(c);
+      }
+    }
+    return effective;
+  }
+
+  /**
+   * 効果のある上限候補を作り直して状態に確定する。
+   *
+   * `computeBudgetCaps` で求めた候補を `budgetCaps` に置き、
+   * `state.cap` を「候補以下で最大」に寄せる。`update()` の先頭などで呼ぶ。
+   */
+  private refreshBudgetCaps(): void {
+    const caps = this.computeBudgetCaps();
+    this.budgetCaps = caps;
+    this.capsDirty = false;
+    if (this.scaleState !== null) {
+      const current = this.scaleState.cap;
+      let next = caps[0] as number;
+      for (const c of caps) {
+        if (c <= current) {
+          next = c;
+        } else {
+          break;
+        }
+      }
+      if (next !== current) {
+        this.scaleState = { ...this.scaleState, cap: next };
+      }
+    }
+  }
+
+  /**
+   * 上限 `c` が前段と実質的に異なるかを判定する。
+   *
+   * いずれかの登録setで `levels[c]` と `levels[c-1]` のテクスチャが
+   * 1スロットでも異なれば効果ありとする。段数不足のsetは対象外である。
+   *
+   * @param c - 判定する上限レベル番号。
+   * @returns 効果があれば `true`。
+   */
+  private isEffectiveCap(c: number): boolean {
+    for (const set of this.setRefs.keys()) {
+      if (c >= set.levels.length || c - 1 < 0) {
+        continue;
+      }
+      const current = set.levels[c].textures as Readonly<Partial<Record<string, unknown>>>;
+      const prev = set.levels[c - 1].textures as Readonly<Partial<Record<string, unknown>>>;
+      const keys = new Set([...Object.keys(current), ...Object.keys(prev)]);
+      for (const key of keys) {
+        if (current[key] !== prev[key]) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**
@@ -369,6 +552,9 @@ export class TextureLodManager {
     for (const binding of bindings) {
       this.groupOfMesh.set(binding.mesh, group);
     }
+    if (this.adaptiveOptions !== null) {
+      this.capsDirty = true;
+    }
   }
 
   /**
@@ -405,6 +591,9 @@ export class TextureLodManager {
       }
     }
     this.groups.delete(group);
+    if (this.adaptiveOptions !== null) {
+      this.capsDirty = true;
+    }
   }
 
   /**
@@ -446,10 +635,14 @@ export class TextureLodManager {
       }
       group.distance = distance;
     }
-    // 自動スケール: 予測常駐量と予算を比べて1回だけ切り替える。
+    // 自動スケール: 予測常駐量と予算を比べて2軸で1回だけ切り替える。
     if (this.adaptiveOptions !== null && this.scaleLadder !== null && this.scaleState !== null) {
+      if (this.capsDirty) {
+        this.refreshBudgetCaps();
+      }
+      const caps = this.budgetCaps;
       // ADR: `set.levels` は登録後に不変のため、レベルごとのテクスチャ配列を update 内で使い回す。
-      // `predict` はラダー走査で複数回呼ばれるため、毎回の `Object.values` 走査を抑える。
+      // `predict` は走査で複数回呼ばれるため、毎回の `Object.values` 走査を抑える。
       // 過度な最適化はせず、update を抜けたら捨てる一時キャッシュに留める。
       const levelCache = new Map<TextureLodSetContract<Material>, (readonly Texture[])[]>();
       const texturesOfLevel = (
@@ -469,25 +662,38 @@ export class TextureLodManager {
         return cached;
       };
       // ADR: 予算未設定時は `predict` が呼ばれず段階上げだけになるため Map は作られない。
-      // 予算ありでは超過判定で現スケールを必ず1回予測するため、初回呼び出し時に作る。
+      // 予算ありでは超過判定で現位置を必ず1回予測するため、初回呼び出し時に作る。
       let bytesOf: Map<Texture, number> | null = null;
-      const predict = (scale: number): number => {
+      // ADR: `(scaleIndex, cap)` をキーに update 内でメモ化する。下げ走査で同じ候補を
+      // 繰り返し予測しても `estimateBytes` の合計を重複計算しないための措置である。
+      const predictCache = new Map<string, number>();
+      const predict = (scale: number, cap: number): number => {
+        const key = `${scale}|${cap}`;
+        const hit = predictCache.get(key);
+        if (hit !== undefined) {
+          return hit;
+        }
         // ADR: 候補レベルのテクスチャと全 set の最粗（pins 常駐分）の和集合で予測する。
         // `release` 後に参照0になったテクスチャも `pins` が残れば常駐するため、
         // 最粗分は候補によらず必ず含める。
         const union = new Set<Texture>();
         for (const group of this.groups) {
+          const levelCap = Math.min(cap, group.thresholds.length - 1);
           let predicted: number | null;
           if (group.distance === null) {
-            predicted = group.level;
+            // ADR: 上限は資源制約のため、隠れている間の保持レベルにもかける。
+            // 適用しないと held のまま上限超過が残る。初回（`null`）は維持する。
+            predicted = group.level === null ? null : Math.max(group.level, levelCap);
           } else {
             const scaled = (group.distance as number) / scale;
             // ADR: 極小スケールでは `distance / scale` が非有限になり得る。
             // `selectLevel` の RangeError で1グループのために全LOD更新を止めないよう、
             // pass2 と同じく現レベル維持として予測に含める。
-            predicted = Number.isFinite(scaled)
+            // いずれも上限は `max` で一貫してかける。
+            const raw = Number.isFinite(scaled)
               ? selectLevel(group.level, scaled, group.thresholds, group.hysteresis)
               : group.level;
+            predicted = raw === null ? null : Math.max(raw, levelCap);
           }
           for (const binding of group.bindings) {
             if (predicted !== null) {
@@ -511,52 +717,75 @@ export class TextureLodManager {
         for (const texture of union) {
           total += bytesOf.get(texture) ?? estimateBytes(texture);
         }
+        predictCache.set(key, total);
         return total;
       };
-      const before = this.scaleState.index;
-      const result = stepThresholdScale(
+      const beforeIndex = this.scaleState.index;
+      const beforeCap = this.scaleState.cap;
+      const result = stepLodBudget(
         this.scaleLadder,
-        this.scaleState,
-        { now: at, budgetBytes: this.maxResidentBytes, predict },
+        { ...this.scaleState, cap: beforeCap },
+        { now: at, budgetBytes: this.maxResidentBytes, caps, predict },
         this.adaptiveOptions,
       );
       this.scaleState = result.state;
       this.thresholdScaleValue = this.scaleLadder[result.state.index] as number;
-      // ADR: 回数は実際に段が動いたときだけ数える。末尾での連続 `floor` は変化なしのため数えない。
+      // ADR: 回数は軸ごとに実際に動いたときだけ数える。末尾での連続 `floor` は変化なしのため数えない。
       // ラダーは先頭が最大のため、下げは index 増加・上げは index 減少になる。
-      if (result.state.index > before) {
+      // `cap-lower` でスケールが先頭へ戻るときは両軸が動くため、両方を数える。
+      if (result.state.index > beforeIndex) {
         this.scaleLowerCount++;
-      } else if (result.state.index < before) {
+      } else if (result.state.index < beforeIndex) {
         this.scaleRaiseCount++;
       }
+      if (result.state.cap > beforeCap) {
+        this.levelCapLowerCount++;
+      } else if (result.state.cap < beforeCap) {
+        this.levelCapRaiseCount++;
+      }
     }
-    // pass2: `distance / scale` の判定。維持グループは飛ばす。
+    // pass2: `distance / scale` の判定に上限をかける。保持グループにも上限を適用する。
     for (const group of this.groups) {
+      const cap = this.effectiveCap(group.thresholds.length);
+      const applyLevel = (next: number): void => {
+        if (group.level !== next) {
+          if (group.level !== null) {
+            for (const binding of group.bindings) {
+              this.release(binding.set, group.level, at);
+            }
+          }
+          for (const binding of group.bindings) {
+            this.retain(binding.set, next, at);
+            binding.mesh.material = binding.set.variant(next);
+          }
+          group.level = next;
+          this.switchCount++;
+        }
+      };
       const distance = group.distance;
       if (distance === null) {
+        // ADR: 上限は資源制約のため、非表示・非有限距離の保持レベルにもかける。
+        // かけないと held のまま上限より細かいレベルが残る。初回（`null`）は維持する。
+        if (group.level !== null) {
+          applyLevel(Math.max(group.level, cap));
+        }
         continue;
       }
       const scaled = (distance as number) / this.thresholdScaleValue;
       // ADR: 極小スケール（例: 1e-310）では `distance / scale` が非有限になり得る。
       // `selectLevel` の RangeError で1グループのために全LOD更新を止めないよう、
-      // 予測と同じく現レベル維持として飛ばす。
+      // 予測と同じく現レベル維持として扱い、上限だけはかける。
       if (!Number.isFinite(scaled)) {
+        if (group.level !== null) {
+          applyLevel(Math.max(group.level, cap));
+        }
         continue;
       }
-      const next = selectLevel(group.level, scaled, group.thresholds, group.hysteresis);
-      if (group.level !== next) {
-        if (group.level !== null) {
-          for (const binding of group.bindings) {
-            this.release(binding.set, group.level, at);
-          }
-        }
-        for (const binding of group.bindings) {
-          this.retain(binding.set, next, at);
-          binding.mesh.material = binding.set.variant(next);
-        }
-        group.level = next;
-        this.switchCount++;
-      }
+      // 初回（`level === null`）も同じ式で上限をかける。段数の少ないセットは
+      // `effectiveCap` 側で最粗に丸めてあるため、範囲外レベルにならない。
+      // `release`/`retain` は上限適用後のレベルで行う。
+      const next = Math.max(selectLevel(group.level, scaled, group.thresholds, group.hysteresis), cap);
+      applyLevel(next);
     }
     if (this.residency === 'evict') {
       this.sweep(at);
@@ -581,7 +810,8 @@ export class TextureLodManager {
   /**
    * 稼働統計を返す。
    *
-   * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数・上限と破棄回数・スケールと必要量。
+   * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数・上限と破棄回数・スケールと必要量・
+   * Tier上限とピン留め量。適応時は `finestLevel` が実効上限（`cap`）になる。
    * `objectCount` と `levelCounts` はグループ単位で数える。
    * `maxResidentBytes` 指定時は上限超過分を `overBudgetBytes` で確認できる。
    */
@@ -598,6 +828,7 @@ export class TextureLodManager {
     }
     let residentBytes = 0;
     let requiredBytes = 0;
+    let pinnedBytes = 0;
     for (const [texture, tracked] of this.tracked) {
       if (!tracked.evicted) {
         const bytes = estimateBytes(texture);
@@ -607,6 +838,9 @@ export class TextureLodManager {
         // `pins` で常駐し、予測の和集合にも必ず含まれる側である。
         if (tracked.refs > 0 || tracked.pins > 0) {
           requiredBytes += bytes;
+        }
+        if (tracked.pins > 0) {
+          pinnedBytes += bytes;
         }
       }
     }
@@ -623,6 +857,10 @@ export class TextureLodManager {
       requiredBytes,
       scaleLowerCount: this.scaleLowerCount,
       scaleRaiseCount: this.scaleRaiseCount,
+      finestLevel: this.currentFinestLevel(),
+      pinnedBytes,
+      levelCapLowerCount: this.levelCapLowerCount,
+      levelCapRaiseCount: this.levelCapRaiseCount,
     };
   }
 
@@ -641,6 +879,9 @@ export class TextureLodManager {
     this.groupOfMesh.clear();
     this.tracked.clear();
     this.setRefs.clear();
+    if (this.adaptiveOptions !== null) {
+      this.capsDirty = true;
+    }
   }
 
   /** レベルのテクスチャ集合を求める（重複除去）。 */

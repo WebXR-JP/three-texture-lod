@@ -110,10 +110,15 @@ export interface TextureLodSetOptions<M extends Material> {
    * `colorNode` 等で独自に `texture()` を組んでいるマテリアルは自動LOD化できないため、
    * このフックでレベルごとのノードグラフを組み直すこと。
    * フック指定時は戻り値がそのままバリアントになる（名前付けもフックの責任）。
+   * 同一内容（全スロットのTextureが同一）のレベルはグループ化されるため、
+   * フックはグループごとに1回だけ、そのグループの先頭レベル番号で呼ばれる。
+   * 返すマテリアルもグループ内で共有される。
+   * レベル番号で外観を変えるフックは、テクスチャを変えるか自前で variant を作る必要がある。
+   * 同一内容のレベルは1回だけ呼ばれ、戻り値のマテリアルを共有する。
    *
    * @param base - 複製元のマテリアル。
-   * @param level - レベル定義。
-   * @param levelIndex - レベル番号（0が最密）。
+   * @param level - レベル定義（グループの先頭レベル）。
+   * @param levelIndex - レベル番号（0が最密。グループの先頭番号）。
    * @returns そのレベル用のマテリアルバリアント。`base` とは別のマテリアルであること。
    * @remarks
    * {@link TextureLodSet.syncFromBase | syncFromBase} はカスタムノードを `base` の内容で
@@ -177,6 +182,15 @@ export interface AdaptiveThresholdScaleOptions {
    * @defaultValue `0.9`
    */
   readonly raiseHeadroom?: number;
+  /**
+   * Tier上限（`finestLevel` を下限とする自動上限）の有効化。
+   *
+   * `true`（既定）では予算超過時に距離スケールとTier上限の2軸で予測制御し、
+   * `false` では従来のスケールのみで制御する（Tier上限を自動で動かさない）。
+   *
+   * @defaultValue `true`
+   */
+  readonly levelCap?: boolean;
 }
 
 /**
@@ -243,6 +257,16 @@ export interface TextureLodManagerOptions {
    * @defaultValue `() => performance.now()`（`TextureLodManager` が補う）。
    */
   readonly now?: () => number;
+  /**
+   * 選択できる最も細かいレベル。0以上。
+   *
+   * ライブラリは解像度を知らないため、レベル番号で上限をかける。
+   * 実効上限はグループごとに `min(実効cap, thresholds.length - 1)` になる。
+   * 適応時は自動上限の下限として使う。
+   *
+   * @defaultValue `0`（`TextureLodManager` が補う）。
+   */
+  readonly finestLevel?: number;
 }
 
 /**
@@ -292,4 +316,18 @@ export interface TextureLodStats {
   readonly scaleRaiseCount: number;
   /** マネージャが `dispose()` したテクスチャの累計回数（猶予による破棄と上限による破棄の合計）。 */
   readonly evictCount: number;
+  /**
+   * 実効値。適応時は自動上限の `cap`、非適応時は手動値である。
+   *
+   * グループがある場合は最大レベルでクランプ済みであり、グループがない場合は手動値を返す。
+   */
+  readonly finestLevel: number;
+  /**
+   * ピン留め（`pins > 0`）の推定バイト合計。破棄済みは含まない。
+   */
+  readonly pinnedBytes: number;
+  /** 上限の引き下げで動いた累計回数（`cap` 増加時）。非適応時は `0`。 */
+  readonly levelCapLowerCount: number;
+  /** 上限の引き上げで動いた累計回数（`cap` 減少時）。非適応時は `0`。 */
+  readonly levelCapRaiseCount: number;
 }

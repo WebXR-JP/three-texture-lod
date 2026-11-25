@@ -197,4 +197,112 @@ describe('TextureLodManager adaptive fuzz', () => {
     }
     expect(floorFrames).toBe(0);
   });
+
+  it('2軸で required<=budget || required===pinned を保つ（seed 7、levelCapありなし）', () => {
+    // 5段（0-2同一・3-4相異）・共有テクスチャ・可視切替・予算変更・手動上限・levelCap切替の乱択で、
+    // 毎 update 後に不変条件を確かめる。`levelCap: true` では上限で収めるため
+    // `required===pinned` が頭打ち条件になり、`false` では従来どおり `scale===min` になる。
+    for (const levelCap of [true, false]) {
+      const random = seededRandom(levelCap ? 7 : 71);
+      const geometry = new PlaneGeometry(0.01, 0.01);
+      const camera = new PerspectiveCamera();
+      const minScale = 0.05;
+      let now = 0;
+      const manager = new TextureLodManager({
+        distanceMode: 'center',
+        now: () => now,
+        evictDelayMs: 1_000_000_000,
+        maxResidentBytes: 2000,
+        adaptiveThresholdScale: {
+          stepsPerOctave: 2,
+          raiseCooldownMs: 200,
+          raiseIntervalMs: 100,
+          levelCap,
+        },
+      });
+      const shared = dataTexture(6);
+      const texA = dataTexture(8);
+      const texB = dataTexture(5);
+      const texC = dataTexture(1);
+      const sets: { set: ReturnType<typeof createTextureLodSet>; base: MeshStandardMaterial }[] =
+        [];
+      for (let s = 0; s < 3; s++) {
+        const base = new MeshStandardMaterial();
+        const levels = [texA, texA, texA, texB, texC].map((map, i) => ({
+          distance: [0, 3, 6, 12, 18][i] as number,
+          textures: {
+            map,
+            normalMap: i === 1 || i === 3 ? shared : dataTexture(4),
+          },
+        }));
+        sets.push({
+          set: createTextureLodSet({ material: base, levels, hysteresis: 0.2 }),
+          base,
+        });
+      }
+      const anchors: Mesh[] = [];
+      for (let g = 0; g < 4; g++) {
+        const first = sets[g % 3] as { set: ReturnType<typeof createTextureLodSet>; base: MeshStandardMaterial };
+        const second = sets[(g + 1) % 3] as { set: ReturnType<typeof createTextureLodSet>; base: MeshStandardMaterial };
+        const meshA = new Mesh(geometry, first.base);
+        const meshB = new Mesh(geometry, second.base);
+        manager.addGroup([
+          { mesh: meshA, set: first.set },
+          { mesh: meshB, set: second.set },
+        ]);
+        anchors.push(meshA);
+      }
+      try {
+        for (let frame = 0; frame < 300; frame++) {
+          now += 16;
+          for (const anchor of anchors) {
+            if (random() < 0.3) {
+              anchor.position.z = -random() * 30;
+            }
+            anchor.visible = random() > 0.05;
+          }
+          if (random() < 0.05) {
+            manager.setMaxResidentBytes(random() < 0.2 ? null : 500 + random() * 3000);
+          }
+          if (random() < 0.03) {
+            manager.setFinestLevel(Math.floor(random() * 3));
+          }
+          manager.update(camera);
+          const stats = manager.stats();
+          if (stats.budgetBytes !== null) {
+            if (levelCap) {
+              const fits = stats.requiredBytes <= stats.budgetBytes + 1e-6;
+              const pinned = Math.abs(stats.requiredBytes - stats.pinnedBytes) <= 1e-6;
+              expect(fits || pinned).toBe(true);
+            } else {
+              const fits = stats.requiredBytes <= stats.budgetBytes + 1e-6;
+              expect(fits || stats.thresholdScale === minScale).toBe(true);
+            }
+          }
+        }
+        // 収束後はカウンタが増えない。
+        const before = manager.stats();
+        for (let frame = 0; frame < 100; frame++) {
+          now += 16;
+          manager.update(camera);
+        }
+        const after = manager.stats();
+        // 乱択の末尾で静止しているとは限らないため、増加が小さいことだけ見る。
+        // ここでは少なくとも発散（毎フレーム増加）していないことを確かめる。
+        expect(after.scaleLowerCount - before.scaleLowerCount).toBeLessThan(100);
+        expect(after.levelCapLowerCount - before.levelCapLowerCount).toBeLessThan(100);
+        // 予算を null に戻すと cap=base・scale=1 に戻る。
+        manager.setMaxResidentBytes(null);
+        manager.setFinestLevel(0);
+        for (let frame = 0; frame < 200; frame++) {
+          now += 1000;
+          manager.update(camera);
+        }
+        expect(manager.stats().thresholdScale).toBe(1);
+        expect(manager.stats().finestLevel).toBe(0);
+      } finally {
+        manager.dispose();
+      }
+    }
+  });
 });

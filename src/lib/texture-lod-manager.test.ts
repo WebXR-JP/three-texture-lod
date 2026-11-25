@@ -1641,7 +1641,8 @@ describe('TextureLodManager thresholdScale（固定）', () => {
 
 describe('TextureLodManager adaptiveThresholdScale', () => {
   it('adaptive 初回 update 後は requiredBytes<=budget になる（超過フレームがない）', () => {
-    // 近距離でも初回 update 内で先にスケールを下げてから判定するため、超過が出ないことの確認。
+    // 近距離でも初回 update 内で先に2軸で下げてから判定するため、超過が出ないことの確認。
+    // set3は全段で実質差があるため、2軸ではスケールではなく上限で収める。
     const budget = bytes(4) + bytes(2);
     const manager = new TextureLodManager({
       distanceMode: 'center',
@@ -1656,9 +1657,11 @@ describe('TextureLodManager adaptiveThresholdScale', () => {
       manager.add(mesh, set);
       manager.update(cameraAt(5)); // s=1 なら L0 で超過する距離
       const stats = manager.stats();
-      expect(stats.thresholdScale).toBeLessThan(1);
       expect(stats.requiredBytes).toBeLessThanOrEqual(budget);
-      expect(manager.stats().scaleLowerCount).toBeGreaterThan(0);
+      // 2軸では cap-lower で収め、スケールは最良のまま残る。
+      expect(stats.thresholdScale).toBe(1);
+      expect(stats.finestLevel).toBe(1);
+      expect(manager.stats().levelCapLowerCount).toBeGreaterThan(0);
     } finally {
       manager.dispose();
     }
@@ -1732,8 +1735,9 @@ describe('TextureLodManager adaptiveThresholdScale', () => {
     }
   });
 
-  it('カメラを遠ざけると冷却3秒＋1秒ごとに1段上がる', () => {
+  it('カメラを遠ざけると冷却3秒＋1秒ごとに上限が1段戻る', () => {
     // 引き下げ後に遠方へ移し、注入時計で冷却と間隔どおり段階的に戻ることの確認。
+    // 2軸では最初の引き下げが cap-lower のため、戻りも cap-raise になる。
     let now = 0;
     const budget = bytes(4) + bytes(2);
     const manager = new TextureLodManager({
@@ -1745,28 +1749,29 @@ describe('TextureLodManager adaptiveThresholdScale', () => {
     });
     const { set, base } = set3('raise');
     const mesh = sceneMesh(base);
-    const ladder = buildScaleLadder(0.05, 1, 4);
     try {
       manager.add(mesh, set);
-      manager.update(cameraAt(5)); // L0 相当で超過し、L1 に収まる段 (index 4, s=0.5) へ
-      expect(manager.stats().thresholdScale).toBe(ladder[4]);
+      manager.update(cameraAt(5)); // L0 相当で超過し、cap=1・scale=1 で収める
+      expect(manager.stats().thresholdScale).toBe(1);
+      expect(manager.stats().finestLevel).toBe(1);
       // 遠方へ移す。以降の予測は最粗＋ピンだけになり、上げ余裕が生まれる。
       // PlaneGeometry の外接球を避けるため十分に遠ざける。
       mesh.position.z = 500;
-      const raisesBefore = manager.stats().scaleRaiseCount;
+      const raisesBefore = manager.stats().levelCapRaiseCount;
       now += 1000;
       manager.update(cameraAt(0));
-      expect(manager.stats().thresholdScale).toBe(ladder[4]); // 冷却中 (1秒<3秒)
+      expect(manager.stats().finestLevel).toBe(1); // 冷却中 (1秒<3秒)
       now += 1000;
       manager.update(cameraAt(0));
-      expect(manager.stats().thresholdScale).toBe(ladder[4]); // 冷却中 (2秒<3秒)
+      expect(manager.stats().finestLevel).toBe(1); // 冷却中 (2秒<3秒)
       now += 1000;
       manager.update(cameraAt(0));
-      expect(manager.stats().thresholdScale).toBe(ladder[3]); // 冷却明けで1段
+      expect(manager.stats().finestLevel).toBe(0); // 冷却明けで上限が1段戻る
+      expect(manager.stats().thresholdScale).toBe(1);
       now += 1000;
       manager.update(cameraAt(0));
-      expect(manager.stats().thresholdScale).toBe(ladder[2]); // 間隔ごとに1段
-      expect(manager.stats().scaleRaiseCount).toBe(raisesBefore + 2);
+      expect(manager.stats().finestLevel).toBe(0); // これ以上は戻らない
+      expect(manager.stats().levelCapRaiseCount).toBe(raisesBefore + 1);
     } finally {
       manager.dispose();
     }
@@ -1829,7 +1834,7 @@ describe('TextureLodManager adaptiveThresholdScale', () => {
     }
   });
 
-  it('setMaxResidentBytes で下げると次の update で s が下がり、null で budgetBytes null・over 0', () => {
+  it('setMaxResidentBytes で下げると次の update で cap が下がり、null で budgetBytes null・over 0', () => {
     let now = 0;
     const manager = new TextureLodManager({
       distanceMode: 'center',
@@ -1844,12 +1849,16 @@ describe('TextureLodManager adaptiveThresholdScale', () => {
       manager.add(mesh, set);
       manager.update(cameraAt(5));
       expect(manager.stats().thresholdScale).toBe(1);
+      expect(manager.stats().finestLevel).toBe(0);
       manager.setMaxResidentBytes(bytes(4) + bytes(2));
       // 設定だけでは変わらず、次の update で下がる。
       expect(manager.stats().thresholdScale).toBe(1);
+      expect(manager.stats().finestLevel).toBe(0);
       now += 16;
       manager.update(cameraAt(5));
-      expect(manager.stats().thresholdScale).toBeLessThan(1);
+      // 2軸では上限で収め、スケールは最良のまま残る。
+      expect(manager.stats().thresholdScale).toBe(1);
+      expect(manager.stats().finestLevel).toBe(1);
       manager.setMaxResidentBytes(null);
       const stats = manager.stats();
       expect(stats.budgetBytes).toBeNull();
@@ -1958,8 +1967,9 @@ describe('TextureLodManager adaptiveThresholdScale（レビュー追補）', () 
     }
   });
 
-  it('setMaxResidentBytes(null) 後に冷却＋1段/秒で thresholdScale が 1 に戻る', () => {
+  it('setMaxResidentBytes(null) 後に冷却＋1段/秒で cap 0・scale 1 に戻る', () => {
     // 予算なしでは predict を呼ばず、間隔ごとに段階的に最大へ戻ることの確認。
+    // 2軸では上限で下げているため、戻りも上限からになる。
     let now = 0;
     const manager = new TextureLodManager({
       distanceMode: 'center',
@@ -1970,26 +1980,23 @@ describe('TextureLodManager adaptiveThresholdScale（レビュー追補）', () 
     });
     const { set, base } = set3('restore');
     const mesh = sceneMesh(base);
-    const ladder = buildScaleLadder(0.05, 1, 4);
     try {
       manager.add(mesh, set);
       manager.update(cameraAt(5));
-      const lowered = manager.stats().thresholdScale;
-      expect(lowered).toBeLessThan(1);
+      expect(manager.stats().finestLevel).toBe(1);
+      expect(manager.stats().thresholdScale).toBe(1);
       manager.setMaxResidentBytes(null);
       // 冷却中は上がらない。
       now += 1000;
       manager.update(cameraAt(5));
-      expect(manager.stats().thresholdScale).toBe(lowered);
-      // 冷却明け後は1秒ごとに1段上がり、やがて 1 に戻る。
-      let scale = lowered;
-      for (let step = 0; step < ladder.length; step++) {
-        now += 1000;
-        manager.update(cameraAt(5));
-        const next = manager.stats().thresholdScale;
-        expect(next).toBeGreaterThanOrEqual(scale);
-        scale = next;
-      }
+      expect(manager.stats().finestLevel).toBe(1);
+      // 冷却明け後は1秒ごとに上限が戻り、やがて cap=0・scale=1 に戻る。
+      now += 1000;
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBe(1);
+      now += 1000;
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBe(0);
       expect(manager.stats().thresholdScale).toBe(1);
     } finally {
       manager.dispose();
@@ -2245,5 +2252,713 @@ describe('TextureLodManager requiredBytes の独立検証（過大評価検出�
     } finally {
       manager.dispose();
     }
+  });
+});
+
+describe('TextureLodManager finestLevel（Tier上限）', () => {
+  it('finestLevel: 2 で近距離でもレベル2になり、levelOf/levelCountsが2になる', () => {
+    // 手動上限が選択に一貫して効くことの確認。
+    const { set, base } = set3('wall');
+    const manager = new TextureLodManager({ finestLevel: 2 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(2);
+      expect(mesh.material).toBe(set.variant(2));
+      expect(manager.stats().levelCounts).toEqual([0, 0, 1]);
+      expect(manager.stats().finestLevel).toBe(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('レベルの少ないセットでは最粗にクランプする', () => {
+    // 3段セットに上限4を指定しても最粗2に丸まることの確認。統計値も丸め済みになる。
+    const { set, base } = set3('short');
+    const manager = new TextureLodManager({ finestLevel: 4 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(2);
+      expect(manager.stats().finestLevel).toBe(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('非表示グループにも上限がかかる', () => {
+    // held のまま上限超過を作らないことの確認。
+    const { set, base } = set3('hidden');
+    const manager = new TextureLodManager({ finestLevel: 0 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(30));
+      expect(manager.levelOf(mesh)).toBe(2);
+      mesh.visible = false;
+      manager.setFinestLevel(2);
+      manager.update(cameraAt(5));
+      // 非表示のまま上限側へ寄る。
+      expect(manager.levelOf(mesh)).toBe(2);
+      mesh.visible = true;
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(2);
+      // 上限を緩めても次の update までは変わらない。
+      manager.setFinestLevel(0);
+      expect(manager.levelOf(mesh)).toBe(2);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('非表示中に上限を厳しくすると保持レベルが上限まで粗くなる', () => {
+    // 表示→非表示→上限変更→再表示で cap 以上になることの確認。
+    const { set, base } = set3('cap-held');
+    const manager = new TextureLodManager({ finestLevel: 0 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+      mesh.visible = false;
+      manager.setFinestLevel(1);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(1);
+      expect(mesh.material).toBe(set.variant(1));
+      mesh.visible = true;
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(1);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('setFinestLevelは設定だけではlevelOf不変、次のupdateで変わる', () => {
+    // 固定スケールと同様に設定と判定を分離することの確認。
+    const { set, base } = set3('defer');
+    const manager = new TextureLodManager({ finestLevel: 0 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+      manager.setFinestLevel(2);
+      expect(manager.levelOf(mesh)).toBe(0);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('非整数・負数はRangeErrorになる', () => {
+    const plain = new TextureLodManager();
+    try {
+      expect(() => new TextureLodManager({ finestLevel: 1.5 })).toThrow(RangeError);
+      expect(() => new TextureLodManager({ finestLevel: -1 })).toThrow(RangeError);
+      expect(() => plain.setFinestLevel(0.5)).toThrow(RangeError);
+      expect(() => plain.setFinestLevel(-1)).toThrow(RangeError);
+    } finally {
+      plain.dispose();
+    }
+  });
+
+  it('上限で細かいレベルが未参照になり、予算破棄の対象になる', () => {
+    // 上限適用後のレベルで retain/release するため、細かい側は掃引で落ちることの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(2),
+      finestLevel: 2,
+    });
+    const { set, base } = set3('budget');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(2);
+      // L0・L1 は未参照のため上限超過分として破棄される。最粗 L2 は残る。
+      expect(manager.stats().residentBytes).toBeCloseTo(bytes(2), 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('pinnedBytesはpins>0の和と一致する', () => {
+    // 最粗テクスチャだけがピン留めされるため、その推定値になることの確認。
+    const manager = new TextureLodManager();
+    const { set, base } = set3('pinned');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().pinnedBytes).toBeCloseTo(bytes(2), 10);
+      expect(manager.stats().levelCapLowerCount).toBe(0);
+      expect(manager.stats().levelCapRaiseCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+});
+
+describe('TextureLodManager stats().finestLevel の空グループ挙動', () => {
+  it('グループ0件では手動finestLevelを返す（3方式）', () => {
+    // 空の上限候補が手動値を潰さないことの確認。適応中も初回update前から手動値になる。
+    const modes = ['plain', 'adaptive', 'noCap'] as const;
+    for (const mode of modes) {
+      const manager =
+        mode === 'plain'
+          ? new TextureLodManager({ finestLevel: 2 })
+          : mode === 'adaptive'
+            ? new TextureLodManager({ adaptiveThresholdScale: true, finestLevel: 2 })
+            : new TextureLodManager({
+                adaptiveThresholdScale: { levelCap: false },
+                finestLevel: 2,
+              });
+      try {
+        expect(manager.stats().finestLevel).toBe(2);
+        manager.update(cameraAt(5));
+        expect(manager.stats().finestLevel).toBe(2);
+      } finally {
+        manager.dispose();
+      }
+    }
+  });
+
+  it('setFinestLevel(2)を空で呼ぶと直ちに2、addGroup後はmin(2,maxLevel)（3方式）', () => {
+    // 手動変更が空でも即時反映され、登録後は段数で丸まることの確認。
+    const modes = ['plain', 'adaptive', 'noCap'] as const;
+    for (const mode of modes) {
+      const manager =
+        mode === 'plain'
+          ? new TextureLodManager()
+          : mode === 'adaptive'
+            ? new TextureLodManager({ adaptiveThresholdScale: true })
+            : new TextureLodManager({ adaptiveThresholdScale: { levelCap: false } });
+      const { set, base } = set3(`${mode}-empty2`);
+      const mesh = sceneMesh(base);
+      try {
+        manager.setFinestLevel(2);
+        expect(manager.stats().finestLevel).toBe(2);
+        manager.add(mesh, set);
+        manager.update(cameraAt(5));
+        // set3は3段（maxLevel=2）のため min(2,2)=2 になる。
+        expect(manager.stats().finestLevel).toBe(2);
+      } finally {
+        manager.dispose();
+      }
+    }
+  });
+
+  it('全解除後は手動値に戻る（3方式）', () => {
+    // 適応で上限が動いた後でも、解除後は残留capではなく手動値を返すことの確認。
+    let now = 0;
+    const managers = [
+      new TextureLodManager({ finestLevel: 0 }),
+      new TextureLodManager({
+        now: () => now,
+        evictDelayMs: 1_000_000,
+        maxResidentBytes: bytes(4) + bytes(2),
+        adaptiveThresholdScale: true,
+        finestLevel: 0,
+      }),
+      new TextureLodManager({
+        now: () => now,
+        evictDelayMs: 1_000_000,
+        maxResidentBytes: bytes(4) + bytes(2),
+        adaptiveThresholdScale: { levelCap: false },
+        finestLevel: 0,
+      }),
+    ];
+    for (const [i, manager] of managers.entries()) {
+      const { set, base } = set3('removed');
+      const mesh = sceneMesh(base);
+      try {
+        manager.add(mesh, set);
+        manager.update(cameraAt(5));
+        // 適応・2軸の1番目は予算で上限が1まで動く。残留capが解除後に残らない前提である。
+        if (i === 1) {
+          expect(manager.stats().finestLevel).toBe(1);
+        }
+        manager.remove(mesh);
+        expect(manager.stats().objectCount).toBe(0);
+        expect(manager.stats().finestLevel).toBe(0);
+      } finally {
+        manager.dispose();
+      }
+    }
+  });
+
+  it('finestLevel:2で段数2のセット追加後はupdate前から1になる（3方式）', () => {
+    // `addGroup` 直後の初回 `update` 前でも古い候補を読まず、最大レベルで丸めることの確認。
+    const modes = ['plain', 'adaptive', 'noCap'] as const;
+    for (const mode of modes) {
+      const manager =
+        mode === 'plain'
+          ? new TextureLodManager({ finestLevel: 2 })
+          : mode === 'adaptive'
+            ? new TextureLodManager({ adaptiveThresholdScale: true, finestLevel: 2 })
+            : new TextureLodManager({
+                adaptiveThresholdScale: { levelCap: false },
+                finestLevel: 2,
+              });
+      const base = new MeshStandardMaterial({ name: `${mode}-two` });
+      const set = createTextureLodSet({
+        material: base,
+        levels: [
+          { distance: 0, textures: { map: dataTexture(8) } },
+          { distance: 10, textures: { map: dataTexture(2) } },
+        ],
+      });
+      const mesh = sceneMesh(base);
+      try {
+        manager.add(mesh, set);
+        // 2段（maxLevel=1）のため min(2,1)=1 になる。更新前から変わらない。
+        expect(manager.stats().finestLevel).toBe(1);
+        manager.update(cameraAt(5));
+        expect(manager.stats().finestLevel).toBe(1);
+        expect(manager.levelOf(mesh)).toBe(1);
+      } finally {
+        manager.dispose();
+      }
+    }
+  });
+
+  it('finestLevel:2で段数5のセット追加後はupdate前後とも2（3方式）', () => {
+    // 最大レベルが手動値を上回るときは手動値のまま変わらないことの確認。
+    const modes = ['plain', 'adaptive', 'noCap'] as const;
+    for (const mode of modes) {
+      const manager =
+        mode === 'plain'
+          ? new TextureLodManager({ finestLevel: 2 })
+          : mode === 'adaptive'
+            ? new TextureLodManager({ adaptiveThresholdScale: true, finestLevel: 2 })
+            : new TextureLodManager({
+                adaptiveThresholdScale: { levelCap: false },
+                finestLevel: 2,
+              });
+      const base = new MeshStandardMaterial({ name: `${mode}-five` });
+      const set = createTextureLodSet({
+        material: base,
+        levels: [16, 8, 4, 2, 1].map((size, i) => ({
+          distance: [0, 10, 20, 30, 40][i] as number,
+          textures: { map: dataTexture(size) },
+        })),
+      });
+      const mesh = sceneMesh(base);
+      try {
+        manager.add(mesh, set);
+        // 5段（maxLevel=4）のため min(2,4)=2 になる。
+        expect(manager.stats().finestLevel).toBe(2);
+        manager.update(cameraAt(5));
+        expect(manager.stats().finestLevel).toBe(2);
+      } finally {
+        manager.dispose();
+      }
+    }
+  });
+
+  it('適応でcap移動後のaddGroup直後は古いcapを返さない', () => {
+    // 上限が動いた後に段数の多いセットを追加して候補が変わっても、
+    // 更新前の統計が古い候補のcapではなく作り直した値を返すことの確認。
+    const manager = new TextureLodManager({ adaptiveThresholdScale: true, finestLevel: 2 });
+    const base2 = new MeshStandardMaterial({ name: 'moved-two' });
+    const set2 = createTextureLodSet({
+      material: base2,
+      levels: [
+        { distance: 0, textures: { map: dataTexture(8) } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const mesh2 = sceneMesh(base2);
+    const base5 = new MeshStandardMaterial({ name: 'moved-five' });
+    const set5 = createTextureLodSet({
+      material: base5,
+      levels: [16, 8, 4, 2, 1].map((size, i) => ({
+        distance: [0, 10, 20, 30, 40][i] as number,
+        textures: { map: dataTexture(size) },
+      })),
+    });
+    const mesh5 = sceneMesh(base5);
+    try {
+      manager.add(mesh2, set2);
+      manager.update(cameraAt(5));
+      // 2段（maxLevel=1）のため上限は1まで動く。
+      expect(manager.stats().finestLevel).toBe(1);
+      manager.add(mesh5, set5);
+      // 候補が [2,...] になるため、更新前から2に戻る。古い [1] のまま1を返さない。
+      expect(manager.stats().finestLevel).toBe(2);
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBe(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('remove→stats→add→updateはstatsを挟まない場合と同じcapになる（3方式）', () => {
+    // `stats()` が `budgetCaps` / `scaleState.cap` を書き換えないことの確認。
+    // 空グループでの読み取りを挟んでも、挟まない場合と `update` の判定が一致する。
+    const modes = ['plain', 'adaptive', 'noCap'] as const;
+    for (const mode of modes) {
+      let now = 0;
+      const make = (): TextureLodManager =>
+        mode === 'plain'
+          ? new TextureLodManager({ finestLevel: 2 })
+          : mode === 'adaptive'
+            ? new TextureLodManager({
+                now: () => now,
+                evictDelayMs: 1_000_000,
+                maxResidentBytes: 1,
+                adaptiveThresholdScale: true,
+                finestLevel: 0,
+              })
+            : new TextureLodManager({
+                now: () => now,
+                evictDelayMs: 1_000_000,
+                maxResidentBytes: 1,
+                adaptiveThresholdScale: { levelCap: false },
+                finestLevel: 2,
+              });
+      const fiveLevels = () => {
+        const coarse = dataTexture(2);
+        const base = new MeshStandardMaterial({ name: `${mode}-fiveagain` });
+        const maps = [dataTexture(8), dataTexture(4), coarse, coarse, coarse];
+        const levels: TextureLodLevel[] = maps.map((map, i) => ({
+          distance: [0, 10, 20, 30, 40][i] as number,
+          textures: { map },
+        }));
+        return { set: createTextureLodSet({ material: base, levels }), base };
+      };
+      const run = (touchStats: boolean) => {
+        const manager = make();
+        try {
+          const first = mode === 'adaptive' ? set3(`${mode}-drive`) : fiveLevels();
+          const meshFirst = sceneMesh(first.base);
+          manager.add(meshFirst, first.set);
+          manager.update(cameraAt(5));
+          if (mode === 'adaptive') {
+            // 予算1ではどこにも収まらず、上限が最粗まで動く。
+            expect(manager.stats().finestLevel).toBe(2);
+            manager.setMaxResidentBytes(1_000_000);
+          }
+          manager.remove(meshFirst);
+          if (touchStats) {
+            // 空グループでの読み取りは手動値を返す。状態を変えてはならない。
+            manager.stats();
+          }
+          const second = fiveLevels();
+          const meshSecond = sceneMesh(second.base);
+          manager.add(meshSecond, second.set);
+          manager.update(cameraAt(5));
+          const stats = manager.stats();
+          return {
+            finestLevel: stats.finestLevel,
+            thresholdScale: stats.thresholdScale,
+            levelCounts: [...stats.levelCounts],
+          };
+        } finally {
+          manager.dispose();
+        }
+      };
+      const without = run(false);
+      const withStats = run(true);
+      expect(withStats).toEqual(without);
+      // 適応2軸は床まで動いた上限2を保ち、0に戻らない。手動2の2方式も2のまま。
+      expect(withStats.finestLevel).toBe(2);
+    }
+  });
+
+  it('stats()を何回呼んでもupdate結果が変わらない', () => {
+    // 表示の読み取りが次回判定に影響しないことの確認。HUD が高頻度で読んでも挙動は同一になる。
+    const run = (touch: boolean) => {
+      let now = 0;
+      const manager = new TextureLodManager({
+        distanceMode: 'center',
+        now: () => now,
+        evictDelayMs: 1_000_000,
+        maxResidentBytes: bytes(4) + bytes(2),
+        adaptiveThresholdScale: true,
+        finestLevel: 0,
+      });
+      const { set, base } = set3('idem');
+      const mesh = sceneMesh(base);
+      try {
+        if (touch) {
+          manager.stats();
+        }
+        manager.add(mesh, set);
+        if (touch) {
+          manager.stats();
+        }
+        manager.update(cameraAt(5));
+        if (touch) {
+          manager.stats();
+          manager.stats();
+        }
+        now += 4000;
+        manager.update(cameraAt(30));
+        if (touch) {
+          manager.stats();
+        }
+        const stats = manager.stats();
+        return {
+          finestLevel: stats.finestLevel,
+          thresholdScale: stats.thresholdScale,
+          levelCounts: [...stats.levelCounts],
+          requiredBytes: stats.requiredBytes,
+        };
+      } finally {
+        manager.dispose();
+      }
+    };
+    expect(run(true)).toEqual(run(false));
+  });
+});
+
+describe('TextureLodManager 2軸予算適応（距離スケール＋Tier上限）', () => {
+  /** 5段で 0-2 同一・3-4 相異なるセットを作る。 */
+  function set5(name: string) {
+    const base = new MeshStandardMaterial({ name });
+    const texA = dataTexture(8);
+    const texB = dataTexture(4);
+    const texC = dataTexture(2);
+    const maps = [texA, texA, texA, texB, texC];
+    const levels: TextureLodLevel[] = maps.map((map, i) => ({
+      distance: [0, 10, 20, 30, 40][i] as number,
+      textures: { map },
+    }));
+    const set = createTextureLodSet({ material: base, levels });
+    return { set, base, texA, texB, texC };
+  }
+
+  it('5段で0-2同一・3-4相異なら上限候補は[0,3,4]でfinestLevelが動く', () => {
+    // 効果のない段（1・2）を飛ばし、有効段だけに上限が動くことの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set5('caps');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // 近接でL0相当。cap=0では超過し、cap=3で収まる
+      expect(manager.stats().finestLevel).toBe(3);
+      expect(manager.levelOf(mesh)).toBe(3);
+      expect(manager.stats().requiredBytes).toBeLessThanOrEqual(bytes(4) + bytes(2));
+      expect(manager.stats().levelCapLowerCount).toBe(1);
+      expect(manager.stats().scaleLowerCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('4096相当の近接1グループ＋予算小でcapが下がりrequired<=budget、解除で戻る', () => {
+    // 共有シナリオの代表として、近接の重い1体を上限で抑えることの確認。
+    let now = 0;
+    const big = dataTexture(64);
+    const mid = dataTexture(4);
+    const coarse = dataTexture(2);
+    const base = new MeshStandardMaterial({ name: 'heavy' });
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: big } },
+        { distance: 10, textures: { map: mid } },
+        { distance: 20, textures: { map: coarse } },
+      ],
+    });
+    const budget = bytes(4) + bytes(2);
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: budget,
+      adaptiveThresholdScale: true,
+    });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().requiredBytes).toBeLessThanOrEqual(budget);
+      expect(manager.stats().finestLevel).toBeGreaterThan(0);
+      expect(manager.stats().thresholdScale).toBe(1);
+      // 予算解除後は冷却と間隔を空けて cap=0・scale=1 に戻る。
+      manager.setMaxResidentBytes(null);
+      now += 1000;
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBeGreaterThan(0); // 冷却中
+      now += 1000;
+      manager.update(cameraAt(5));
+      now += 1000;
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBe(0);
+      expect(manager.stats().thresholdScale).toBe(1);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('非表示グループにもcapがかかる', () => {
+    // held のまま上限超過を作らず、上限側へ寄せることの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('hiddenCap');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBe(1);
+      const levelBefore = manager.levelOf(mesh);
+      mesh.visible = false;
+      now += 16;
+      manager.update(cameraAt(5));
+      // 非表示でも上限は維持され、レベルは上限以上になる。
+      expect(manager.levelOf(mesh)).toBe(levelBefore);
+      expect((manager.levelOf(mesh) as number) >= (manager.stats().finestLevel as number)).toBe(
+        true,
+      );
+      expect(manager.stats().requiredBytes).toBeLessThanOrEqual(bytes(4) + bytes(2));
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('levelCap:false は従来どおりfloorする', () => {
+    // 上限を使わずスケールだけで下げるため、最粗でも収まらなければ下限で頭打ちになることの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: 1,
+      adaptiveThresholdScale: { levelCap: false },
+    });
+    const { set, base } = set3('noCap');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().thresholdScale).toBe(0.05);
+      expect(manager.stats().finestLevel).toBe(0);
+      expect(manager.stats().requiredBytes).toBeGreaterThan(1);
+      expect(manager.stats().levelCapLowerCount).toBe(0);
+      expect(manager.stats().levelCapRaiseCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('手動finestLevel=2とadaptiveでcapが2より細かくならない', () => {
+    // 手動下限を割り込んで細かく戻さないことの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(8) + bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+      finestLevel: 2,
+    });
+    const { set, base } = set3('manual');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBe(2);
+      expect(manager.levelOf(mesh)).toBe(2);
+      // 予算を緩めても上限は2のまま細かくならない。
+      manager.setMaxResidentBytes(null);
+      for (let frame = 0; frame < 10; frame++) {
+        now += 1000;
+        manager.update(cameraAt(5));
+      }
+      expect(manager.stats().finestLevel).toBe(2);
+      // 手動で下げると候補が増え、次の更新で寄る。
+      manager.setFinestLevel(0);
+      now += 16;
+      manager.update(cameraAt(5));
+      expect(manager.stats().finestLevel).toBeLessThanOrEqual(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('カウンタが軸ごとに増え、収束後に増えない', () => {
+    // スケールと上限で別々に数え、静止後は両方とも動かないことの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('counter');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.stats().levelCapLowerCount).toBe(1);
+      const lowers = manager.stats().levelCapLowerCount;
+      const raises = manager.stats().levelCapRaiseCount;
+      const scaleLowers = manager.stats().scaleLowerCount;
+      const scaleRaises = manager.stats().scaleRaiseCount;
+      for (let frame = 0; frame < 500; frame++) {
+        now += 16;
+        manager.update(cameraAt(5));
+      }
+      expect(manager.stats().levelCapLowerCount).toBe(lowers);
+      expect(manager.stats().levelCapRaiseCount).toBe(raises);
+      expect(manager.stats().scaleLowerCount).toBe(scaleLowers);
+      expect(manager.stats().scaleRaiseCount).toBe(scaleRaises);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('pinnedBytesがpins>0の和になる', () => {
+    // 破棄済みを除き、ピン留めだけを数えることの確認。
+    let now = 0;
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: bytes(4) + bytes(2),
+      adaptiveThresholdScale: true,
+    });
+    const { set, base } = set3('pinnedCap');
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      // 最粗だけがピン留めされる。
+      expect(manager.stats().pinnedBytes).toBeCloseTo(bytes(2), 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('levelCapの不正値はRangeErrorになる', () => {
+    expect(
+      () =>
+        new TextureLodManager({
+          adaptiveThresholdScale: { levelCap: 'yes' as unknown as boolean },
+        }),
+    ).toThrow(RangeError);
   });
 });

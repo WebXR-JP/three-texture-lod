@@ -35,13 +35,14 @@ const LEVEL_COLORS = [
   new Color('#ffe066'),
   new Color('#ffa94d'),
   new Color('#ff6b6b'),
+  new Color('#c77dff'),
   new Color('#5b6b7d'),
 ] as const;
 
 /** レベルに対応するリング色。共有インスタンスを返す（呼び出し側で copy する）。 */
 export function levelColor(level: number | null): Color {
-  if (level === null) return LEVEL_COLORS[4];
-  return LEVEL_COLORS[Math.min(3, level)];
+  if (level === null) return LEVEL_COLORS[5];
+  return LEVEL_COLORS[Math.min(4, level)];
 }
 
 /** 背景用のグラデーションを作る（外部アセットを持たない）。 */

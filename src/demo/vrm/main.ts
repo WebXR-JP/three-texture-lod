@@ -4,7 +4,7 @@
  * 流れ:
  * 1. VRM を classic MToonMaterial で読み込む
  * 2. avatar-optimizer でアトラス化・マテリアル統合（MToonAtlasNodeMaterial へ）
- * 3. アトラスを 1/2 ずつ縮小した4レベルを作り、1体ぶんを1グループとして登録
+ * 3. アトラスを絶対解像度Tier（4096/2048/1024/512/256）の5レベルに縮小し、1体ぶんを1グループとして登録
  * 4. 毎フレーム、アバターの距離で全マテリアルを同じレベルへ切り替える
  * 5. 複製は最適化を再実行せず、テンプレートのアトラス・セットを共有して体数を増やす
  *
@@ -13,6 +13,7 @@
  * - `?avatars=4` 総体数（既定4、最大100。不足分は最適化済みモデルの複製で補う）
  * - `?backend=webgl` WebGL2 バックエンドを強制
  * - `?lod=0` LODを無効化（最密テクスチャのみ）
+ * - `?top=1024` Tier上限（これより細かくしない手動下限。4096/2048/1024/512/256。非Tier値はその値以下で最大のTierに丸める。非数値は無視。`?lod=0`・手動レベル固定では無効）
  * - `?wander=0` 徘徊を無効化（全員を配置位置に固定）
  * - `?h=0.15` ヒステリシス幅
  * - `?atlas=1024` アトラス解像度（256〜4096、既定1024）
@@ -40,12 +41,12 @@ import {
   type ResidencyMode,
 } from '../../lib/index.js';
 import {
-  LOD_DISTANCES,
   instantiateAvatar,
   loadAvatar,
   type AvatarHandle,
   type AvatarTemplate,
 } from './avatar.js';
+import { LOD_DISTANCES, LOD_TIERS, tierIndexForResolution } from './tiers.js';
 import { createEnvironment, createLevelRings } from './environment.js';
 import { buildSlots } from './layout.js';
 import { createAvatarLabel, type AvatarLabel } from './labels.js';
@@ -102,7 +103,17 @@ const MAX_SOURCES = 4;
 const MAX_AVATARS = 100;
 // 総体数。不足分は最適化済みモデルの複製で補う。既定4（A,B,C + Aの複製1）。
 const targetAvatars = clampNumber(Math.round(Number(params.get('avatars') ?? 4)), 1, MAX_AVATARS, 4);
-const MAX_LOD_LEVEL = LOD_DISTANCES.length - 1;
+const LEVELS = LOD_TIERS.map((_, index) => index);
+const MAX_LOD_LEVEL = LOD_TIERS.length - 1;
+/** `?top` の手動下限（Tierのindex）。null は auto/上限なし。非Tier値はその値以下で最大のTierに丸める。 */
+let topLevel: number | null = null;
+{
+  const raw = params.get('top');
+  if (raw !== null && raw.trim() !== '') {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) topLevel = tierIndexForResolution(parsed);
+  }
+}
 
 // 配置スロットは起動時に一度だけ計算する。先頭4体は固定位置、以降はグリッド。
 const slots = buildSlots(MAX_AVATARS);
@@ -194,6 +205,7 @@ function createManager(): TextureLodManager {
     residency,
     evictDelayMs,
     maxResidentBytes: residency === 'evict' && budgetMB > 0 ? budgetMB * 1048576 : undefined,
+    finestLevel: topLevel ?? 0,
     ...(adaptive ? { adaptiveThresholdScale: true as const } : {}),
     ...(!adaptive && fixedScale !== null ? { thresholdScale: fixedScale } : {}),
   });
@@ -491,12 +503,25 @@ function setForceLevel(level: number | null): void {
   manager.dispose();
   for (const avatar of avatars) {
     const sets = avatar.template.sets;
-    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 3;
+    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 4;
     const clamped = Math.min(level, max);
     for (const binding of avatar.bindings) {
       binding.mesh.material = binding.set.variant(clamped);
     }
   }
+}
+
+/**
+ * Tier上限（手動下限）を変える。作り直しは不要。
+ *
+ * `?lod=0`・手動レベル固定では無効（表示は off）。その場合も値は保持し、
+ * LOD有効・自動レベルに戻れば適用される。
+ */
+function setTopLevel(level: number | null): void {
+  topLevel = level;
+  guiState.topTier = level === null ? 'auto' : String(LOD_TIERS[level]);
+  if (!lodEnabled || manualLevel !== null) return;
+  manager.setFinestLevel(level ?? 0);
 }
 
 // ---------------------------------------------------------------- カメラ
@@ -804,11 +829,12 @@ const guiState = {
   evictDelayMs,
   budgetMB,
   adaptive: adaptiveEnabled,
+  topTier: (topLevel === null ? 'auto' : String(LOD_TIERS[topLevel])) as string,
   thresholdScaleDisplay: fixedScale !== null ? `fixed ${fixedScale.toFixed(2)}` : '1.000',
   autoCamera,
   avatarCount: avatars.length,
   wander: wanderEnabled,
-  forceLevel: 'auto' as 'auto' | '0' | '1' | '2' | '3',
+  forceLevel: 'auto' as 'auto' | '0' | '1' | '2' | '3' | '4',
   add: pickFile,
   addClone,
   removeClone,
@@ -915,10 +941,17 @@ gui.add(guiState, 'autoCamera').name('自動カメラ').onChange((value: boolean
   }
 }).listen();
 gui
-  .add(guiState, 'forceLevel', ['auto', '0', '1', '2', '3'])
+  .add(guiState, 'forceLevel', ['auto', '0', '1', '2', '3', '4'])
   .name('レベル固定')
   .onChange((value: string) => {
     setForceLevel(value === 'auto' ? null : Number(value));
+  })
+  .listen();
+gui
+  .add(guiState, 'topTier', ['auto', '4096', '2048', '1024', '512', '256'])
+  .name('Tier上限')
+  .onChange((value: string) => {
+    setTopLevel(value === 'auto' ? null : tierIndexForResolution(Number(value)));
   })
   .listen();
 gui
@@ -960,7 +993,7 @@ function applyManualLevel(): void {
   if (manualLevel === null) return;
   for (const avatar of avatars) {
     const sets = avatar.template.sets;
-    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 3;
+    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 4;
     const clamped = Math.min(manualLevel, max);
     for (const binding of avatar.bindings) {
       binding.mesh.material = binding.set.variant(clamped);
@@ -1037,10 +1070,18 @@ function updateHud(): void {
   const renderedMeshes = avatars.reduce((acc, avatar) => acc + avatar.meshes.length, 0);
   const stats = manager.stats();
   // 手動レベル固定中はマネージャに登録がないため、HUDの内訳は現在の適用レベルから数える。
-  const counts = [0, 1, 2, 3].map(
+  const counts = LEVELS.map(
     (level) => avatars.filter((_, index) => levelOfAvatar(index) === level).length,
   );
-  const levelText = [0, 1, 2, 3].map((level) => `L${level} ${counts[level] ?? 0}`).join('  ');
+  const levelText = LEVELS.map((level) => `${LOD_TIERS[level]}:${counts[level] ?? 0}`).join('  ');
+  const topLine =
+    !lodEnabled || manualLevel !== null
+      ? 'top      off'
+      : (() => {
+          const finest = Math.min(stats.finestLevel, MAX_LOD_LEVEL);
+          const suffix = topLevel !== null ? '(manual)' : isAdaptiveActive() ? '(auto)' : '(manual)';
+          return `top      ${LOD_TIERS[finest]} ${suffix}`;
+        })();
   const pipelines = pipelineInfo();
   const resident = manualLevel !== null || !lodEnabled ? atlasBytes : stats.residentBytes;
   // GUIの読み取り専用「しきい値倍率」を250ms HUD更新に合わせて反映する。
@@ -1052,9 +1093,17 @@ function updateHud(): void {
   const rows = avatars.slice(0, 12).map((avatar, index) => {
     const level = levelOfAvatar(index);
     const distance = computeLodDistance(avatar.anchor, camera, 'surface');
+    const tierText =
+      level === null
+        ? '--'
+        : (() => {
+            const tier = LOD_TIERS[Math.min(level, MAX_LOD_LEVEL)];
+            const actual = avatar.template.levelWidths[Math.min(level, MAX_LOD_LEVEL)];
+            return actual !== undefined && actual !== tier ? `T${tier}→${actual}` : `T${tier}`;
+          })();
     return `  ${avatar.name.padEnd(6)} ${level === null ? '--' : `L${level}`}  ${distance
       .toFixed(1)
-      .padStart(5)}m`;
+      .padStart(5)}m ${tierText}`;
   });
   if (avatars.length > 12) rows.push(`  … +${avatars.length - 12} more`);
 
@@ -1067,12 +1116,13 @@ function updateHud(): void {
     `atlas     ${(atlasBytes / 1048576).toFixed(1)} MB (full)`,
     `LOD       ${lodEnabled ? 'on' : 'off'}  ${residency}  h=${hysteresis.toFixed(2)}  wander ${wanderEnabled ? 'on' : 'off'}`,
     `levels    ${lodEnabled ? levelText : 'full resolution'}`,
+    `${topLine}`,
     lodEnabled &&
     manualLevel === null &&
     residency === 'evict' &&
     budgetMB > 0
       ? isAdaptiveActive()
-        ? `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}  scale ${stats.thresholdScale.toFixed(3)}  need ${(stats.requiredBytes / 1048576).toFixed(1)} MB${stats.requiredBytes > (stats.budgetBytes ?? Infinity) && stats.thresholdScale === 0.05 ? ' FLOOR' : ''}`
+        ? `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}  scale ${stats.thresholdScale.toFixed(3)}  need ${(stats.requiredBytes / 1048576).toFixed(1)} MB${stats.requiredBytes > (stats.budgetBytes ?? Infinity) ? ' FLOOR' : ''}`
         : `VRAM      ${(resident / 1048576).toFixed(1)} / ${budgetMB.toFixed(1)} MB (est.)  over ${(stats.overBudgetBytes / 1048576).toFixed(1)}  evict ${stats.evictCount}`
       : residency === 'keep-all' && budgetMB > 0
         ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (keep-all)`
@@ -1094,9 +1144,7 @@ function updateHud(): void {
       ? ` · scale ${stats.thresholdScale.toFixed(2)}`
       : '';
   const summaryFloor =
-    summaryScale !== '' &&
-    stats.requiredBytes > (stats.budgetBytes ?? Infinity) &&
-    stats.thresholdScale === 0.05
+    summaryScale !== '' && stats.requiredBytes > (stats.budgetBytes ?? Infinity)
       ? ' · FLOOR'
       : '';
   hudSummaryEl.textContent =
@@ -1190,6 +1238,8 @@ const api = {
       managerGeneration,
       scale: manager.stats().thresholdScale,
       manualLevel,
+      topLevel,
+      topResolution: topLevel === null ? null : LOD_TIERS[topLevel],
       wander: wanderEnabled,
       wanderRadius: WANDER_TUNING.radius,
       ringCount: rings.mesh.count,
@@ -1210,11 +1260,12 @@ const api = {
         atlasResolution: avatar.stats.atlasResolution,
         atlasBytes: avatar.stats.atlasBytes,
         usedSlots: avatar.stats.usedSlots,
+        levelWidths: [...avatar.template.levelWidths],
         before: avatar.stats.before,
         after: avatar.stats.after,
       })),
       manager: manager.stats(),
-      levelCounts: [0, 1, 2, 3].map(
+      levelCounts: LEVELS.map(
         (level) => avatars.filter((_, index) => levelOfAvatar(index) === level).length,
       ),
       pipelineCaches: pipeline.caches,
@@ -1223,6 +1274,9 @@ const api = {
       textureCount: renderer.info.memory.textures,
       frameTimeMs,
       updateMs,
+      // 模擬時間（秒）。`delta = min(0.05, rawDelta)` を積んだ値で、壁時計とは異なる。
+      // 重い環境では1フレームが数秒でも0.05ずつしか進まないため、徘徊の進行判定は壁時計ではなくこの値で見る。
+      elapsed,
       hudCollapsed,
       errors: [...errors],
     };
@@ -1254,6 +1308,7 @@ const api = {
     thresholdScale?: number;
     lodEnabled?: boolean;
     forceLevel?: number | null;
+    top?: number | null;
     autoCamera?: boolean;
     wander?: boolean;
   }) {
@@ -1288,6 +1343,13 @@ const api = {
       return false;
     }
     if (partial.wander !== undefined && typeof partial.wander !== 'boolean') {
+      return false;
+    }
+    if (
+      partial.top !== undefined &&
+      partial.top !== null &&
+      (typeof partial.top !== 'number' || !Number.isFinite(partial.top))
+    ) {
       return false;
     }
     // 固定 scale と adaptive の同時指定は不可。固定があれば adaptive は無効扱いになるため、
@@ -1368,7 +1430,12 @@ const api = {
       guiState.forceLevel =
         partial.forceLevel === null
           ? 'auto'
-          : (String(partial.forceLevel) as '0' | '1' | '2' | '3');
+          : (String(partial.forceLevel) as '0' | '1' | '2' | '3' | '4');
+    }
+    if (partial.top !== undefined) {
+      setTopLevel(
+        partial.top === null ? null : tierIndexForResolution(partial.top),
+      );
     }
     return true;
   },
@@ -1381,6 +1448,29 @@ const api = {
           map?: { image?: { width?: number } };
         };
         const width = variant.map?.image?.width;
+        return typeof width === 'number' ? width : null;
+      }),
+    );
+  },
+  /**
+   * 指定スロットの各セット・各レベルでのテクスチャ幅を返す（テスト用）。
+   *
+   * `variantTextureWidths` の汎用版。`map` 以外（`normalMap` など）の
+   * Tier別クランプを確認するために使う。
+   *
+   * @param index - アバター番号。
+   * @param slot - テクスチャスロット名（例 `map`、`normalMap`）。
+   * @returns セットごとの各レベルの `textures[slot]` の `image.width`。無ければ null。
+   */
+  variantSlotWidths(index: number, slot: string): (number | null)[][] {
+    const avatar = avatars[index];
+    if (!avatar) return [];
+    return avatar.template.sets.map((set) =>
+      set.levels.map((level) => {
+        const texture = (level.textures as Record<string, unknown>)[slot] as
+          | { image?: { width?: number } }
+          | undefined;
+        const width = texture?.image?.width;
         return typeof width === 'number' ? width : null;
       }),
     );
@@ -1423,7 +1513,12 @@ const api = {
       const material = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
       const name = material?.name ?? '';
       const suffix = name.lastIndexOf('#lod');
-      return suffix >= 0 ? Number(name.slice(suffix + 4)) : -1;
+      if (suffix < 0) return -1;
+      // 同一内容レベルはマテリアルを共有し、名前に範囲が付く（例 `#lod0-2`）。
+      // その場合はグループ先頭（canonical）を返す。数値でなければ -1。
+      const range = name.slice(suffix + 4).split('-', 1)[0] ?? '';
+      const parsed = Number(range);
+      return Number.isInteger(parsed) ? parsed : -1;
     });
   },
   optimization(index: number) {

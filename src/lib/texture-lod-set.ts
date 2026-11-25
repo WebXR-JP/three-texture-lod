@@ -150,6 +150,25 @@ function vec2Equals(a: { readonly x: number; readonly y: number }, b: { readonly
 }
 
 /**
+ * 全スロットのTextureが同一オブジェクトかを比べる。
+ *
+ * ADR: `levels` のスロット集合一致は検証済みのため、`slots` の全キーが `===` で
+ * 一致すれば同一内容とみなす。値importなしの方針のため `instanceof` は使わない。
+ */
+function texturesEqual(
+  a: Readonly<Partial<Record<string, unknown>>>,
+  b: Readonly<Partial<Record<string, unknown>>>,
+  slots: readonly string[],
+): boolean {
+  for (const slot of slots) {
+    if (a[slot] !== b[slot]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * レベル間でずれているテクスチャ設定を警告する。
  *
  * フィルタ・ラッピング・色空間等がレベル間で異なると、LOD切替の瞬間に輝度・色・継ぎ目の段差として
@@ -235,7 +254,18 @@ export class TextureLodSet<M extends Material = Material> {
   readonly hysteresis: number;
   /** `levels` から導出した境界配列。`thresholds[i]` はレベル `i` の開始距離。 */
   readonly thresholds: readonly number[];
-  private readonly variants: M[];
+  /**
+   * グループごとの実体マテリアル。添字は生成順（先頭レベル番号の昇順）である。
+   *
+   * ADR: 全スロットのTextureが同一（`===`）のレベルは同じマテリアルを共有する。
+   * 持たないTierを最大テクスチャの繰り返しで補う想定のため、重複バリアントを作ると
+   * 切替・常駐・描画状態が増えるだけで見え方は変わらない。共有により実体を減らす。
+   */
+  private readonly groupMaterials: M[];
+  /** レベル番号からグループ添字への写像。`variant()` の解決に使う。 */
+  private readonly groupIndexOfLevel: readonly number[];
+  /** レベル番号から属するグループの先頭レベル番号への写像。 */
+  private readonly canonicalOfLevel: readonly number[];
   /** 実行時のスロット名一覧。`Object.keys` で採取した文字列として保持する。 */
   private readonly slots: readonly string[];
 
@@ -265,20 +295,48 @@ export class TextureLodSet<M extends Material = Material> {
     // ADR: バリアント生成はコンストラクタ内で即時に行う。
     // 遅延生成にすると初回切替フレームで clone・コンパイルが走りスパイクになるため、
     // 登録時に前倒しで確保する。メモリと立上りコストのトレードオフは前者を選ぶ。
-    this.variants = options.levels.map((level, index) => {
+    // ADR: 同一内容（全スロットのTextureが `===`）のレベルはグループ化し、実体を1つだけ作る。
+    // 比較は先頭出現順に行い、グループの代表は先頭レベルとする。非連続の一致も同一グループに
+    // まとめ、名前と `canonicalLevel` は最小・最大で表す。実運用では末尾の繰り返しを想定する。
+    const groups: { start: number; end: number }[] = [];
+    const groupIndexOfLevel: number[] = new Array<number>(options.levels.length);
+    for (let i = 0; i < options.levels.length; i++) {
+      let found = -1;
+      for (let g = 0; g < groups.length; g++) {
+        if (texturesEqual(options.levels[groups[g].start].textures, options.levels[i].textures, this.slots)) {
+          found = g;
+          break;
+        }
+      }
+      if (found >= 0) {
+        groupIndexOfLevel[i] = found;
+        groups[found].end = i;
+      } else {
+        groupIndexOfLevel[i] = groups.length;
+        groups.push({ start: i, end: i });
+      }
+    }
+    this.groupIndexOfLevel = groupIndexOfLevel;
+    this.canonicalOfLevel = groupIndexOfLevel.map((g) => groups[g].start);
+    this.groupMaterials = groups.map((group) => {
       if (options.createVariant !== undefined) {
-        const created = options.createVariant(options.material, level, index);
+        const created = options.createVariant(
+          options.material,
+          options.levels[group.start],
+          group.start,
+        );
         // ADR: フックの戻り値が base と同一だと全レベルが同一マテリアルになり、
         // マテリアルでなければ `variant()` の呼び出し側が壊れる。生成時に失敗させる。
         // `instanceof` ではなく `isMaterial` で判定するのは、値importなしの方針のためである。
+        // 検証はグループごと（先頭レベル番号で1回）に行い、共有後の重複呼び出しはしない。
         if (created === options.material || (created as unknown as { isMaterial?: unknown }).isMaterial !== true) {
-          throw new Error(`createVariant は base とは別のマテリアルを返す必要があります（レベル ${index}）`);
+          throw new Error(`createVariant は base とは別のマテリアルを返す必要があります（レベル ${group.start}）`);
         }
         return created;
       }
       const variant = options.material.clone();
       const target = slotsOf(variant);
-      const textures = level.textures as Readonly<Partial<Record<string, Texture>>>;
+      const textures = options.levels[group.start].textures as Readonly<Partial<Record<string, Texture>>>;
       for (const slot of this.slots) {
         const texture = textures[slot];
         // ADR: 検証済みのため `undefined` は来ないはずだが、型上は任意キー読みで
@@ -288,7 +346,10 @@ export class TextureLodSet<M extends Material = Material> {
         }
       }
       const baseName = options.material.name !== '' ? options.material.name : 'material';
-      variant.name = `${baseName}#lod${index}`;
+      variant.name =
+        group.start === group.end
+          ? `${baseName}#lod${group.start}`
+          : `${baseName}#lod${group.start}-${group.end}`;
       return variant;
     });
   }
@@ -296,15 +357,37 @@ export class TextureLodSet<M extends Material = Material> {
   /**
    * レベル番号に対応するマテリアルバリアントを返す。
    *
+   * 同じTexture集合のレベルは同じマテリアルを共有する。
+   * 持たないTierを最大テクスチャの繰り返しで補う想定のため、
+   * 見え方が変わらない重複バリアントを作らないための措置である。
+   *
    * @param level - レベル番号。`0 <= level < levels.length`。
    * @returns そのレベルのマテリアル（内部保持の実体であり、複製ではない）。
+   * 同一内容のレベルでは同じ実体を返す。
    * @throws `RangeError` — `level` が範囲外の場合。
    */
   variant(level: number): M {
-    if (!Number.isInteger(level) || level < 0 || level >= this.variants.length) {
-      throw new RangeError(`level は 0 以上 ${this.variants.length} 未満である必要があります: ${level}`);
+    if (!Number.isInteger(level) || level < 0 || level >= this.levels.length) {
+      throw new RangeError(`level は 0 以上 ${this.levels.length} 未満である必要があります: ${level}`);
     }
-    return this.variants[level];
+    return this.groupMaterials[this.groupIndexOfLevel[level] as number];
+  }
+
+  /**
+   * そのレベルが属するグループの先頭レベル番号を返す。
+   *
+   * 同じTexture集合のレベルは同じマテリアルを共有するため、
+   * `variant(level)` は `variant(canonicalLevel(level))` と同じ実体になる。
+   *
+   * @param level - レベル番号。`0 <= level < levels.length`。
+   * @returns 属するグループの先頭レベル番号。
+   * @throws `RangeError` — `level` が範囲外の場合。
+   */
+  canonicalLevel(level: number): number {
+    if (!Number.isInteger(level) || level < 0 || level >= this.levels.length) {
+      throw new RangeError(`level は 0 以上 ${this.levels.length} 未満である必要があります: ${level}`);
+    }
+    return this.canonicalOfLevel[level] as number;
   }
 
   /**
@@ -313,6 +396,7 @@ export class TextureLodSet<M extends Material = Material> {
    * 各バリアントのテクスチャ値を退避して null にし、`variant.copy(base)` で取り込んだ後に復元する。
    * 色・ラフネス等の後付け調整をバリアントへ波及させるための手段である。
    * 正常終了時のみ `needsUpdate = true` によりシェーダの再ビルドが走る。
+   * 同一内容のレベルはマテリアルを共有するため、ユニークな実体ごとに1回だけ行う。
    *
    * @remarks
    * `createVariant` で独自ノードを組んだバリアントも `base` の内容で上書きするため、
@@ -321,7 +405,7 @@ export class TextureLodSet<M extends Material = Material> {
    * 名前とテクスチャ値は退避値へ戻す。
    */
   syncFromBase(): void {
-    for (const v of this.variants) {
+    for (const v of this.groupMaterials) {
       const record = v as unknown as Record<string, unknown>;
       const baseRecord = this.baseMaterial as unknown as Record<string, unknown>;
       // ADR: three r187 の NodeMaterial.copy は、コピー先の値が真で `.copy` を持つ全プロパティに
@@ -421,10 +505,11 @@ export class TextureLodSet<M extends Material = Material> {
   /**
    * バリアントのマテリアルを破棄する。テクスチャは破棄しない。
    *
+   * 同一内容のレベルはマテリアルを共有するため、ユニークな実体ごとに1回だけ破棄する。
    * テクスチャの寿命はマネージャの常駐管理または利用者が持つ。
    */
   dispose(): void {
-    for (const v of this.variants) {
+    for (const v of this.groupMaterials) {
       v.dispose();
     }
   }

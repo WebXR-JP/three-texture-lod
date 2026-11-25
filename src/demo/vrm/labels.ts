@@ -12,8 +12,8 @@ import {
   SRGBColorSpace,
 } from 'three/webgpu';
 
-const LEVEL_TEXT = ['L0', 'L1', 'L2', 'L3'];
-const LEVEL_COLORS = ['#6ee7c8', '#ffe066', '#ffa94d', '#ff6b6b'] as const;
+const LEVEL_TEXT = ['L0', 'L1', 'L2', 'L3', 'L4'];
+const LEVEL_COLORS = ['#6ee7c8', '#ffe066', '#ffa94d', '#ff6b6b', '#c77dff'] as const;
 
 export interface AvatarLabel {
   readonly sprite: Sprite;

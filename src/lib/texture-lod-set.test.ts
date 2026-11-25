@@ -425,3 +425,149 @@ describe('TextureLodSet', () => {
     expect(set.variant(1).map).toBe(farMap);
   });
 });
+
+describe('TextureLodSet マテリアル共有', () => {
+  it('同一内容のレベルはマテリアルを共有し、canonicalLevelは先頭番号を返す', () => {
+    // 同一Texture集合の共有により実体が減ること、levels長は保たれることを確かめる。
+    const base = new MeshStandardMaterial({ name: 'wall' });
+    const t0 = dataTexture(64);
+    const t1 = dataTexture(16);
+    const t2 = dataTexture(4);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: t0 } },
+        { distance: 10, textures: { map: t1 } },
+        { distance: 20, textures: { map: t1 } },
+        { distance: 30, textures: { map: t2 } },
+        { distance: 40, textures: { map: t2 } },
+      ],
+    });
+    expect(set.levels.length).toBe(5);
+    expect(set.variant(1)).toBe(set.variant(2));
+    expect(set.variant(3)).toBe(set.variant(4));
+    expect(set.variant(0)).not.toBe(set.variant(1));
+    expect(set.variant(1)).not.toBe(set.variant(3));
+    expect(set.canonicalLevel(0)).toBe(0);
+    expect(set.canonicalLevel(1)).toBe(1);
+    expect(set.canonicalLevel(2)).toBe(1);
+    expect(set.canonicalLevel(3)).toBe(3);
+    expect(set.canonicalLevel(4)).toBe(3);
+    expect((set.variant(0) as MeshStandardMaterial).name).toContain('lod0');
+    expect((set.variant(1) as MeshStandardMaterial).name).toContain('lod1-2');
+    expect((set.variant(3) as MeshStandardMaterial).name).toContain('lod3-4');
+  });
+
+  it('全レベルが同一内容でもlevels長は保ち、単一マテリアルを共有する', () => {
+    // Tier繰り返しで全段が同じTextureになる場合でも動くことの確認。
+    const base = new MeshStandardMaterial({ name: 'wall' });
+    const shared = dataTexture(8);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: shared } },
+        { distance: 20, textures: { map: shared } },
+        { distance: 30, textures: { map: shared } },
+        { distance: 40, textures: { map: shared } },
+      ],
+    });
+    expect(set.levels.length).toBe(5);
+    expect(set.variant(0)).toBe(set.variant(4));
+    expect(set.variant(1)).toBe(set.variant(2));
+    for (let i = 0; i < 5; i++) {
+      expect(set.canonicalLevel(i)).toBe(0);
+    }
+  });
+
+  it('1スロットでも違えば別マテリアルになる', () => {
+    // mapが同じでも他スロットが違えば内容が違うため共有しないことの確認。
+    const base = new MeshStandardMaterial({ name: 'wall' });
+    const sameMap = dataTexture(8);
+    const roughA = dataTexture(4);
+    const roughB = dataTexture(2);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: sameMap, roughnessMap: roughA } },
+        { distance: 10, textures: { map: sameMap, roughnessMap: roughB } },
+      ],
+    });
+    expect(set.variant(0)).not.toBe(set.variant(1));
+    expect(set.canonicalLevel(0)).toBe(0);
+    expect(set.canonicalLevel(1)).toBe(1);
+  });
+
+  it('createVariantはグループごとに1回だけ先頭番号で呼ばれる', () => {
+    // フックの呼び出し回数と引数が共有単位であること、戻り値も共有されることの確認。
+    const base = new MeshStandardMaterial({ name: 'wall' });
+    const t0 = dataTexture(64);
+    const t1 = dataTexture(16);
+    const seen: number[] = [];
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: t0 } },
+        { distance: 10, textures: { map: t1 } },
+        { distance: 20, textures: { map: t1 } },
+      ],
+      createVariant: (source, _level, index) => {
+        seen.push(index);
+        return source.clone();
+      },
+    });
+    expect(seen).toEqual([0, 1]);
+    expect(set.variant(1)).toBe(set.variant(2));
+  });
+
+  it('disposeは共有マテリアルに1回だけ走る', () => {
+    // 同一実体の二重破棄を避けることの確認。テクスチャは破棄しない。
+    const base = new MeshStandardMaterial({ name: 'wall' });
+    const t0 = dataTexture(64);
+    const t1 = dataTexture(16);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: t0 } },
+        { distance: 10, textures: { map: t1 } },
+        { distance: 20, textures: { map: t1 } },
+      ],
+    });
+    const unique0 = set.variant(0);
+    const shared = set.variant(1);
+    const spy0 = vi.spyOn(unique0, 'dispose');
+    const spyShared = vi.spyOn(shared, 'dispose');
+    set.dispose();
+    expect(spy0).toHaveBeenCalledTimes(1);
+    expect(spyShared).toHaveBeenCalledTimes(1);
+  });
+
+  it('syncFromBaseは共有マテリアルに1回だけ走る', () => {
+    // 共有実体へのcopyが重複しないことの確認。
+    const base = new MeshStandardMaterial({ name: 'wall' });
+    const t0 = dataTexture(64);
+    const t1 = dataTexture(16);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: t0 } },
+        { distance: 10, textures: { map: t1 } },
+        { distance: 20, textures: { map: t1 } },
+      ],
+    });
+    const shared = set.variant(1);
+    expect(set.variant(2)).toBe(shared);
+    const copySpy = vi.spyOn(shared, 'copy');
+    base.color.set(0x00ff00);
+    set.syncFromBase();
+    expect(copySpy).toHaveBeenCalledTimes(1);
+    expect((shared as MeshStandardMaterial).color.getHex()).toBe(0x00ff00);
+  });
+
+  it('canonicalLevelの範囲外でRangeErrorを投げる', () => {
+    const { base, levels } = levels3();
+    const set = createTextureLodSet({ material: base, levels });
+    expect(() => set.canonicalLevel(-1)).toThrow(RangeError);
+    expect(() => set.canonicalLevel(3)).toThrow(RangeError);
+  });
+});

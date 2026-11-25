@@ -19,7 +19,12 @@ import {
   type TextureLodSet,
   type TextureSlotOf,
 } from '../../lib/index.js';
-import { createDownscaledTexture, enableMipmaps, type DownsampleKind } from './downscale.js';
+import {
+  createDownscaledTexture,
+  enableMipmaps,
+  type DownsampleKind,
+} from './downscale.js';
+import { LOD_DISTANCES, LOD_TIERS, tierDivisor } from './tiers.js';
 
 /** アトラス化される MToon のテクスチャスロット。matcap はUV非依存なので対象外。 */
 const ATLAS_SLOTS = [
@@ -38,10 +43,8 @@ type AtlasSlot = (typeof ATLAS_SLOTS)[number];
 const HEAD_YAW_AXIS = new Vector3(0, 1, 0);
 const headYaw = new Quaternion();
 
-/** LODの距離境界（surface距離、メートル）。解像度は1段あたり2倍。 */
-export const LOD_DISTANCES = [0, 3, 6, 12] as const;
-/** アトラス解像度に対する縮小率。1024 → 512 → 256 → 128。 */
-const LOD_DIVISORS = [1, 2, 4, 8] as const;
+/** LODの距離境界（surface距離、メートル）は `tiers.ts` の定義を使う。 */
+export { LOD_DISTANCES };
 
 /** 最適化前後の比較用。 */
 export interface SceneStats {
@@ -83,6 +86,12 @@ export interface AvatarTemplate {
   readonly headRawBoneName: string | null;
   /** 最適化の実測値。複製は所有しないため、集計はテンプレート単位で行う。 */
   readonly stats: AvatarStats;
+  /**
+   * 5段の map 実幅（px）。複数セットがある場合は各レベルの最大幅。
+   *
+   * clone と共有する。`rebuild` では幅は同じだが参照を新しくする。
+   */
+  readonly levelWidths: readonly number[];
   /** 現在のLODセット。共有のため `rebuild` で差し替わる。 */
   sets: TextureLodSet<MToonAtlasNodeMaterial>[];
   /** ベースマテリアルからセットを引く索引。複製の束縛作りに使う。 */
@@ -287,6 +296,37 @@ function kindOf(slot: AtlasSlot): DownsampleKind {
   return 'color';
 }
 
+/**
+ * セットの各レベルから map 実幅の最大値を拾う。
+ *
+ * @param sets - LODセット列。
+ * @returns 5段の実幅。map が無いレベルは同レベルの全スロットの最大幅にする。
+ */
+function levelWidthsOf(
+  sets: TextureLodSet<MToonAtlasNodeMaterial>[],
+): readonly number[] {
+  return LOD_TIERS.map((_, level) => {
+    let max = 0;
+    for (const set of sets) {
+      const levelDef = set.levels[level];
+      if (!levelDef) continue;
+      const textures = levelDef.textures as Record<string, unknown>;
+      const mapTexture = textures['map'];
+      if (isTexture(mapTexture)) {
+        const image = mapTexture.image as { width?: number } | undefined;
+        if (typeof image?.width === 'number') max = Math.max(max, image.width);
+        continue;
+      }
+      for (const value of Object.values(textures)) {
+        if (!isTexture(value)) continue;
+        const image = value.image as { width?: number } | undefined;
+        if (typeof image?.width === 'number') max = Math.max(max, image.width);
+      }
+    }
+    return max;
+  });
+}
+
 /** アバターのルート向き。VRM0 は -Z 向きなので 180 度回す。 */
 function faceCamera(vrm: VRM): void {
   const version = (vrm.meta as { metaVersion?: string } | undefined)?.metaVersion;
@@ -456,10 +496,19 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
         if (!isTexture(texture)) return null;
         const image = texture.image as { width?: number; height?: number };
         if ((image.width ?? 0) < 64 || (image.height ?? 0) < 64) return null;
-        return { slot, texture, kind: kindOf(slot) };
+        return {
+          slot,
+          texture,
+          kind: kindOf(slot),
+          maxDim: Math.max(image.width ?? 0, image.height ?? 0),
+        };
       }).filter(
-        (entry): entry is { slot: AtlasSlot; texture: Texture; kind: DownsampleKind } =>
-          entry !== null,
+        (entry): entry is {
+          slot: AtlasSlot;
+          texture: Texture;
+          kind: DownsampleKind;
+          maxDim: number;
+        } => entry !== null,
       );
 
       if (texturesBySlot.length === 0) {
@@ -470,11 +519,16 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
 
       const levels: TextureLodLevel<MToonAtlasNodeMaterial>[] = LOD_DISTANCES.map(
         (distance, index) => {
+          const tier = LOD_TIERS[index];
           const textures: Partial<
             Record<TextureSlotOf<MToonAtlasNodeMaterial>, Texture>
           > = {};
           for (const entry of texturesBySlot) {
-            textures[entry.slot] = scaled(entry.texture, LOD_DIVISORS[index], entry.kind);
+            textures[entry.slot] = scaled(
+              entry.texture,
+              tierDivisor(entry.maxDim, tier),
+              entry.kind,
+            );
           }
           return { distance, textures };
         },
@@ -521,6 +575,7 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
     },
     sets: initialSets,
     materialSets,
+    levelWidths: levelWidthsOf(initialSets),
     disposeVariants() {
       for (const set of template.sets) set.dispose();
     },
@@ -529,6 +584,7 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
       template.sets = sets;
       template.materialSets = new Map<Material, TextureLodSet<MToonAtlasNodeMaterial>>();
       for (const set of sets) template.materialSets.set(set.baseMaterial, set);
+      (template as { levelWidths: readonly number[] }).levelWidths = levelWidthsOf(sets);
     },
   };
 

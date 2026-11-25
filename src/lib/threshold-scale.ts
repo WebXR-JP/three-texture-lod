@@ -144,11 +144,265 @@ export function validateScaleOptions(options: Required<AdaptiveThresholdScaleOpt
       `raiseHeadroom は (0, 1] の範囲である必要があります: ${String(raiseHeadroom)}`,
     );
   }
+  // ADR: `levelCap` は後方互換のため存在するときだけ検証する。
+  // 既存のテスト器具は `levelCap` なしの `Required` キャストを渡すため、欠落では弾かない。
+  if ('levelCap' in options && (options as { levelCap?: unknown }).levelCap !== undefined) {
+    if (typeof (options as { levelCap?: unknown }).levelCap !== 'boolean') {
+      throw new RangeError(
+        `levelCap は boolean である必要があります: ${String((options as { levelCap?: unknown }).levelCap)}`,
+      );
+    }
+  }
+}
+
+/**
+ * 距離スケールとTier上限の2軸制御位置。
+ */
+export interface LodBudgetState {
+  /** ラダー上の位置（`0 = maxScale` 側）。 */
+  readonly index: number;
+  /** 実効Tier上限（レベル番号。大きいほど粗い）。 */
+  readonly cap: number;
+  /** 最後に引き下げた時刻。未引き下げなら `null`。 */
+  readonly lastLowerAt: number | null;
+  /** 最後に引き上げ可否を判定した時刻。未判定なら `null`。 */
+  readonly lastRaiseCheckAt: number | null;
+}
+
+/**
+ * 2軸制御の1回分の入力。
+ */
+export interface LodBudgetInput {
+  /** 現在時刻（`now()` 基準のミリ秒）。 */
+  readonly now: number;
+  /** 上限バイト数。未設定なら `null`。 */
+  readonly budgetBytes: number | null;
+  /**
+   * 効果のある上限候補（昇順、先頭=手動下限、末尾=最粗）。
+   *
+   * `state.cap` を含む。効果のない段（前後で予測が変わらない上限）は入れない前提である。
+   */
+  readonly caps: readonly number[];
+  /**
+   * 候補スケールと上限での予測常駐量を返す関数。
+   *
+   * 超過判定のために現在位置で必ず1回呼ばれ、超過時のみ走査のために追加で呼ばれる。
+   * 冷却中・間隔内は引き上げ候補の呼び出しを省く。
+   */
+  readonly predict: (scale: number, cap: number) => number;
+}
+
+/**
+ * 2軸判定の結果。
+ *
+ * - `hold`: 維持。
+ * - `lower`: スケールだけ引き下げ。
+ * - `cap-lower`: 上限を粗くし、スケールを最良へ戻す側の引き下げ。
+ * - `raise`: スケールだけ1段引き上げ。
+ * - `cap-raise`: 上限だけ1段細かく戻す。
+ * - `floor`: どこにも収まらないため最粗・末尾へ。
+ */
+export type LodBudgetDecision = 'hold' | 'lower' | 'cap-lower' | 'cap-raise' | 'raise' | 'floor';
+
+/**
+ * 効果のある上限候補を検証する。
+ *
+ * @param caps - 昇順の整数列であること。
+ * @throws `RangeError` — 空・非整数・狭義昇順でない場合。
+ */
+function validateCaps(caps: readonly number[]): void {
+  if (caps.length === 0) {
+    throw new RangeError('caps は1件以上必要です');
+  }
+  for (const [i, c] of caps.entries()) {
+    if (!Number.isInteger(c)) {
+      throw new RangeError(`caps[${i}] は整数である必要があります: ${String(c)}`);
+    }
+    if (i > 0 && !(caps[i - 1] as number < c)) {
+      throw new RangeError(`caps は狭義昇順である必要があります: [${caps.join(',')}]`);
+    }
+  }
+}
+
+/**
+ * 予算に対するスケールとTier上限の2軸を1回だけ進める。
+ *
+ * 超過時（`B !== null && predict(L[index], cap) > B`）は、上限据え置き（`j > index`）と
+ * 上限粗化（`j = 0` から）の各候補で最初に収まる段を探し、予測量が最大の候補を選ぶ。
+ * 同点は `j` が小さい方、さらに同点は `cap` が小さい方である。
+ * 下限状態（`cap` が最粗かつ `index` が末尾）では走査せず `floor` にする。
+ * 収束時（予算内）は冷却と判定間隔が開いたときだけ1軸1段だけ上げる。
+ * `budget === null` では予測なしでスケールを先頭へ戻してから上限を戻す。
+ *
+ * @param ladder - `buildScaleLadder` の戻り。狭義降順・先頭が最大・末尾が下限の前提。
+ * @param state - 前回の位置（スケール段・上限）と時刻。
+ * @param input - 時刻・予算・上限候補・予測関数。
+ * @param options - 正規化済みの調整値。
+ * @returns 次の状態と判定。
+ * @throws `RangeError` — 調整値・上限候補が不正の場合。
+ */
+export function stepLodBudget(
+  ladder: readonly number[],
+  state: LodBudgetState,
+  input: LodBudgetInput,
+  options: Required<AdaptiveThresholdScaleOptions>,
+): { state: LodBudgetState; decision: LodBudgetDecision } {
+  // ADR: 毎フレームの呼び出しでラダーを作り直さないよう、数値比較だけの検査に留める。
+  // 形状の検証と生成は `buildScaleLadder` が担い、マネージャの生成時に済ませる。
+  if (!Number.isFinite(options.raiseIntervalMs) || options.raiseIntervalMs < 0) {
+    throw new RangeError(
+      `raiseIntervalMs は 0 以上の有限値である必要があります: ${String(options.raiseIntervalMs)}`,
+    );
+  }
+  if (!Number.isFinite(options.raiseCooldownMs) || options.raiseCooldownMs < 0) {
+    throw new RangeError(
+      `raiseCooldownMs は 0 以上の有限値である必要があります: ${String(options.raiseCooldownMs)}`,
+    );
+  }
+  if (!(options.raiseHeadroom > 0 && options.raiseHeadroom <= 1)) {
+    throw new RangeError(
+      `raiseHeadroom は (0, 1] の範囲である必要があります: ${String(options.raiseHeadroom)}`,
+    );
+  }
+  validateCaps(input.caps);
+  if (ladder.length === 0) {
+    throw new RangeError('ladder は1件以上必要です');
+  }
+  const budget = input.budgetBytes;
+  const now = input.now;
+  // ADR: 呼び出し側の丸めずれに備え、`index` は範囲に収め、`cap` は候補以下で最大へ寄せる。
+  // `cap` が先頭より細いときは先頭に吸着し、手動下限より細い上限を作らない。
+  let rawIndex = state.index;
+  if (!Number.isFinite(rawIndex)) {
+    rawIndex = 0;
+  }
+  let index = Math.trunc(rawIndex);
+  if (index < 0) {
+    index = 0;
+  } else if (index > ladder.length - 1) {
+    index = ladder.length - 1;
+  }
+  const caps = input.caps;
+  let cap = caps[0] as number;
+  const rawCap = state.cap;
+  if (Number.isFinite(rawCap)) {
+    for (const c of caps) {
+      if (c <= rawCap) {
+        cap = c;
+      } else {
+        break;
+      }
+    }
+  }
+  let lastLowerAt = state.lastLowerAt;
+  let lastRaiseCheckAt = state.lastRaiseCheckAt;
+
+  const capPosOf = (value: number): number => {
+    const found = caps.indexOf(value);
+    return found < 0 ? 0 : found;
+  };
+
+  // ADR: 超過判定の `predict` は毎回1回だけ呼ぶ。下限状態では走査を省き、
+  // 連続 `floor` でも毎フレーム全走査の `predict` を回さない。
+  if (budget !== null && input.predict(ladder[index] as number, cap) > budget) {
+    if (cap === caps[caps.length - 1] && index === ladder.length - 1) {
+      lastLowerAt = now;
+      return { state: { index, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'floor' };
+    }
+    const capPos = capPosOf(cap);
+    let best: { c: number; j: number; need: number } | null = null;
+    for (let k = capPos; k < caps.length; k++) {
+      const c = caps[k] as number;
+      const startJ = k === capPos ? index + 1 : 0;
+      for (let j = startJ; j < ladder.length; j++) {
+        const need = input.predict(ladder[j] as number, c);
+        if (need <= budget) {
+          if (
+            best === null ||
+            need > best.need ||
+            (need === best.need && (j < best.j || (j === best.j && c < best.c)))
+          ) {
+            best = { c, j, need };
+          }
+          break;
+        }
+      }
+    }
+    lastLowerAt = now;
+    if (best === null) {
+      const lastCap = caps[caps.length - 1] as number;
+      const lastIndex = ladder.length - 1;
+      return {
+        state: { index: lastIndex, cap: lastCap, lastLowerAt, lastRaiseCheckAt },
+        decision: 'floor',
+      };
+    }
+    const decision: LodBudgetDecision = best.c !== cap ? 'cap-lower' : 'lower';
+    return {
+      state: { index: best.j, cap: best.c, lastLowerAt, lastRaiseCheckAt },
+      decision,
+    };
+  }
+  const capPos = capPosOf(cap);
+  const hasS = index > 0;
+  const hasC = capPos > 0;
+  if (!hasS && !hasC) {
+    return { state: { index, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'hold' };
+  }
+  // ADR: 引き下げ直後の揺り戻しを抑えるため、冷却と判定間隔の両方が開くまで上げない。
+  // 冷却中・間隔内は引き上げ候補の `predict` を呼ばず、予測コストを抑える。
+  // 冷却はスケール下げと上限下げで共有し、どちらの引き下げ直後も上げない。
+  const cooled = lastLowerAt === null || now - lastLowerAt >= options.raiseCooldownMs;
+  const due = lastRaiseCheckAt === null || now - lastRaiseCheckAt >= options.raiseIntervalMs;
+  if (!cooled || !due) {
+    return { state: { index, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'hold' };
+  }
+  lastRaiseCheckAt = now;
+  if (budget === null) {
+    // ADR: 予算なしでは予測なしで段階的に最大へ戻す。見え方への影響が大きい
+    // スケールを先頭へ戻してから上限を戻し、粗い上限のまま細部が戻らない順序を保つ。
+    if (hasS) {
+      return { state: { index: index - 1, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'raise' };
+    }
+    const prev = caps[capPos - 1] as number;
+    return { state: { index, cap: prev, lastLowerAt, lastRaiseCheckAt }, decision: 'cap-raise' };
+  }
+  let scaleNeed: number | null = null;
+  let capNeed: number | null = null;
+  let scaleOk = false;
+  let capOk = false;
+  if (hasS) {
+    scaleNeed = input.predict(ladder[index - 1] as number, cap);
+    scaleOk = scaleNeed <= options.raiseHeadroom * budget;
+  }
+  if (hasC) {
+    const prev = caps[capPos - 1] as number;
+    capNeed = input.predict(ladder[index] as number, prev);
+    capOk = capNeed <= options.raiseHeadroom * budget;
+  }
+  // ADR: 1回は1軸1段だけ動かす。両方が余裕内のときは予測量が大きい方を選び、
+  // 同点はスケールを優先して見え方の戻りを先にする。
+  if (scaleOk && capOk) {
+    if ((capNeed as number) > (scaleNeed as number)) {
+      const prev = caps[capPos - 1] as number;
+      return { state: { index, cap: prev, lastLowerAt, lastRaiseCheckAt }, decision: 'cap-raise' };
+    }
+    return { state: { index: index - 1, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'raise' };
+  }
+  if (scaleOk) {
+    return { state: { index: index - 1, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'raise' };
+  }
+  if (capOk) {
+    const prev = caps[capPos - 1] as number;
+    return { state: { index, cap: prev, lastLowerAt, lastRaiseCheckAt }, decision: 'cap-raise' };
+  }
+  return { state: { index, cap, lastLowerAt, lastRaiseCheckAt }, decision: 'hold' };
 }
 
 /**
  * 予算に対するスケールを1回だけ進める。
  *
+ * `stepLodBudget` の薄いラッパであり、単一上限での従来挙動を保つ。
  * 毎 `update` の呼び出し側が `predict` を閉包で渡し、戻りの `state` を次回に引き継ぐ。
  * 引き下げに間隔制限はなく、超過時は予算内に収まる最初の段へまとめて下がる。
  * 予測が非単調でも全走査するため二分探索しない。`predict == budget` は超過ではない。
@@ -166,65 +420,29 @@ export function stepThresholdScale(
   input: ScaleControllerInput,
   options: Required<AdaptiveThresholdScaleOptions>,
 ): { state: ScaleControllerState; decision: ScaleDecision } {
-  // ADR: 毎フレームの呼び出しでラダーを作り直さないよう、ここでは数値比較だけの検査に留める。
-  // ラダー形状（狭義降順・先頭最大・末尾下限）の検証と生成は `buildScaleLadder` が担い、
-  // `TextureLodManager` のコンストラクタ時に済ませる。呼び出し側が渡した `ladder` をそのまま使う。
-  if (!Number.isFinite(options.raiseIntervalMs) || options.raiseIntervalMs < 0) {
-    throw new RangeError(
-      `raiseIntervalMs は 0 以上の有限値である必要があります: ${String(options.raiseIntervalMs)}`,
-    );
-  }
-  if (!Number.isFinite(options.raiseCooldownMs) || options.raiseCooldownMs < 0) {
-    throw new RangeError(
-      `raiseCooldownMs は 0 以上の有限値である必要があります: ${String(options.raiseCooldownMs)}`,
-    );
-  }
-  if (!(options.raiseHeadroom > 0 && options.raiseHeadroom <= 1)) {
-    throw new RangeError(
-      `raiseHeadroom は (0, 1] の範囲である必要があります: ${String(options.raiseHeadroom)}`,
-    );
-  }
-  const budget = input.budgetBytes;
-  const now = input.now;
-  let index = state.index;
-  let lastLowerAt = state.lastLowerAt;
-  let lastRaiseCheckAt = state.lastRaiseCheckAt;
-
-  const scale = ladder[index];
-  // ADR: 超過判定の `predict` は毎回1回だけ呼ぶ。下振れ予測の単調性を仮定せず、
-  // 超過時の走査は全段をなめる（1段213MiB級の移動では二分探索の前提が崩れるため）。
-  if (budget !== null && input.predict(scale as number) > budget) {
-    let found = -1;
-    // ADR: 既に末尾なら走査しても見つからないため、再走査を省いて即 `floor` にする。
-    // 連続 floor でも毎フレーム全段の `predict` を回さないための措置である。
-    if (index < ladder.length - 1) {
-      for (let j = index + 1; j < ladder.length; j++) {
-        if (input.predict(ladder[j] as number) <= budget) {
-          found = j;
-          break;
-        }
-      }
-    }
-    lastLowerAt = now;
-    if (found === -1) {
-      index = ladder.length - 1;
-      return { state: { index, lastLowerAt, lastRaiseCheckAt }, decision: 'floor' };
-    }
-    index = found;
-    return { state: { index, lastLowerAt, lastRaiseCheckAt }, decision: 'lower' };
-  }
-  // ADR: 引き下げ直後の揺り戻しを抑えるため、冷却と判定間隔の両方が開くまで上げない。
-  // 冷却中・間隔内は引き上げ候補の `predict` を呼ばず、予測コストを抑える。
-  const cooled = lastLowerAt === null || now - lastLowerAt >= options.raiseCooldownMs;
-  const due = lastRaiseCheckAt === null || now - lastRaiseCheckAt >= options.raiseIntervalMs;
-  if (index > 0 && cooled && due) {
-    lastRaiseCheckAt = now;
-    // ADR: 予算未設定時は予測なしで段階的に最大へ戻す。予算ありでも余裕（headroom）があるときだけ上げる。
-    // `== budget` ちょうどの引き上げは、下振れ余地がなく直後に再引き下げとなるため headroom で抑止する。
-    if (budget === null || input.predict(ladder[index - 1] as number) <= options.raiseHeadroom * budget) {
-      index = index - 1;
-      return { state: { index, lastLowerAt, lastRaiseCheckAt }, decision: 'raise' };
-    }
-  }
-  return { state: { index, lastLowerAt, lastRaiseCheckAt }, decision: 'hold' };
+  // ADR: 2軸版への委譲で二重実装を避ける。単一上限では `cap-lower`/`cap-raise` が
+  // 発生せず、呼び出し回数・状態遷移は従来と同一になる。`state` に `cap` があれば拾うが、
+  // 旧形状では `0` として単一候補にする。
+  const capValue = (state as unknown as { cap?: unknown }).cap;
+  const cap = typeof capValue === 'number' && Number.isFinite(capValue) ? capValue : 0;
+  const result = stepLodBudget(
+    ladder,
+    { index: state.index, cap, lastLowerAt: state.lastLowerAt, lastRaiseCheckAt: state.lastRaiseCheckAt },
+    {
+      now: input.now,
+      budgetBytes: input.budgetBytes,
+      caps: [cap],
+      predict: (scale: number) => input.predict(scale),
+    },
+    options,
+  );
+  const decision = result.decision as ScaleDecision;
+  return {
+    state: {
+      index: result.state.index,
+      lastLowerAt: result.state.lastLowerAt,
+      lastRaiseCheckAt: result.state.lastRaiseCheckAt,
+    },
+    decision,
+  };
 }

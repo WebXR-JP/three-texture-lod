@@ -22,6 +22,7 @@
  * - `?budget=32` 常駐上限MB（0で無効、既定0。0〜4096）
  * - `?adaptive=0` 予算適応の距離しきい値スケールを無効化（既定は有効）
  * - `?scale=0.5` 固定の距離しきい値倍率（0.05〜4。範囲外はクランプ、非数値は無視。指定時は adaptive より優先）
+ * - `?hud=0` HUDを折りたたんで起動（`?hud=1` で展開。一時的な上書きで localStorage には保存されない。既定は展開）
  */
 import GUI from 'lil-gui';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -552,6 +553,76 @@ const loadingBarEl = document.getElementById('loading-bar')!;
 const loadingStatusEl = document.getElementById('loading-status')!;
 const loadingLogEl = document.getElementById('loading-log')!;
 const hudBodyEl = document.getElementById('hud-body')!;
+const hudEl = document.getElementById('hud')!;
+const hudHeadEl = document.getElementById('hud-head')!;
+const hudToggleEl = document.getElementById('hud-toggle')!;
+const hudSummaryEl = document.getElementById('hud-summary')!;
+const HUD_COLLAPSED_KEY = 'vrm-hud-collapsed';
+
+function readStoredHudCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(HUD_COLLAPSED_KEY) === '1';
+  } catch {
+    // プライベートモード等では保存を読まず、既定（展開）にする。
+    return false;
+  }
+}
+
+// 折りたたみの初期値の優先順: `?hud=0/1` > localStorage > 既定（展開）。
+// `?hud` は一時的な上書きで、localStorage には保存しない。
+let hudCollapsed: boolean;
+{
+  const hudParam = params.get('hud');
+  if (hudParam === '0') hudCollapsed = true;
+  else if (hudParam === '1') hudCollapsed = false;
+  else hudCollapsed = readStoredHudCollapsed();
+}
+
+/**
+ * HUDの折りたたみを切り替える。適用後の状態（true = 折りたたみ）を返す。
+ *
+ * @param persist - false のとき localStorage へ保存しない（`?hud` による起動時の一時上書き用）。
+ */
+function setHudCollapsed(collapsed: boolean, persist = true): boolean {
+  hudCollapsed = collapsed;
+  hudEl.classList.toggle('collapsed', collapsed);
+  hudToggleEl.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  hudToggleEl.textContent = collapsed ? '▸' : '▾';
+  hudToggleEl.setAttribute('aria-label', collapsed ? 'HUDを展開する' : 'HUDを折りたたむ');
+  hudToggleEl.setAttribute('title', 'HUDの折りたたみ (H)');
+  if (persist) {
+    try {
+      window.localStorage.setItem(HUD_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch {
+      // プライベートモード等では保存しない。
+    }
+  }
+  return hudCollapsed;
+}
+
+// ヘッダー全体がトグル。ボタンに独自ハンドラは付けず、バブリング1回だけで切り替える。
+hudHeadEl.addEventListener('click', () => {
+  setHudCollapsed(!hudCollapsed);
+});
+// `H` キーでトグル。lil-gui の入力中・長押し・修飾キー付きは誤爆しないよう無視する。
+window.addEventListener('keydown', (event) => {
+  if (event.repeat) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.key !== 'h' && event.key !== 'H') return;
+  const target = event.target as HTMLElement | null;
+  if (
+    target &&
+    (target.tagName === 'INPUT' ||
+      target.tagName === 'TEXTAREA' ||
+      target.tagName === 'SELECT' ||
+      target.isContentEditable)
+  ) {
+    return;
+  }
+  setHudCollapsed(!hudCollapsed);
+});
+// 起動時の適用は保存しない。`?hud` は次回以降の既定を変えない一時的な上書き。
+setHudCollapsed(hudCollapsed, false);
 
 function setLoading(text: string, progress: number): void {
   loadingStatusEl.textContent = text;
@@ -1015,6 +1086,21 @@ function updateHud(): void {
     '',
     ...rows,
   ].join('\n');
+
+  // 折りたたみ時の1行サマリ。本文の行・数値は変えず、体数・frame・scale/FLOORだけを短く出す。
+  // scale/FLOOR は本文のVRAM行と同じ条件（予算あり・adaptive有効・手動固定なし）でのみ出す。
+  const summaryScale =
+    budgetMB > 0 && isAdaptiveActive() && manualLevel === null
+      ? ` · scale ${stats.thresholdScale.toFixed(2)}`
+      : '';
+  const summaryFloor =
+    summaryScale !== '' &&
+    stats.requiredBytes > (stats.budgetBytes ?? Infinity) &&
+    stats.thresholdScale === 0.05
+      ? ' · FLOOR'
+      : '';
+  hudSummaryEl.textContent =
+    `src ${sources} / ${avatars.length}体 · ${frameTimeMs.toFixed(1)}ms${summaryScale}${summaryFloor}`;
 }
 
 let lastTime = performance.now();
@@ -1137,6 +1223,7 @@ const api = {
       textureCount: renderer.info.memory.textures,
       frameTimeMs,
       updateMs,
+      hudCollapsed,
       errors: [...errors],
     };
   },
@@ -1150,6 +1237,11 @@ const api = {
     }
   },
   setAvatarSurfaceDistance,
+  setHudCollapsed: (collapsed: boolean): boolean => {
+    // boolean 以外は状態を変えず false を返す。stats().hudCollapsed は常に boolean。
+    if (typeof collapsed !== 'boolean') return false;
+    return setHudCollapsed(collapsed);
+  },
   addClone,
   removeClone,
   setAvatarCount,

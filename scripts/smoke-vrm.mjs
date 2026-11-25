@@ -1134,6 +1134,207 @@ async function checkCrowd(browser, backend) {
   return result;
 }
 
+async function checkHud(page, backend, result) {
+  const baseQuery = `models=A&avatars=1&auto=0&h=0.15&wander=0${backend === 'webgl' ? '&backend=webgl' : ''}`;
+  const baseUrl = `${BASE_URL}/vrm.html?${baseQuery}`;
+
+  async function waitHudReady(label) {
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 240000 },
+    );
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    assert(status === 'ready', `${backend} (hud): ${label}で ready にならなかった（status=${status}）`);
+  }
+
+  // HUDは既定で展開。ready直後の本文は表示され、サマリは隠れていること。
+  await waitFrames(page, 3);
+  const expandedHeight = await page.evaluate(
+    () => document.getElementById('hud').getBoundingClientRect().height,
+  );
+  const expandedWidth = await page.evaluate(
+    () => document.getElementById('hud').getBoundingClientRect().width,
+  );
+  const bodyVisible = await page.evaluate(
+    () => document.getElementById('hud-body').offsetParent !== null,
+  );
+  assert(bodyVisible === true, `${backend} (hud): 初期表示で #hud-body が見えていない`);
+  const summaryHidden = await page.evaluate(
+    () => getComputedStyle(document.getElementById('hud-summary')).display === 'none',
+  );
+  assert(summaryHidden === true, `${backend} (hud): 展開時に #hud-summary が表示されている`);
+  // pre-wrap で長い行が折り返し、横にはみ出さないこと。
+  const bodyOverflow = await page.evaluate(() => {
+    const body = document.getElementById('hud-body');
+    return { scrollWidth: body.scrollWidth, clientWidth: body.clientWidth };
+  });
+  assert(
+    bodyOverflow.scrollWidth <= bodyOverflow.clientWidth + 1,
+    `${backend} (hud): #hud-body が横にはみ出している: scrollWidth=${bodyOverflow.scrollWidth}, clientWidth=${bodyOverflow.clientWidth}`,
+  );
+
+  // トグルボタンで折りたたみ。stats()1回＋DOM確認で、hudCollapsedの二重確認はしない。
+  await page.click('#hud-toggle');
+  await waitFrames(page, 2);
+  const collapsedStats = await statsOf(page);
+  assert(
+    collapsedStats.hudCollapsed === true,
+    `${backend} (hud): 折りたたみ後に stats().hudCollapsed が true でない`,
+  );
+  const collapsedFlag = await page.evaluate(() => ({
+    bodyHidden: document.getElementById('hud-body').offsetParent === null,
+    ariaExpanded: document.getElementById('hud-toggle').getAttribute('aria-expanded'),
+    collapsedClass: document.getElementById('hud').classList.contains('collapsed'),
+  }));
+  assert(
+    collapsedFlag.bodyHidden === true,
+    `${backend} (hud): 折りたたみ後に #hud-body が表示されたまま`,
+  );
+  assert(
+    collapsedFlag.ariaExpanded === 'false',
+    `${backend} (hud): 折りたたみ後の aria-expanded が ${collapsedFlag.ariaExpanded}`,
+  );
+  assert(
+    collapsedFlag.collapsedClass === true,
+    `${backend} (hud): 折りたたみ後に .collapsed が付いていない`,
+  );
+  const collapsedRect = await page.evaluate(() => {
+    const rect = document.getElementById('hud').getBoundingClientRect();
+    return { height: rect.height, width: rect.width, right: rect.right };
+  });
+  const collapsedViewportWidth = await page.evaluate(() => window.innerWidth);
+  assert(
+    collapsedRect.right <= collapsedViewportWidth,
+    `${backend} (hud): 折りたたみ時の右端 ${collapsedRect.right} が viewport 幅 ${collapsedViewportWidth} を超えている`,
+  );
+  assert(
+    collapsedRect.height < expandedHeight / 2,
+    `${backend} (hud): 折りたたみ時の高さ ${collapsedRect.height} が展開時 ${expandedHeight} の半分未満にならない`,
+  );
+
+  // もう一度クリックで展開に戻る。
+  await page.click('#hud-toggle');
+  await waitFrames(page, 2);
+  const reopened = await statsOf(page);
+  const reopenedFlag = await page.evaluate(() => ({
+    bodyVisible: document.getElementById('hud-body').offsetParent !== null,
+    ariaExpanded: document.getElementById('hud-toggle').getAttribute('aria-expanded'),
+  }));
+  assert(
+    reopened.hudCollapsed === false,
+    `${backend} (hud): 再展開後に hudCollapsed が false でない`,
+  );
+  assert(reopenedFlag.bodyVisible === true, `${backend} (hud): 再展開後に #hud-body が見えていない`);
+  assert(
+    reopenedFlag.ariaExpanded === 'true',
+    `${backend} (hud): 再展開後の aria-expanded が ${reopenedFlag.ariaExpanded}`,
+  );
+
+  // H キーで折りたたみ・展開。
+  await page.keyboard.press('h');
+  await waitFrames(page, 2);
+  const keyCollapsed = await statsOf(page);
+  assert(keyCollapsed.hudCollapsed === true, `${backend} (hud): Hキーで折りたたまれない`);
+  await page.keyboard.press('h');
+  await waitFrames(page, 2);
+  const keyExpanded = await statsOf(page);
+  assert(keyExpanded.hudCollapsed === false, `${backend} (hud): 2回目のHキーで展開されない`);
+
+  // 折りたたみ中のサマリ: 空でなく frame(ms) を含み、更新され続けること。
+  // このページは予算0のため scale は出ない（本文VRAM行と同条件）。
+  await page.click('#hud-toggle');
+  await waitFrames(page, 2);
+  const summaryBefore = await page.evaluate(
+    () => document.getElementById('hud-summary').textContent,
+  );
+  const frameBefore = (await statsOf(page)).frame;
+  assert(
+    typeof summaryBefore === 'string' && summaryBefore.length > 0,
+    `${backend} (hud): 折りたたみ中のサマリが空`,
+  );
+  assert(summaryBefore.includes('ms'), `${backend} (hud): サマリに frame 値(ms)が無い: ${summaryBefore}`);
+  assert(
+    !summaryBefore.includes('scale'),
+    `${backend} (hud): 予算0なのにサマリに scale が出ている: ${summaryBefore}`,
+  );
+  await sleep(600);
+  const summaryAfter = await page.evaluate(
+    () => document.getElementById('hud-summary').textContent,
+  );
+  const frameAfter = (await statsOf(page)).frame;
+  assert(
+    frameAfter > frameBefore,
+    `${backend} (hud): 折りたたみ中に frame が進んでいない: ${frameBefore} → ${frameAfter}`,
+  );
+
+  // 折りたたみバーが lil-gui と重ならないこと（1200px viewport）。
+  const overlap = await page.evaluate(() => {
+    const barRight = document.getElementById('hud').getBoundingClientRect().right;
+    const root = [...document.querySelectorAll('.lil-gui')].find(
+      (element) => element.parentElement === document.body,
+    );
+    return { barRight, guiLeft: root ? root.getBoundingClientRect().left : null };
+  });
+  assert(overlap.guiLeft !== null, `${backend} (hud): lil-gui のルートが見つからない`);
+  assert(
+    overlap.barRight < overlap.guiLeft,
+    `${backend} (hud): 折りたたみバーの右端 ${overlap.barRight} が lil-gui の左端 ${overlap.guiLeft} 以上`,
+  );
+
+  // 永続化: 折りたたんだままリロード → 復元される。その後 ?hud=1 → 展開される。
+  await page.reload({ waitUntil: 'load' });
+  await waitHudReady('リロード後');
+  const restored = await statsOf(page);
+  assert(restored.hudCollapsed === true, `${backend} (hud): リロード後に折りたたみが復元されていない`);
+  await page.goto(`${baseUrl}&hud=1`, { waitUntil: 'load' });
+  await waitHudReady('?hud=1');
+  const urlExpanded = await statsOf(page);
+  assert(urlExpanded.hudCollapsed === false, `${backend} (hud): ?hud=1 で展開されていない`);
+
+  // URL指定は保存しない: 空の localStorage で ?hud=0 → 折りたたみ → パラメータなし再読込 → 展開。
+  await page.evaluate(() => window.localStorage.clear());
+  await page.goto(`${baseUrl}&hud=0`, { waitUntil: 'load' });
+  await waitHudReady('?hud=0');
+  const urlCollapsed = await statsOf(page);
+  assert(urlCollapsed.hudCollapsed === true, `${backend} (hud): ?hud=0 で折りたたまれていない`);
+  await page.goto(baseUrl, { waitUntil: 'load' });
+  await waitHudReady('パラメータなし再読込');
+  const urlDefault = await statsOf(page);
+  assert(
+    urlDefault.hudCollapsed === false,
+    `${backend} (hud): ?hud=0 が保存されて既定が変わっている`,
+  );
+
+  // lil-gui の入力中は H を無視すること。
+  const inputFocused = await page.evaluate(() => {
+    const input = document.querySelector('.lil-gui input');
+    if (!input) return false;
+    input.focus();
+    return document.activeElement === input;
+  });
+  assert(inputFocused === true, `${backend} (hud): lil-gui の input にフォーカスできない`);
+  await page.keyboard.press('h');
+  await waitFrames(page, 2);
+  const afterInputKey = await statsOf(page);
+  assert(
+    afterInputKey.hudCollapsed === false,
+    `${backend} (hud): 入力中のHキーでトグルされた`,
+  );
+
+  result.hud = {
+    expandedHeight,
+    // 幅は記録のみ。サマリ1行のため折りたたみ時が展開時より広くなる場合がある。
+    expandedWidth,
+    collapsedHeight: collapsedRect.height,
+    collapsedWidth: collapsedRect.width,
+    bodyScrollWidth: bodyOverflow.scrollWidth,
+    bodyClientWidth: bodyOverflow.clientWidth,
+    summary: summaryAfter,
+    guiLeft: overlap.guiLeft,
+  };
+}
+
 async function checkBackend(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
@@ -1205,6 +1406,7 @@ async function checkBackend(browser, backend) {
     await checkPipelines(page, result);
     await checkEvict(page, backend, result);
     await checkKeepAll(page, result);
+    await checkHud(page, backend, result);
 
     const consoleErrors = messages.filter(
       (message) =>

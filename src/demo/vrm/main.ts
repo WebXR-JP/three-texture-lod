@@ -6,9 +6,11 @@
  * 2. avatar-optimizer でアトラス化・マテリアル統合（MToonAtlasNodeMaterial へ）
  * 3. アトラスを 1/2 ずつ縮小した4レベルを作り、1体ぶんを1グループとして登録
  * 4. 毎フレーム、アバターの距離で全マテリアルを同じレベルへ切り替える
+ * 5. 複製は最適化を再実行せず、テンプレートのアトラス・セットを共有して体数を増やす
  *
  * URLパラメータ:
- * - `?models=A,B,C,A` 読み込むモデル（A/B/C はサンプル、それ以外は /models/<name>.vrm か URL）
+ * - `?models=A,B,C` 読み込むモデル（既定、A/B/C はサンプル、それ以外は /models/<name>.vrm か URL）
+ * - `?avatars=4` 総体数（既定4、最大12。不足分は最適化済みモデルの複製で補う）
  * - `?backend=webgl` WebGL2 バックエンドを強制
  * - `?lod=0` LODを無効化（最密テクスチャのみ）
  * - `?h=0.15` ヒステリシス幅
@@ -26,6 +28,7 @@ import {
   Scene,
   SRGBColorSpace,
   Vector3,
+  type Material,
 } from 'three/webgpu';
 import { WebGPURenderer } from 'three/webgpu';
 import {
@@ -33,7 +36,13 @@ import {
   computeLodDistance,
   type ResidencyMode,
 } from '../../lib/index.js';
-import { LOD_DISTANCES, loadAvatar, type AvatarHandle } from './avatar.js';
+import {
+  LOD_DISTANCES,
+  instantiateAvatar,
+  loadAvatar,
+  type AvatarHandle,
+  type AvatarTemplate,
+} from './avatar.js';
 import { createEnvironment, createLevelRing, setRingLevel } from './environment.js';
 import { createAvatarLabel, type AvatarLabel } from './labels.js';
 
@@ -51,11 +60,15 @@ let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 1000
 let lodEnabled = params.get('lod') !== '0';
 let autoCamera = params.get('auto') !== '0';
 
-const modelSpecs = (params.get('models') ?? 'A,B,C,A')
+const modelSpecs = (params.get('models') ?? 'A,B,C')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
-const MAX_AVATARS = 4;
+// ソース上限は最適化時の一時 WebGLRenderer のため。複製は最適化を再実行しないので無関係。
+const MAX_SOURCES = 4;
+const MAX_AVATARS = 12;
+// 総体数。不足分は最適化済みモデルの複製で補う。既定4（A,B,C + Aの複製1）。
+const targetAvatars = clampNumber(Math.round(Number(params.get('avatars') ?? 4)), 1, MAX_AVATARS, 4);
 const MAX_LOD_LEVEL = LOD_DISTANCES.length - 1;
 
 const LAYOUT = [
@@ -114,6 +127,8 @@ console.error = (...args: unknown[]) => {
 const avatars: AvatarHandle[] = [];
 const labels: AvatarLabel[] = [];
 const rings: Mesh[] = [];
+// ソースごとの共有元。複製はここに積まず、ハンドルの template で参照する。
+const templates: AvatarTemplate[] = [];
 
 let manager = createManager();
 let manualLevel: number | null = null;
@@ -148,14 +163,13 @@ function restoreBaseMaterials(): void {
   }
 }
 
-function register(avatar: AvatarHandle): void {
-  const index = avatars.length;
-  const slot = LAYOUT[Math.min(index, LAYOUT.length - 1)];
+function register(avatar: AvatarHandle, source: boolean): void {
+  const slot = layoutSlot(avatars.length);
   avatar.root.position.set(slot.x, 0, slot.z);
   scene.add(avatar.root);
 
   const label = createAvatarLabel();
-  label.sprite.position.set(0, 2.0, 0);
+  label.sprite.position.set(0, 2.0 + (avatars.length % 2) * 0.28, 0);
   avatar.root.add(label.sprite);
 
   const ring = createLevelRing();
@@ -165,16 +179,97 @@ function register(avatar: AvatarHandle): void {
   avatars.push(avatar);
   labels.push(label);
   rings.push(ring);
+  if (source) templates.push(avatar.template);
 
   if (lodEnabled && manualLevel === null) addGroup(avatar);
 }
 
+/** 配置スロット。4体目までは固定レイアウト、5体目以降は奥へ2列で並べる。 */
+function layoutSlot(index: number): { x: number; z: number } {
+  if (index < LAYOUT.length) return LAYOUT[index];
+  // 5体目以降は奥に4列で並べる。2列だと中央に固まってラベルが重なるため。
+  const extra = index - LAYOUT.length;
+  const row = Math.floor(extra / 4);
+  const column = extra % 4;
+  const xs = [-6.0, -2.0, 2.0, 6.0];
+  return { x: xs[column], z: -13.0 - row * 4.5 };
+}
+
 function layout(): void {
   for (const [index, avatar] of avatars.entries()) {
-    const slot = LAYOUT[Math.min(index, LAYOUT.length - 1)];
+    const slot = layoutSlot(index);
     avatar.root.position.set(slot.x, 0, slot.z);
     rings[index].position.set(slot.x, 0.012, slot.z);
   }
+}
+
+/**
+ * 最もインスタンスが少ないテンプレートを複製して1体増やす。
+ *
+ * @returns 追加できたら true。上限到達やソース無しでは false。
+ */
+function addClone(): boolean {
+  if (avatars.length >= MAX_AVATARS) {
+    showToast(`複製は最大 ${MAX_AVATARS} 体までです`);
+    return false;
+  }
+  if (templates.length === 0) {
+    showToast('複製元のモデルがありません');
+    return false;
+  }
+  let target = templates[0];
+  let count = Infinity;
+  for (const template of templates) {
+    const instances = avatars.filter((avatar) => avatar.template === template).length;
+    if (instances < count) {
+      count = instances;
+      target = template;
+    }
+  }
+  const clone = instantiateAvatar(target, uniqueName(target.name));
+  register(clone, false);
+  layout();
+  showToast(`${clone.name} を複製しました（${avatars.length}体）`);
+  return true;
+}
+
+/**
+ * 最後の複製を1体削除する。テクスチャ・マテリアルは共有のため破棄しない。
+ *
+ * @returns 削除できたら true。複製が無ければ false。
+ */
+function removeClone(): boolean {
+  for (let index = avatars.length - 1; index >= 0; index--) {
+    if (!avatars[index].isClone) continue;
+    const avatar = avatars[index];
+    if (lodEnabled && manualLevel === null) manager.remove(avatar.anchor);
+    // 複製した骨格のボーンテクスチャを解放する。geometry/material はテンプレートと共有なので触らない。
+    const skeletons = new Set<{ dispose(): void }>();
+    avatar.root.traverse((object) => {
+      const skinned = object as unknown as {
+        isSkinnedMesh?: boolean;
+        skeleton?: { dispose(): void };
+      };
+      if (skinned.isSkinnedMesh && skinned.skeleton) skeletons.add(skinned.skeleton);
+    });
+    for (const skeleton of skeletons) skeleton.dispose();
+    scene.remove(avatar.root);
+    const label = labels[index];
+    label.sprite.material.map?.dispose();
+    label.sprite.material.dispose();
+    const ring = rings[index];
+    scene.remove(ring);
+    ring.geometry.dispose();
+    (ring.material as Material).dispose();
+    avatars.splice(index, 1);
+    labels.splice(index, 1);
+    rings.splice(index, 1);
+    layout();
+    showToast(`${avatar.name} を削除しました（${avatars.length}体）`);
+    return true;
+  }
+  showToast('削除できる複製がありません');
+  return false;
 }
 
 function uniqueName(base: string): string {
@@ -202,8 +297,9 @@ function sourceForSpec(spec: string): string {
 // ---------------------------------------------------------------- LOD再構築
 
 /**
- * hysteresis を変えるときは、既存のバリアントを破棄してセットを作り直す。
+ * hysteresis を変えるときは、テンプレート単位でバリアントを破棄してセットを作り直す。
  * アトラステクスチャ（元画像）は共有したまま、マテリアルだけを差し替える。
+ * 複製を含む全ハンドルは作り直したセットへ rebind する。
  */
 function recreateLod(nextHysteresis: number): boolean {
   if (!(nextHysteresis >= 0 && nextHysteresis < 1)) {
@@ -220,10 +316,12 @@ function recreateLod(nextHysteresis: number): boolean {
   manager.dispose();
   // 強制レベル中はメッシュがバリアントを掴んでいる。破棄前に必ずbaseへ戻す。
   restoreBaseMaterials();
-  for (const avatar of avatars) avatar.disposeVariants();
+  const unique = new Set(avatars.map((avatar) => avatar.template));
+  for (const template of unique) template.disposeVariants();
   hysteresis = nextHysteresis;
   guiState.hysteresis = nextHysteresis;
-  for (const avatar of avatars) avatar.rebuild(hysteresis);
+  for (const template of unique) template.rebuild(hysteresis);
+  for (const avatar of avatars) avatar.rebind();
   manualLevel = null;
   guiState.forceLevel = 'auto';
   manager = createManager();
@@ -267,7 +365,8 @@ function setForceLevel(level: number | null): void {
   manualLevel = level;
   manager.dispose();
   for (const avatar of avatars) {
-    const max = avatar.sets[0]?.levels.length ? avatar.sets[0].levels.length - 1 : 3;
+    const sets = avatar.template.sets;
+    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 3;
     const clamped = Math.min(level, max);
     for (const binding of avatar.bindings) {
       binding.mesh.material = binding.set.variant(clamped);
@@ -386,8 +485,8 @@ async function addFromSource(spec: string, index: number, total: number): Promis
     hysteresis,
     onProgress: (message) => setLoading(message, (index + 0.35) / total),
   });
-  register(avatar);
-  const stats = avatar.stats;
+  register(avatar, true);
+  const stats = avatar.template.stats;
   appendLog(
     `${name}: mesh ${stats.before.meshes}→${stats.after.meshes}, ` +
       `mat ${stats.before.materials}→${stats.after.materials}, ` +
@@ -404,6 +503,10 @@ async function addFromFile(file: File): Promise<void> {
     showToast(`アバターは最大 ${MAX_AVATARS} 体までです`);
     return;
   }
+  if (templates.length >= MAX_SOURCES) {
+    showToast(`ソースは最大 ${MAX_SOURCES} 体までです。複製で増やせます`);
+    return;
+  }
   busy = true;
   try {
     loadingEl.classList.remove('hidden');
@@ -418,7 +521,7 @@ async function addFromFile(file: File): Promise<void> {
       hysteresis,
       onProgress: (message) => setLoading(message, 0.6),
     });
-    register(avatar);
+    register(avatar, true);
     layout();
     appendLog(`${name}: 追加しました`);
     if (status === 'error' && avatars.length > 0) status = 'ready';
@@ -449,7 +552,7 @@ const loadFailures: string[] = [];
 
 try {
   setLoading('VRMを読み込み中...', 0);
-  const specs = modelSpecs.length > 0 ? modelSpecs.slice(0, MAX_AVATARS) : ['A'];
+  const specs = modelSpecs.length > 0 ? modelSpecs.slice(0, Math.min(MAX_SOURCES, targetAvatars)) : ['A'];
   for (const [index, spec] of specs.entries()) {
     try {
       await addFromSource(spec, index, specs.length);
@@ -458,6 +561,11 @@ try {
       appendLog(`失敗: ${String((error as Error)?.message ?? error)}`);
       console.warn(error);
     }
+  }
+  // 総体数に足りない分は、最適化済みモデルを複製して補う。最適化の再実行はしない。
+  while (avatars.length < targetAvatars && templates.length > 0) {
+    const template = templates[avatars.length % templates.length];
+    register(instantiateAvatar(template, uniqueName(template.name)), false);
   }
   if (avatars.length === 0) {
     throw new Error(
@@ -489,6 +597,8 @@ const guiState = {
   autoCamera,
   forceLevel: 'auto' as 'auto' | '0' | '1' | '2' | '3',
   add: pickFile,
+  addClone,
+  removeClone,
   reload: () => location.reload(),
 };
 
@@ -546,6 +656,8 @@ gui
   })
   .listen();
 gui.add(guiState, 'add').name('VRMを追加');
+gui.add(guiState, 'addClone').name('複製を追加');
+gui.add(guiState, 'removeClone').name('複製を削除');
 gui.add(guiState, 'reload').name('再読み込み');
 
 // ---------------------------------------------------------------- 毎フレーム
@@ -571,7 +683,8 @@ function backendName(): string {
 function applyManualLevel(): void {
   if (manualLevel === null) return;
   for (const avatar of avatars) {
-    const max = avatar.sets[0]?.levels.length ? avatar.sets[0].levels.length - 1 : 3;
+    const sets = avatar.template.sets;
+    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 3;
     const clamped = Math.min(manualLevel, max);
     for (const binding of avatar.bindings) {
       binding.mesh.material = binding.set.variant(clamped);
@@ -597,13 +710,17 @@ function updateVisuals(): void {
     const level = levelOfAvatar(index);
     setRingLevel(rings[index], level);
 
+    // 体数が多いときは全ラベルを出すと重なるため、先頭4体だけ表示する。
+    // 残りはHUDのアバター行で名前・レベル・距離を確認できる。
+    labels[index].sprite.visible = index < 4;
+
     // ラベルは距離に比例して大きくし、画面上の見かけの大きさを一定に保つ。
     labels[index].sprite.getWorldPosition(labelWorldPosition);
     const cameraDistance = camera.position.distanceTo(labelWorldPosition);
-    const width = Math.min(5.0, Math.max(0.7, cameraDistance * 0.26));
+    const width = Math.min(3.6, Math.max(0.7, cameraDistance * 0.26));
     labels[index].sprite.scale.set(width, width / 4.44, 1);
 
-    if (updateLabels) {
+    if (updateLabels && index < 4) {
       const distance = computeLodDistance(avatar.anchor, camera, 'surface');
       labels[index].set(`${avatar.name} ${distance.toFixed(1)}m`, level);
     }
@@ -611,21 +728,22 @@ function updateVisuals(): void {
 }
 
 function updateHud(): void {
-  const before = avatars.reduce(
-    (acc, avatar) => ({
-      meshes: acc.meshes + avatar.stats.before.meshes,
-      materials: acc.materials + avatar.stats.before.materials,
-    }),
-    { meshes: 0, materials: 0 },
-  );
-  const after = avatars.reduce(
-    (acc, avatar) => ({
-      meshes: acc.meshes + avatar.stats.after.meshes,
-      materials: acc.materials + avatar.stats.after.materials,
-    }),
-    { meshes: 0, materials: 0 },
-  );
-  const atlasBytes = avatars.reduce((acc, avatar) => acc + avatar.stats.atlasBytes, 0);
+  // 最適化の集計はソース（テンプレート）のみ。複製のゼロ値を足して二重計上しない。
+  const before = { meshes: 0, materials: 0 };
+  const after = { meshes: 0, materials: 0 };
+  let atlasBytes = 0;
+  let optimizeMs = 0;
+  for (const template of templates) {
+    before.meshes += template.stats.before.meshes;
+    before.materials += template.stats.before.materials;
+    after.meshes += template.stats.after.meshes;
+    after.materials += template.stats.after.materials;
+    atlasBytes += template.stats.atlasBytes;
+    optimizeMs += template.stats.optimizeMs;
+  }
+  const sources = templates.length;
+  const clones = avatars.length - sources;
+  const renderedMeshes = avatars.reduce((acc, avatar) => acc + avatar.meshes.length, 0);
   const stats = manager.stats();
   // 手動レベル固定中はマネージャに登録がないため、HUDの内訳は現在の適用レベルから数える。
   const counts = [0, 1, 2, 3].map(
@@ -644,9 +762,9 @@ function updateHud(): void {
 
   hudBodyEl.textContent = [
     `backend   ${backendName()}`,
-    `models    ${avatars.length}  (${avatars.map((avatar) => avatar.name).join(', ')})`,
-    `optimize  ${(avatars.reduce((acc, avatar) => acc + avatar.stats.optimizeMs, 0) / 1000).toFixed(1)}s  atlas ${atlasResolution}px`,
-    `meshes    ${before.meshes} → ${after.meshes}`,
+    `models    src ${sources} / avatars ${avatars.length} (clones ${clones})`,
+    `optimize  ${(optimizeMs / 1000).toFixed(1)}s  atlas ${atlasResolution}px`,
+    `meshes    ${before.meshes} → ${after.meshes}  (rendered ${renderedMeshes})`,
     `materials ${before.materials} → ${after.materials}`,
     `atlas     ${(atlasBytes / 1048576).toFixed(1)} MB (full)`,
     `LOD       ${lodEnabled ? 'on' : 'off'}  ${residency}  h=${hysteresis.toFixed(2)}`,
@@ -733,12 +851,16 @@ const api = {
       evictDelayMs,
       manualLevel,
       loadFailures: [...loadFailures],
+      sourceCount: templates.length,
+      cloneCount: avatars.length - templates.length,
+      renderedMeshes: avatars.reduce((acc, avatar) => acc + avatar.meshes.length, 0),
       avatars: avatars.map((avatar, index) => ({
         name: avatar.name,
+        isClone: avatar.isClone,
         level: levelOfAvatar(index),
         distance: computeLodDistance(avatar.anchor, camera, 'surface'),
         meshes: avatar.meshes.length,
-        materials: avatar.sets.length,
+        materials: avatar.template.sets.length,
         optimizeMs: avatar.stats.optimizeMs,
         atlasResolution: avatar.stats.atlasResolution,
         atlasBytes: avatar.stats.atlasBytes,
@@ -765,6 +887,8 @@ const api = {
     }
   },
   setAvatarSurfaceDistance,
+  addClone,
+  removeClone,
   setSettings(partial: {
     hysteresis?: number;
     residency?: ResidencyMode;
@@ -833,7 +957,7 @@ const api = {
   variantTextureWidths(index: number): (number | null)[][] {
     const avatar = avatars[index];
     if (!avatar) return [];
-    return avatar.sets.map((set) =>
+    return avatar.template.sets.map((set) =>
       set.levels.map((level, index) => {
         const variant = set.variant(index) as unknown as {
           map?: { image?: { width?: number } };
@@ -842,6 +966,37 @@ const api = {
         return typeof width === 'number' ? width : null;
       }),
     );
+  },
+  cloneHeadQuaternion(index: number): number[] | null {
+    const avatar = avatars[index];
+    if (!avatar || !avatar.isClone) return null;
+    const name = avatar.template.headRawBoneName;
+    const bone = name ? avatar.root.getObjectByName(name) : null;
+    return bone ? bone.quaternion.toArray() : null;
+  },
+  appliedVariantMatches(index: number): boolean {
+    const avatar = avatars[index];
+    if (!avatar) return false;
+    const level = levelOfAvatar(index);
+    if (level === null) return false;
+    return avatar.meshes.every((mesh) => {
+      const base = avatar.baseMaterials.get(mesh);
+      const set = base ? avatar.template.materialSets.get(base) : undefined;
+      if (!set) return false;
+      const material = Array.isArray(mesh.material) ? null : mesh.material;
+      return material === set.variant(level);
+    });
+  },
+  cloneHeadInSkeleton(index: number): boolean {
+    const avatar = avatars[index];
+    if (!avatar || !avatar.isClone) return false;
+    const name = avatar.template.headRawBoneName;
+    const bone = name ? avatar.root.getObjectByName(name) : null;
+    if (!bone) return false;
+    const skinned = avatar.anchor as unknown as {
+      skeleton?: { bones?: readonly unknown[] };
+    };
+    return skinned.skeleton?.bones?.includes(bone) === true;
   },
   meshLevels(index: number): number[] {
     const avatar = avatars[index];

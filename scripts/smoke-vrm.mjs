@@ -280,7 +280,7 @@ async function checkKeepAll(page, result) {
   await page.evaluate(() => window.__vrmDemo.setSettings({ residency: 'evict' }));
 }
 
-async function checkMultiAvatar(browser, backend) {
+async function checkFourSources(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
   page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
@@ -288,7 +288,7 @@ async function checkMultiAvatar(browser, backend) {
   const result = { backend, ok: false };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?models=A,B,C,A&auto=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?models=A,B,C,A&avatars=4&auto=0${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -357,6 +357,155 @@ async function checkMultiAvatar(browser, backend) {
   return result;
 }
 
+async function checkInstances(browser, backend, config) {
+  const { query, expectedSource, expectedClone, slug } = config;
+  const expectedTotal = expectedSource + expectedClone;
+  const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+  const messages = [];
+  page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  const result = { backend, ok: false };
+  try {
+    await page.goto(
+      `${BASE_URL}/vrm.html?${query}${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      { waitUntil: 'load' },
+    );
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 300000 },
+    );
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    result.status = status;
+    if (status !== 'ready') {
+      assert(false, `${backend} (${slug}): デモが ready にならなかった（status=${status}）`);
+      return result;
+    }
+    // evictDelay(既定1000ms) 後の常駐量まで待ってから測る。
+    await waitFrames(page, 20);
+    await sleep(1400);
+    const stats = await statsOf(page);
+    result.stats = stats;
+    assert(stats.avatars.length === expectedTotal, `${backend} (${slug}): アバター数が ${stats.avatars.length}`);
+    assert(stats.sourceCount === expectedSource, `${backend} (${slug}): sourceCount が ${stats.sourceCount}`);
+    assert(stats.cloneCount === expectedClone, `${backend} (${slug}): cloneCount が ${stats.cloneCount}`);
+    assert(stats.manager.objectCount === expectedTotal, `${backend} (${slug}): objectCount が ${stats.manager.objectCount}`);
+    assert(
+      JSON.stringify(stats.manager.levelCounts) === JSON.stringify([1, 1, 1, 1]),
+      `${backend} (${slug}): levelCounts が ${JSON.stringify(stats.manager.levelCounts)}`,
+    );
+    assert(
+      stats.avatars.map((avatar) => avatar.level).join(',') === '0,1,2,3',
+      `${backend} (${slug}): 初期レベルの並びが ${stats.avatars.map((avatar) => avatar.level).join(',')}`,
+    );
+    assert(stats.loadFailures.length === 0, `${backend} (${slug}): 読み込み失敗 ${stats.loadFailures.join(',')}`);
+    assert(stats.errors.length === 0, `${backend} (${slug}): stats.errors ${stats.errors.join(' | ')}`);
+    assert(
+      stats.avatars.filter((avatar) => avatar.optimizeMs > 0).length === expectedSource,
+      `${backend} (${slug}): 最適化回数が ${expectedSource} でない`,
+    );
+    assert(
+      stats.avatars.filter((avatar) => avatar.isClone).every((avatar) => avatar.optimizeMs === 0),
+      `${backend} (${slug}): 複製の optimizeMs が 0 でない`,
+    );
+    // 複製の atlasBytes は0のため、fullAtlas はソース分のみ。
+    // resident は複数レベル分で full を超えうるため、1.5倍未満で見る。
+    const fullAtlas = stats.avatars.reduce((sum, avatar) => sum + avatar.atlasBytes, 0);
+    result.resident = stats.manager.residentBytes;
+    result.fullAtlas = fullAtlas;
+    assert(
+      stats.manager.residentBytes < fullAtlas * 1.5,
+      `${backend} (${slug}): 常駐量が全アトラスの1.5倍未満にならない: ${stats.manager.residentBytes} / ${fullAtlas}`,
+    );
+
+    for (const [index] of stats.avatars.entries()) {
+      const meshLevels = await page.evaluate((i) => window.__vrmDemo.meshLevels(i), index);
+      assert(
+        meshLevels.length > 0 && new Set(meshLevels).size === 1,
+        `${backend} (${slug}): アバター${index}のメッシュ間レベルが不一致: ${JSON.stringify(meshLevels)}`,
+      );
+      assert(
+        (await page.evaluate((i) => window.__vrmDemo.appliedVariantMatches(i), index)) === true,
+        `${backend} (${slug}): アバター${index}の適用マテリアルが現行セットのvariantと不一致`,
+      );
+    }
+
+    const cloneIndex = stats.avatars.findIndex((avatar) => avatar.isClone);
+    assert(cloneIndex >= 0, `${backend} (${slug}): 複製が1体もない`);
+
+    result.brightness = await screenshot(page, `${backend}-${slug}.png`);
+
+    // 複製は raw 頭ボーンを揺らす（normalized ボーンでは skinning に反映されない）。
+    const head0 = await page.evaluate((i) => window.__vrmDemo.cloneHeadQuaternion(i), cloneIndex);
+    const inSkeleton = await page.evaluate((i) => window.__vrmDemo.cloneHeadInSkeleton(i), cloneIndex);
+    await sleep(450);
+    const head1 = await page.evaluate((i) => window.__vrmDemo.cloneHeadQuaternion(i), cloneIndex);
+    assert(
+      Array.isArray(head0) && Array.isArray(head1),
+      `${backend} (${slug}): 頭ボーン quaternion が取れない: ${JSON.stringify(head0)} / ${JSON.stringify(head1)}`,
+    );
+    const dot =
+      head0[0] * head1[0] + head0[1] * head1[1] + head0[2] * head1[2] + head0[3] * head1[3];
+    const angle = 2 * Math.acos(Math.min(1, Math.abs(dot)));
+    assert(inSkeleton === true, `${backend} (${slug}): raw 頭ボーンが SkinnedMesh の skeleton に無い`);
+    assert(angle > 1e-3, `${backend} (${slug}): 頭ボーンの回転差が小さすぎる: ${angle}`);
+    result.headMotion = { before: head0, after: head1, angle, inSkeleton };
+
+    // GUIボタンと同じAPIで追加・削除ができ、マネージャのグループ数も追従すること。
+    const added = await page.evaluate(() => window.__vrmDemo.addClone());
+    await waitFrames(page, 6);
+    const afterAdd = await statsOf(page);
+    assert(added === true, `${backend} (${slug}): addClone が false`);
+    assert(afterAdd.avatars.length === expectedTotal + 1, `${backend} (${slug}): 追加後のアバター数が ${afterAdd.avatars.length}`);
+    assert(afterAdd.manager.objectCount === expectedTotal + 1, `${backend} (${slug}): 追加後の objectCount が ${afterAdd.manager.objectCount}`);
+
+    const removed = await page.evaluate(() => window.__vrmDemo.removeClone());
+    await waitFrames(page, 6);
+    const afterRemove = await statsOf(page);
+    assert(removed === true, `${backend} (${slug}): removeClone が false`);
+    assert(afterRemove.avatars.length === expectedTotal, `${backend} (${slug}): 削除後のアバター数が ${afterRemove.avatars.length}`);
+    assert(afterRemove.manager.objectCount === expectedTotal, `${backend} (${slug}): 削除後の objectCount が ${afterRemove.manager.objectCount}`);
+    result.addRemove = { added: afterAdd.avatars.length, removed: afterRemove.avatars.length };
+
+    // h変更でテンプレートのセットを作り直し、全インスタンスがrebindされること。
+    await page.evaluate(() => window.__vrmDemo.setSettings({ hysteresis: 0.1 }));
+    await waitFrames(page, 8);
+    const afterH = await statsOf(page);
+    assert(afterH.manager.objectCount === expectedTotal, `${backend} (${slug}): h変更後の objectCount が ${afterH.manager.objectCount}`);
+    for (const [index] of afterH.avatars.entries()) {
+      const meshLevels = await page.evaluate((i) => window.__vrmDemo.meshLevels(i), index);
+      assert(
+        meshLevels.length > 0 && new Set(meshLevels).size === 1,
+        `${backend} (${slug}): h変更後にアバター${index}のメッシュ間レベルが不一致: ${JSON.stringify(meshLevels)}`,
+      );
+      assert(
+        (await page.evaluate((i) => window.__vrmDemo.appliedVariantMatches(i), index)) === true,
+        `${backend} (${slug}): h変更後にアバター${index}の適用マテリアルが新セットのvariantと不一致`,
+      );
+    }
+    result.hysteresisRebind = { objectCount: afterH.manager.objectCount, levels: afterH.avatars.map((a) => a.level) };
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    const noise = messages.filter((message) =>
+      /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+    );
+    result.consoleErrors = consoleErrors;
+    result.webgpuNoise = noise;
+    assert(consoleErrors.length === 0, `${backend} (${slug}): コンソールエラー ${consoleErrors.join(' | ')}`);
+    assert(noise.length === 0, `${backend} (${slug}): GPU関連の警告 ${noise.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (${slug}): 例外: ${String(error)}`);
+  } finally {
+    result.messages = messages.slice(-20);
+    await page.close();
+  }
+  return result;
+}
+
 async function checkBackend(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
@@ -368,7 +517,7 @@ async function checkBackend(browser, backend) {
   const result = { backend, ok: false, messages: [] };
   try {
     await page.goto(
-      `${BASE_URL}/vrm.html?models=A&auto=0&h=0.15${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&h=0.15${backend === 'webgl' ? '&backend=webgl' : ''}`,
       { waitUntil: 'load' },
     );
     await page.waitForFunction(
@@ -486,8 +635,8 @@ async function main() {
       await sleep(100);
     }
 
-    // 4体は最適化時の一時WebGLRendererが多く、直前のページのコンテキストと合わせると
-    // 上限に達することがある。1体と4体はそれぞれ新しいChromeで検証する。
+    // 4ソース・複製は最適化時の一時WebGLRendererが多く、直前のページのコンテキストと合わせると
+    // 上限に達することがある。1体・4ソース・複製はそれぞれ新しいChromeで検証する。
     const launchBrowser = () =>
       chromium.launch({
         executablePath: CHROME_PATH,
@@ -505,15 +654,54 @@ async function main() {
         await singleBrowser.close();
       }
 
-      const multiBrowser = await launchBrowser();
-      let multi;
+      const defaultBrowser = await launchBrowser();
+      let defaultPage;
       try {
-        multi = await checkMultiAvatar(multiBrowser, backend);
+        defaultPage = await checkInstances(defaultBrowser, backend, {
+          query: 'auto=0',
+          expectedSource: 3,
+          expectedClone: 1,
+          slug: 'default',
+        });
       } finally {
-        await multiBrowser.close();
+        await defaultBrowser.close();
       }
 
-      single.multi = multi;
+      const clonesBrowser = await launchBrowser();
+      let clones;
+      try {
+        clones = await checkInstances(clonesBrowser, backend, {
+          query: 'models=A&avatars=4&auto=0',
+          expectedSource: 1,
+          expectedClone: 3,
+          slug: 'clones',
+        });
+      } finally {
+        await clonesBrowser.close();
+      }
+
+      // 4ソースは最適化時の一時WebGLRendererが36個分になり、WebGLでは
+      // コンテキスト上限に触れて Device Lost することがある（既知の制約）。
+      // 4ソースの最適化・マテリアル統合はWebGPUで検証し、WebGLは既定の3ソース+複製で見る。
+      let fourSources;
+      if (backend === 'webgpu') {
+        const fourBrowser = await launchBrowser();
+        try {
+          fourSources = await checkFourSources(fourBrowser, backend);
+        } finally {
+          await fourBrowser.close();
+        }
+      } else {
+        fourSources = {
+          backend,
+          ok: true,
+          skipped: '4-source optimization exceeds the WebGL context budget; verified on WebGPU',
+        };
+      }
+
+      single.fourSources = fourSources;
+      single.default = defaultPage;
+      single.clones = clones;
       single.ok = failures.length === 0;
       results.push(single);
     }

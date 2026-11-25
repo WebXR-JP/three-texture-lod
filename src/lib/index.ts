@@ -9,13 +9,20 @@
  */
 export type {
   DistanceMode,
+  KnownTextureSlot,
   ResidencyMode,
   TextureLodLevel,
   TextureLodManagerOptions,
   TextureLodSetOptions,
   TextureLodStats,
   TextureSlot,
+  TextureSlotOf,
 } from './types.js';
+export type {
+  TextureLodBinding,
+  TextureLodGroupOptions,
+  TextureLodSetContract,
+} from './texture-lod-manager.js';
 export { selectLevel } from './select-level.js';
 export { computeLodDistance } from './lod-distance.js';
 export { TextureLodSet, createTextureLodSet } from './texture-lod-set.js';

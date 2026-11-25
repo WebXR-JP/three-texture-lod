@@ -380,4 +380,48 @@ describe('TextureLodSet', () => {
       expect(spy).not.toHaveBeenCalled();
     }
   });
+
+  it('独自テクスチャスロットを足した型が levels に通る', () => {
+    // `MeshStandardMaterial` に `shadeMultiplyTexture` を足した型で、
+    // 派生スロット名が型検査を通ること（`as any` を使わない）の確認。
+    // `Object.assign` で実行時のプロパティも用意するため、存在確認も通る。
+    const base = Object.assign(new MeshStandardMaterial({ name: 'shade' }), {
+      shadeMultiplyTexture: null,
+    });
+    const nearShade = dataTexture(8);
+    const farShade = dataTexture(2);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: dataTexture(8), shadeMultiplyTexture: nearShade } },
+        { distance: 10, textures: { map: dataTexture(4), shadeMultiplyTexture: farShade } },
+      ],
+    });
+    expect(set.variant(0).shadeMultiplyTexture).toBe(nearShade);
+    expect(set.variant(1).shadeMultiplyTexture).toBe(farShade);
+    expect(set.thresholds).toEqual([0, 10]);
+  });
+
+  it('MToon相当の独自スロット型でも shadeMultiplyTexture が差し替わる', () => {
+    // `@webxr-jp/mtoon-atlas` は依存に無いため、`Texture | null` を持つ
+    // サブクラスで模擬する。NodeMaterial 系の型でも派生スロットが通ることの確認。
+    class MockMToonMaterial extends MeshStandardNodeMaterial {
+      shadeMultiplyTexture: Texture | null = null;
+    }
+    const base = new MockMToonMaterial();
+    const nearShade = dataTexture(8);
+    const farShade = dataTexture(2);
+    const nearMap = dataTexture(8);
+    const farMap = dataTexture(4);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: nearMap, shadeMultiplyTexture: nearShade } },
+        { distance: 10, textures: { map: farMap, shadeMultiplyTexture: farShade } },
+      ],
+    });
+    expect(set.variant(0).shadeMultiplyTexture).toBe(nearShade);
+    expect(set.variant(1).shadeMultiplyTexture).toBe(farShade);
+    expect(set.variant(1).map).toBe(farMap);
+  });
 });

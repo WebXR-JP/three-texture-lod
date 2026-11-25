@@ -6,7 +6,7 @@
  * GPUなしで動くよう three の core クラスのみを使い、時計は注入して時間を操作する。
  */
 import { describe, expect, it, vi } from 'vitest';
-import { DataTexture, Mesh, MeshStandardMaterial, PerspectiveCamera, PlaneGeometry } from 'three';
+import { DataTexture, Material, Mesh, MeshStandardMaterial, PerspectiveCamera, PlaneGeometry, type Texture } from 'three';
 import { createTextureLodSet } from './texture-lod-set.js';
 import { TextureLodManager } from './texture-lod-manager.js';
 import type { TextureLodLevel } from './types.js';
@@ -523,6 +523,431 @@ describe('TextureLodManager', () => {
     expect(manager.stats().objectCount).toBe(0);
     for (const spy of spies) {
       expect(spy).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('TextureLodManager groups', () => {
+  it('addGroupで複数メッシュが同じレベルに連動し、統計はグループ単位になる', () => {
+    // 1つの距離ソース（束縛外のanchor可）から全束縛が同じレベルに切り替わることの確認。
+    // 統計の objectCount・levelCounts と切替回数がグループ単位であることも確かめる。
+    const a = set3('body');
+    const bBase = new MeshStandardMaterial({ name: 'face' });
+    const bSet = createTextureLodSet({
+      material: bBase,
+      levels: [8, 4, 2].map((size, i) => ({
+        distance: [0, 10, 20][i],
+        textures: { map: dataTexture(size) },
+      })),
+    });
+    const manager = new TextureLodManager();
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(bBase);
+    const anchor = sceneMesh(a.base);
+    try {
+      manager.addGroup(
+        [
+          { mesh: meshA, set: a.set },
+          { mesh: meshB, set: bSet },
+        ],
+        { anchor },
+      );
+      // 初回update前はマテリアルに触れない。
+      expect(meshA.material).toBe(a.base);
+      expect(meshB.material).toBe(bBase);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(meshA)).toBe(0);
+      expect(manager.levelOf(meshB)).toBe(0);
+      expect(meshA.material).toBe(a.set.variant(0));
+      expect(meshB.material).toBe(bSet.variant(0));
+      // 統計はグループ単位であり、切替もグループで1回だけ数える。
+      expect(manager.stats().objectCount).toBe(1);
+      expect(manager.stats().levelCounts).toEqual([1, 0, 0]);
+      expect(manager.stats().switchCount).toBe(1);
+      manager.update(cameraAt(30));
+      expect(manager.levelOf(meshA)).toBe(2);
+      expect(manager.levelOf(meshB)).toBe(2);
+      expect(meshA.material).toBe(a.set.variant(2));
+      expect(meshB.material).toBe(bSet.variant(2));
+      expect(manager.stats().levelCounts).toEqual([0, 0, 1]);
+      expect(manager.stats().switchCount).toBe(2);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('境界が違うセットを混ぜるとthrowし、登録が残らない', () => {
+    // レベル番号の共有には境界の完全一致が必要であり、失敗時は部分登録を残さないことの確認。
+    const a = set3('a');
+    const bBase = new MeshStandardMaterial({ name: 'b' });
+    const bSet = createTextureLodSet({
+      material: bBase,
+      levels: [
+        { distance: 0, textures: { map: dataTexture(8) } },
+        { distance: 10, textures: { map: dataTexture(4) } },
+        { distance: 25, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const manager = new TextureLodManager();
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(bBase);
+    try {
+      expect(() =>
+        manager.addGroup([
+          { mesh: meshA, set: a.set },
+          { mesh: meshB, set: bSet },
+        ]),
+      ).toThrow(/境界/);
+      expect(manager.stats().objectCount).toBe(0);
+      expect(manager.stats().residentBytes).toBe(0);
+      // 失敗後に単独登録できる（部分登録が残っていない）。
+      manager.add(meshA, a.set);
+      expect(manager.stats().objectCount).toBe(1);
+      manager.remove(meshA);
+      expect(manager.stats().residentBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('hysteresisが違うセットを混ぜるとthrowする', () => {
+    // 境界が同じでも幅が違えばレベル共有できないこと、どちら側の不一致かが分かることの確認。
+    const aBase = new MeshStandardMaterial({ name: 'a' });
+    const bBase = new MeshStandardMaterial({ name: 'b' });
+    const levelsFor = (size: number): TextureLodLevel[] => [
+      { distance: 0, textures: { map: dataTexture(size) } },
+      { distance: 10, textures: { map: dataTexture(size / 2) } },
+    ];
+    const setA = createTextureLodSet({ material: aBase, levels: levelsFor(8), hysteresis: 0.1 });
+    const setB = createTextureLodSet({ material: bBase, levels: levelsFor(8), hysteresis: 0.2 });
+    const manager = new TextureLodManager();
+    try {
+      expect(() =>
+        manager.addGroup([
+          { mesh: sceneMesh(aBase), set: setA },
+          { mesh: sceneMesh(bBase), set: setB },
+        ]),
+      ).toThrow(/hysteresis/);
+      expect(manager.stats().objectCount).toBe(0);
+      expect(manager.stats().residentBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('bindingsが空だとthrowする', () => {
+    // 距離ソースも束縛もないグループは作れないことの確認。
+    const manager = new TextureLodManager();
+    try {
+      expect(() => manager.addGroup([])).toThrow(Error);
+      expect(manager.stats().objectCount).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('二重登録があるとthrowし、部分登録が残らない', () => {
+    // 2件目が登録済みでも、先に全件検証して1件目も登録しないことの確認。
+    const a = set3('a');
+    const b = set3('b');
+    const manager = new TextureLodManager();
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(b.base);
+    const meshC = sceneMesh(b.base);
+    try {
+      manager.addGroup([
+        { mesh: meshA, set: a.set },
+        { mesh: meshB, set: b.set },
+      ]);
+      expect(() =>
+        manager.addGroup([
+          { mesh: meshC, set: b.set },
+          { mesh: meshA, set: a.set },
+        ]),
+      ).toThrow(Error);
+      // meshC は未登録のまま、既存グループは壊れていない。
+      expect(() => manager.levelOf(meshC)).toThrow(Error);
+      expect(manager.stats().objectCount).toBe(1);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(meshA)).toBe(0);
+      expect(manager.levelOf(meshB)).toBe(0);
+      // 解除後に組み直せる。
+      manager.remove(meshA);
+      expect(manager.stats().objectCount).toBe(0);
+      manager.addGroup([
+        { mesh: meshC, set: b.set },
+        { mesh: meshA, set: a.set },
+      ]);
+      expect(manager.stats().objectCount).toBe(1);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('removeはグループ全体を解除し、全メッシュがbaseに戻る', () => {
+    // 片方の remove で同じグループの他メッシュも同時に外れることの確認。
+    const a = set3('a');
+    const b = set3('b');
+    const manager = new TextureLodManager();
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(b.base);
+    try {
+      manager.addGroup([
+        { mesh: meshA, set: a.set },
+        { mesh: meshB, set: b.set },
+      ]);
+      manager.update(cameraAt(5));
+      expect(manager.stats().residentBytes).toBeGreaterThan(0);
+      manager.remove(meshA);
+      expect(meshA.material).toBe(a.base);
+      expect(meshB.material).toBe(b.base);
+      expect(() => manager.levelOf(meshB)).toThrow(Error);
+      expect(manager.stats().objectCount).toBe(0);
+      expect(manager.stats().residentBytes).toBe(0);
+      // 再登録できる。
+      manager.add(meshA, a.set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(meshA)).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('同じsetを共有したグループは解除で参照が残らない', () => {
+    // 1つのsetを2束縛で使っても、グループ解除で登録数が0に戻ることの確認。
+    const { set, base } = set3('wall');
+    const manager = new TextureLodManager();
+    const meshA = sceneMesh(base);
+    const meshB = sceneMesh(base);
+    try {
+      manager.addGroup([
+        { mesh: meshA, set },
+        { mesh: meshB, set },
+      ]);
+      manager.update(cameraAt(5));
+      expect(manager.stats().residentBytes).toBeGreaterThan(0);
+      manager.remove(meshB);
+      expect(meshA.material).toBe(base);
+      expect(meshB.material).toBe(base);
+      expect(manager.stats().objectCount).toBe(0);
+      expect(manager.stats().residentBytes).toBe(0);
+      // 再登録できる。
+      manager.addGroup([
+        { mesh: meshA, set },
+        { mesh: meshB, set },
+      ]);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(meshA)).toBe(0);
+      expect(manager.levelOf(meshB)).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('グループ内で共有されたテクスチャの参照カウントが壊れない', () => {
+    // 異なるsetが同じ Texture を使う場合、束縛数ぶん数えて束縛数ぶん戻すことの確認。
+    let now = 0;
+    const manager = new TextureLodManager({ now: () => now, evictDelayMs: 1000 });
+    const shared = dataTexture(8);
+    const sharedSpy = vi.spyOn(shared, 'dispose');
+    const baseA = new MeshStandardMaterial({ name: 'a' });
+    const baseB = new MeshStandardMaterial({ name: 'b' });
+    const setA = createTextureLodSet({
+      material: baseA,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: dataTexture(4) } },
+      ],
+    });
+    const setB = createTextureLodSet({
+      material: baseB,
+      levels: [
+        { distance: 0, textures: { map: shared } },
+        { distance: 10, textures: { map: dataTexture(2) } },
+      ],
+    });
+    const meshA = sceneMesh(baseA);
+    const meshB = sceneMesh(baseB);
+    try {
+      manager.addGroup([
+        { mesh: meshA, set: setA },
+        { mesh: meshB, set: setB },
+      ]);
+      manager.update(cameraAt(5)); // 両方レベル0。shared の refs=2。
+      manager.update(cameraAt(50)); // 両方レベル1。refs=0。
+      now = 5000;
+      manager.update(cameraAt(50));
+      // 2束縛ぶん戻したため破棄は1回だけ。
+      expect(sharedSpy).toHaveBeenCalledTimes(1);
+      // 再使用で復帰する。
+      manager.update(cameraAt(5));
+      expect(manager.stats().residentBytes).toBeCloseTo(bytes(8) + bytes(4) + bytes(2), 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('anchorが見えない間はレベルを保持する', () => {
+    // 判定基準は anchor であり、束縛側の可視性では止まらないことの確認。
+    const a = set3('a');
+    const b = set3('b');
+    const manager = new TextureLodManager();
+    const meshA = sceneMesh(a.base);
+    const meshB = sceneMesh(b.base);
+    const anchor = sceneMesh(a.base);
+    try {
+      manager.addGroup(
+        [
+          { mesh: meshA, set: a.set },
+          { mesh: meshB, set: b.set },
+        ],
+        { anchor },
+      );
+      manager.update(cameraAt(30));
+      expect(manager.levelOf(meshA)).toBe(2);
+      const switches = manager.stats().switchCount;
+      // anchor だけ不可視（束縛は可視のまま）でも判定を飛ばす。
+      anchor.visible = false;
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(meshA)).toBe(2);
+      expect(manager.levelOf(meshB)).toBe(2);
+      expect(meshA.material).toBe(a.set.variant(2));
+      expect(meshB.material).toBe(b.set.variant(2));
+      expect(manager.stats().switchCount).toBe(switches);
+      // 束縛側が不可視でも anchor が可視なら判定する。
+      meshA.visible = false;
+      anchor.visible = true;
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(meshA)).toBe(0);
+      expect(meshA.material).toBe(a.set.variant(0));
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('NaNのanchorがあってもthrowせず、他グループは更新される', () => {
+    // 不正な transform のグループ1件で全LOD更新が止まらないことの確認。
+    const a = set3('a');
+    const b = set3('b');
+    const manager = new TextureLodManager({ distanceMode: 'center' });
+    const badAnchor = sceneMesh(a.base);
+    badAnchor.position.set(Number.NaN, 0, 0);
+    const badMesh = sceneMesh(a.base);
+    const goodMesh = sceneMesh(b.base);
+    try {
+      manager.addGroup([{ mesh: badMesh, set: a.set }], { anchor: badAnchor });
+      manager.add(goodMesh, b.set);
+      expect(() => manager.update(cameraAt(5))).not.toThrow();
+      expect(manager.levelOf(badMesh)).toBeNull();
+      expect(badMesh.material).toBe(a.base);
+      expect(manager.levelOf(goodMesh)).not.toBeNull();
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('具象マテリアル型のセットも束縛として登録できる', () => {
+    // 独自テクスチャスロットを持つセットが `TextureLodBinding<Material>` に載ることの確認。
+    class AtlasMaterial extends MeshStandardMaterial {
+      shadeMultiplyTexture: Texture | null = null;
+    }
+    const base = new AtlasMaterial();
+    base.name = 'atlas';
+    const nearShade = dataTexture(8);
+    const farShade = dataTexture(2);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: dataTexture(8), shadeMultiplyTexture: nearShade } },
+        { distance: 10, textures: { map: dataTexture(4), shadeMultiplyTexture: farShade } },
+      ],
+    });
+    const manager = new TextureLodManager();
+    const mesh = sceneMesh(base);
+    try {
+      manager.addGroup([{ mesh, set }]);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+      expect(mesh.material).toBe(set.variant(0));
+      manager.update(cameraAt(50));
+      expect(manager.levelOf(mesh)).toBe(1);
+      expect(mesh.material).toBe(set.variant(1));
+      expect(set.variant(1).shadeMultiplyTexture).toBe(farShade);
+    } finally {
+      manager.dispose();
+    }
+  });
+});
+
+
+describe('TextureLodManager addGroup の境界', () => {
+  it('共通のテクスチャスロットを持たない Material サブクラスでも型が通り、実行時に切り替わる', () => {
+    class CustomMaterial extends Material {
+      foo: Texture | null = null;
+    }
+    const base = new CustomMaterial();
+    const textures = [dataTexture(8), dataTexture(4)];
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { foo: textures[0] } },
+        { distance: 10, textures: { foo: textures[1] } },
+      ],
+    });
+    const manager = new TextureLodManager();
+    const mesh = new Mesh(new PlaneGeometry(2, 2), base);
+    try {
+      manager.addGroup([{ mesh, set }]);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+      expect((mesh.material as CustomMaterial).foo).toBe(textures[0]);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('同一呼び出し内で同じmeshを2回束縛すると throw し、状態が変わらない', () => {
+    const { set, base } = set3('dup');
+    const mesh = sceneMesh(base);
+    const manager = new TextureLodManager();
+    try {
+      expect(() =>
+        manager.addGroup([
+          { mesh, set },
+          { mesh, set },
+        ]),
+      ).toThrow(Error);
+      expect(manager.stats().objectCount).toBe(0);
+      expect(manager.stats().residentBytes).toBe(0);
+    } finally {
+      manager.dispose();
+    }
+  });
+});
+
+
+describe('TextureLodManager addGroup の Contract 検証', () => {
+  it('levels が空の Contract は addGroup で拒否され、状態が変わらない', () => {
+    const { set, base } = set3('broken');
+    const mesh = sceneMesh(base);
+    const manager = new TextureLodManager();
+    const broken = set as unknown as { levels: unknown[]; thresholds: number[] };
+    const originalLevels = broken.levels;
+    const originalThresholds = broken.thresholds;
+    try {
+      broken.levels = [];
+      broken.thresholds = [];
+      expect(() =>
+        manager.addGroup([
+          { mesh, set: set as unknown as Parameters<TextureLodManager['addGroup']>[0][number]['set'] },
+        ]),
+      ).toThrow(/levels/);
+      expect(manager.stats().objectCount).toBe(0);
+      expect(manager.stats().residentBytes).toBe(0);
+    } finally {
+      broken.levels = originalLevels;
+      broken.thresholds = originalThresholds;
+      manager.dispose();
     }
   });
 });

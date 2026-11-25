@@ -10,13 +10,14 @@
 import type { Camera, Material, Mesh, Object3D, Texture } from 'three';
 
 /**
- * LOD切替の対象になるテクスチャスロット。
+ * LOD切替の対象になる既知のテクスチャスロット。
  *
- * MeshStandardMaterial 系が持つ代表的なマップに限定する。
+ * マテリアル型からスロットを導出できない場合（`Material` 基底型など）のフォールバック。
+ * `MeshStandardMaterial` 系が持つ代表的なマップを並べている。
  * `colorNode` 等で独自に `texture()` を組んでいるマテリアルは自動LOD化の対象外であり、
  * {@link TextureLodSetOptions.createVariant} で個別に対応する。
  */
-export type TextureSlot =
+export type KnownTextureSlot =
   | 'map'
   | 'normalMap'
   | 'roughnessMap'
@@ -26,9 +27,43 @@ export type TextureSlot =
   | 'alphaMap';
 
 /**
- * 1段階分のLOD定義。解像度の異なる別テクスチャの組を表す。
+ * 後方互換のための別名。既知スロット集合と同じである。
  */
-export interface TextureLodLevel {
+export type TextureSlot = KnownTextureSlot;
+
+/**
+ * マテリアル型から導出したテクスチャスロット名。
+ *
+ * `M` のキーのうち、値の型が `Texture | null | undefined` に代入可能なものを抽出する。
+ * プロトタイプ上のアクセサで定義された `NodeMaterial` 系のスロットも型上はキーとして拾える。
+ * 1件もなければ（`Material` 基底型など）既知スロットにフォールバックする。
+ *
+ * @typeParam M - 対象マテリアルの型。`Material` のサブタイプ。
+ */
+export type TextureSlotOf<M extends Material = Material> = [Extract<TextureKeyOf<M>, string>] extends [
+  never,
+]
+  ? KnownTextureSlot
+  : Extract<TextureKeyOf<M>, string>;
+
+/**
+ * テクスチャ値を持つプロパティ名だけを抜き出す中間型。
+ *
+ * ADR: `any` 型のプロパティ（`0 extends (1 & T)` で判定）は除外する。
+ * `any` は条件型の両分岐を通るため、含めると `userData` のような非テクスチャまで
+ * スロット扱いになり、`Material` 基底型でのフォールバックが壊れる。
+ */
+type TextureKeyOf<M extends Material> = {
+  [K in keyof M]: 0 extends 1 & M[K] ? never : M[K] extends Texture | null | undefined ? K : never;
+}[keyof M];
+
+/**
+ * 1段階分のLOD定義。解像度の異なる別テクスチャの組を表す。
+ *
+ * @typeParam M - 対象マテリアルの型。`Material` のサブタイプ。既定は `Material` であり、
+ * その場合は既知スロットと同じになる。
+ */
+export interface TextureLodLevel<M extends Material = Material> {
   /**
    * このレベルに切り替わる距離（カメラからのメートル）。
    *
@@ -40,7 +75,7 @@ export interface TextureLodLevel {
    *
    * 全レベルで同じスロット集合にすること。空集合は不可。
    */
-  readonly textures: Readonly<Partial<Record<TextureSlot, Texture>>>;
+  readonly textures: Readonly<Partial<Record<TextureSlotOf<M>, Texture>>>;
 }
 
 /**
@@ -61,7 +96,7 @@ export interface TextureLodSetOptions<M extends Material> {
   /** 複製元になるマテリアル。生成後に変更されることはない。 */
   readonly material: M;
   /** LODレベル定義。2件以上、先頭の距離は 0、距離は昇順。 */
-  readonly levels: readonly TextureLodLevel[];
+  readonly levels: readonly TextureLodLevel<M>[];
   /**
    * ヒステリシス幅（0以上1未満の比率）。
    *
@@ -84,7 +119,7 @@ export interface TextureLodSetOptions<M extends Material> {
    * {@link TextureLodSet.syncFromBase | syncFromBase} はカスタムノードを `base` の内容で
    * 上書きするため、フック利用時はその呼び出しで独自分が消えることに注意する。
    */
-  readonly createVariant?: (base: M, level: TextureLodLevel, levelIndex: number) => M;
+  readonly createVariant?: (base: M, level: TextureLodLevel<M>, levelIndex: number) => M;
 }
 
 /**
@@ -129,7 +164,7 @@ export interface TextureLodManagerOptions {
  * LODの稼働統計。
  */
 export interface TextureLodStats {
-  /** 登録中のオブジェクト数。 */
+  /** 登録中のグループ数。単一メッシュの `add` ではメッシュ数と一致する。 */
   readonly objectCount: number;
   /** これまでのレベル切替回数（初回の割当を含む）。 */
   readonly switchCount: number;

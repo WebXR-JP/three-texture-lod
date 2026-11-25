@@ -1,0 +1,27 @@
+# pnpm 11 では package.json の pnpm.ignoredBuiltDependencies が無効になったため、
+# ビルドスクリプトの可否をここで明示する。
+# canvas は avatar-optimizer の依存だが、ブラウザ側では使わない（Node専用）。
+allowBuilds:
+  canvas: false
+
+# デモで使う公開直後のパッケージだけ、クールダウンを免除する。
+# スコープ全体のワイルドカードにはせず、lockfileで固定したバージョンに限定する。
+minimumReleaseAgeExclude:
+  - '@webxr-jp/avatar-optimizer@0.5.0'
+  - '@webxr-jp/mtoon-atlas@0.5.1'
+  - '@webxr-jp/texture-compression@0.1.1'
+  - '@pixiv/three-vrm@3.6.0'
+  - '@pixiv/three-vrm-core@3.6.0'
+  - '@pixiv/three-vrm-materials-hdr-emissive-multiplier@3.6.0'
+  - '@pixiv/three-vrm-materials-mtoon@3.6.0'
+  - '@pixiv/three-vrm-materials-v0compat@3.6.0'
+  - '@pixiv/three-vrm-node-constraint@3.6.0'
+  - '@pixiv/three-vrm-springbone@3.6.0'
+  - '@pixiv/types-vrm-0.0@3.6.0'
+  - '@pixiv/types-vrmc-materials-hdr-emissive-multiplier-1.0@3.6.0'
+  - '@pixiv/types-vrmc-materials-mtoon-1.0@3.6.0'
+  - '@pixiv/types-vrmc-node-constraint-1.0@3.6.0'
+  - '@pixiv/types-vrmc-springbone-1.0@3.6.0'
+  - '@pixiv/types-vrmc-springbone-extended-collider-1.0@3.6.0'
+  - '@pixiv/types-vrmc-springbone-limit-1.0@3.6.0'
+  - '@pixiv/types-vrmc-vrm-1.0@3.6.0'

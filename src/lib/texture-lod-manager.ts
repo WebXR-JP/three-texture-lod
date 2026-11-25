@@ -1,5 +1,5 @@
 /**
- * 登録メッシュの毎フレームLOD更新とテクスチャ常駐管理。
+ * 登録グループの毎フレームLOD更新とテクスチャ常駐管理。
  *
  * @packageDocumentation
  */
@@ -12,7 +12,6 @@ import type {
   ResidencyMode,
   TextureLodManagerOptions,
   TextureLodStats,
-  TextureLodLevel,
 } from './types.js';
 
 /**
@@ -22,17 +21,76 @@ import type {
  * 具象マテリアル型ごとに `Map` を分けずに済み、`variant()` の戻りは `Material` として扱える。
  * `TextureLodSet<M>` は `baseMaterial`・`variant()` の共変位置のみで `M` を露出するため、
  * この構造への代入に追加の型主張は要らない。
+ * グループ内の複数セットが具象型をまたいでも（例: 結合メッシュ用と顔用の別型）、
+ * `Material` までの共変で同一グループに載せられる。
  */
-interface ManagedSet {
-  readonly baseMaterial: Material;
-  readonly levels: readonly TextureLodLevel[];
+export interface TextureLodSetContract<M extends Material = Material> {
+  /** 複製元マテリアル。 */
+  readonly baseMaterial: M;
+  /**
+   * レベル定義。グループ内では全セットで境界・段数が一致していること。
+   *
+   * ADR: ここだけ `TextureLodLevel<M>` ではなく文字列キーの構造にしている。
+   * `TextureLodLevel<M>` の `Partial<Record<TextureSlotOf<M>, ...>>` は
+   * 共通キーを持たないカスタム Material では weak type 判定に掛かり、
+   * `addGroup` が型エラーになるためである。実行時の値は set 生成時に検証済み。
+   */
+  readonly levels: readonly {
+    readonly distance: number;
+    readonly textures: Readonly<Partial<Record<string, Texture>>>;
+  }[];
+  /** `levels` から導出した境界配列。 */
   readonly thresholds: readonly number[];
+  /** ヒステリシス幅。グループ内では全セットで一致していること。 */
   readonly hysteresis: number;
-  variant(level: number): Material;
+  /**
+   * レベル番号に対応するマテリアルバリアントを返す。
+   *
+   * @param level - レベル番号。`0 <= level < levels.length`。
+   */
+  variant(level: number): M;
 }
 
-interface ManagedEntry {
-  readonly set: ManagedSet;
+/**
+ * グループ内の1束縛。mesh の material を set のバリアントへ切り替える。
+ *
+ * @typeParam M - セットの対象マテリアル型。既定は `Material` であり、
+ * `TextureLodSet<MToon>` のような具象セットも共変で代入できる。
+ */
+export interface TextureLodBinding<M extends Material = Material> {
+  /** 管理対象メッシュ。 */
+  readonly mesh: Mesh;
+  /** そのメッシュ用のLODセット。 */
+  readonly set: TextureLodSetContract<M>;
+}
+
+/**
+ * グループ登録時の選択肢。
+ */
+export interface TextureLodGroupOptions {
+  /**
+   * 距離計算の基準。
+   *
+   * 省略時は `bindings[0].mesh`。bindings に含まれなくてもよい。
+   */
+  readonly anchor?: Mesh;
+}
+
+/** 内部保持する1束縛。公開の束縛を `Material` までの共変で読み替えたものである。 */
+interface ManagedBinding {
+  readonly mesh: Mesh;
+  readonly set: TextureLodSetContract<Material>;
+}
+
+/** 内部保持する1グループ。レベルはグループ全体で1つだけ持つ。 */
+interface ManagedGroup {
+  /** 距離計算の基準。bindings に含まれなくてもよい。 */
+  readonly anchor: Mesh;
+  readonly bindings: readonly ManagedBinding[];
+  /** 全束縛セットで一致していることが登録時に検証済みの境界。 */
+  readonly thresholds: readonly number[];
+  /** 全束縛セットで一致していることが登録時に検証済みのヒステリシス幅。 */
+  readonly hysteresis: number;
   level: number | null;
 }
 
@@ -56,23 +114,26 @@ interface TrackedTexture {
  * 毎フレーム描画前に {@link TextureLodManager.update} を呼ぶこと。
  * ヒステリシス幅・境界はセット側が保持し（レベル定義とバンドは不可分でset生成時に検証できるため）、
  * マネージャは判定の実行と参照カウントのみを担当する。
+ * 同一距離で連動させる複数メッシュは {@link TextureLodManager.addGroup} で1グループに束ねる。
+ * グループ内では anchor 1件の距離からレベルを1つだけ決め、全束縛に同じレベルを適用する。
  */
 export class TextureLodManager {
   private readonly distanceMode: DistanceMode;
   private readonly residency: ResidencyMode;
   private readonly evictDelayMs: number;
   private readonly now: () => number;
-  private readonly entries = new Map<Mesh, ManagedEntry>();
+  private readonly groups = new Set<ManagedGroup>();
+  private readonly groupOfMesh = new Map<Mesh, ManagedGroup>();
   /** ADR: 異なるsetが同じ Texture オブジェクトを共有しても参照カウントが壊れないよう、追跡は Texture 単位で行う。 */
   private readonly tracked = new Map<Texture, TrackedTexture>();
   /**
-   * setごとの使用メッシュ数。
+   * setごとの使用束縛数。
    *
    * ADR: `remove` 後も追跡が残り続けないよう、set単位の登録数を数える。
-   * 同じsetを使うメッシュが1件でも残る間はテクスチャを追跡し続け、
+   * 同じsetを使う束縛が1件でも残る間はテクスチャを追跡し続け、
    * 0件になったら登録を解除する（テクスチャの破棄はしない）。
    */
-  private readonly setRefs = new Map<ManagedSet, number>();
+  private readonly setRefs = new Map<TextureLodSetContract<Material>, number>();
   private switchCount = 0;
 
   /**
@@ -88,89 +149,165 @@ export class TextureLodManager {
   /**
    * メッシュとセットを登録する。初回 `update` まではマテリアルに触れない。
    *
+   * 単一束縛のグループとして {@link TextureLodManager.addGroup} に委譲する。
+   *
    * @param mesh - 管理対象メッシュ。
    * @param set - そのメッシュ用のLODセット。
    * @throws `Error` — `mesh` が登録済みの場合。
    */
   add<M extends Material>(mesh: Mesh, set: TextureLodSet<M>): void {
-    if (this.entries.has(mesh)) {
-      throw new Error('mesh は既に登録されています');
-    }
-    const at = this.now();
-    const using = this.setRefs.get(set) ?? 0;
-    // ADR: 同じsetの2件目以降は追跡への登録を重ねない。
-    // テクスチャの登録はset単位であり、メッシュ数では増やさないためである。
-    if (using === 0) {
-      this.registerSet(set, at);
-    }
-    this.setRefs.set(set, using + 1);
-    this.entries.set(mesh, { set, level: null });
+    this.addGroup([{ mesh, set }]);
   }
 
   /**
-   * 登録を解除し、`mesh.material` をベースマテリアルに戻す。
+   * 複数の束縛を1グループとして登録する。初回 `update` まではマテリアルに触れない。
    *
-   * @param mesh - 登録済みメッシュ。
+   * グループ内では anchor 1件の距離からレベルを1つだけ決め、全束縛に同じレベルを適用する。
+   * そのため全セットの `thresholds`（長さ・各値）と `hysteresis` が完全一致していること。
+   *
+   * @param bindings - 1件以上の束縛。各 mesh は未登録であること。
+   * @param options - anchor の指定。省略時は `bindings[0].mesh`。
+   * @throws `Error` — `bindings` が空の場合。
+   * @throws `Error` — 1件でも mesh が登録済みの場合。状態を変更する前に投げ、部分登録は残さない。
+   * @throws `Error` — セット間で境界またはヒステリシス幅が違う場合。どちらが違うかを含める。
+   */
+  addGroup(bindings: readonly TextureLodBinding[], options?: TextureLodGroupOptions): void {
+    if (bindings.length === 0) {
+      throw new Error('bindings は1件以上必要です');
+    }
+    // ADR: 部分登録が残ると参照カウントと追跡がずれ、後続の remove で帳尻が合わなくなる。
+    // 変更（setRefs・tracked・groups）の前に全件検証し、失敗時は状態を一切変えない。
+    const seen = new Set<Mesh>();
+    for (const binding of bindings) {
+      if (this.groupOfMesh.has(binding.mesh) || seen.has(binding.mesh)) {
+        throw new Error('mesh は既に登録されています');
+      }
+      seen.add(binding.mesh);
+    }
+    const reference = bindings[0].set;
+    for (const binding of bindings) {
+      if (
+        binding.set.levels.length === 0 ||
+        binding.set.levels.length !== binding.set.thresholds.length
+      ) {
+        throw new Error(
+          `セットの levels と thresholds の件数が不正です: levels=${binding.set.levels.length}, thresholds=${binding.set.thresholds.length}`,
+        );
+      }
+      if (
+        binding.set.thresholds.length !== reference.thresholds.length ||
+        binding.set.thresholds.some((threshold, index) => threshold !== reference.thresholds[index])
+      ) {
+        throw new Error(
+          `グループ内の境界（thresholds）が一致していません: [${reference.thresholds.join(',')}] と [${binding.set.thresholds.join(',')}]`,
+        );
+      }
+      if (binding.set.hysteresis !== reference.hysteresis) {
+        throw new Error(
+          `グループ内の hysteresis が一致していません: ${reference.hysteresis} と ${binding.set.hysteresis}`,
+        );
+      }
+    }
+    const at = this.now();
+    for (const binding of bindings) {
+      const using = this.setRefs.get(binding.set) ?? 0;
+      // ADR: 同じsetの2件目以降は追跡への登録を重ねない。
+      // テクスチャの登録はset単位であり、束縛数では増やさないためである。
+      if (using === 0) {
+        this.registerSet(binding.set, at);
+      }
+      this.setRefs.set(binding.set, using + 1);
+    }
+    const group: ManagedGroup = {
+      anchor: options?.anchor ?? bindings[0].mesh,
+      bindings: bindings.map((binding) => ({ mesh: binding.mesh, set: binding.set })),
+      thresholds: reference.thresholds,
+      hysteresis: reference.hysteresis,
+      level: null,
+    };
+    this.groups.add(group);
+    for (const binding of bindings) {
+      this.groupOfMesh.set(binding.mesh, group);
+    }
+  }
+
+  /**
+   * 登録を解除し、`mesh` が属するグループ全体のマテリアルをベースに戻す。
+   *
+   * グループ単位の解除であり、同じグループの他メッシュも同時に外れる。
+   * 各束縛の参照を解放し、set の登録数を減らす。
+   *
+   * @param mesh - 登録済みメッシュ。属するグループ全体が解除される。
    * @throws `Error` — `mesh` が未登録の場合。
    */
   remove(mesh: Mesh): void {
-    const entry = this.entries.get(mesh);
-    if (entry === undefined) {
+    const group = this.groupOfMesh.get(mesh);
+    if (group === undefined) {
       throw new Error('mesh は登録されていません');
     }
-    if (entry.level !== null) {
-      this.release(entry.set, entry.level, this.now());
+    const at = this.now();
+    if (group.level !== null) {
+      for (const binding of group.bindings) {
+        this.release(binding.set, group.level, at);
+      }
     }
-    mesh.material = entry.set.baseMaterial;
-    this.entries.delete(mesh);
-    // ADR: `release` の後で登録解除する。`registeredBy === 0` で追跡から消すため、
-    // 先に消すと参照カウントの減算先がなくなる。
-    const using = (this.setRefs.get(entry.set) ?? 0) - 1;
-    if (using <= 0) {
-      this.setRefs.delete(entry.set);
-      this.unregisterSet(entry.set);
-    } else {
-      this.setRefs.set(entry.set, using);
+    for (const binding of group.bindings) {
+      binding.mesh.material = binding.set.baseMaterial;
+      this.groupOfMesh.delete(binding.mesh);
+      // ADR: `release` の後で登録解除する。`registeredBy === 0` で追跡から消すため、
+      // 先に消すと参照カウントの減算先がなくなる。
+      const using = (this.setRefs.get(binding.set) ?? 0) - 1;
+      if (using <= 0) {
+        this.setRefs.delete(binding.set);
+        this.unregisterSet(binding.set);
+      } else {
+        this.setRefs.set(binding.set, using);
+      }
     }
+    this.groups.delete(group);
   }
 
   /**
-   * 全登録メッシュのレベル判定を行い、変化があればマテリアルを差し替える。描画前に毎フレーム呼ぶ。
+   * 全グループのレベル判定を行い、変化があればマテリアルを差し替える。描画前に毎フレーム呼ぶ。
    *
    * @param camera - 基準カメラ。
    * @remarks
-   * 判定前に `mesh.updateWorldMatrix(true, false)` と `camera.updateWorldMatrix(true, false)` を呼ぶ。
+   * 判定前に anchor と `camera` の `updateWorldMatrix(true, false)` を呼ぶ。
    * アプリがまだ行列更新していないタイミングで呼ばれても正しくなるための措置である。
-   * `mesh.visible === false` のメッシュは判定を飛ばし、現在のレベルと参照を保持する。
-   * 距離が非有限（`NaN`・無限大）のメッシュも判定を飛ばし、現在のレベルと参照を保持する。
-   * 不正な transform は本来シーン側のバグだが、1オブジェクトのために全LOD更新を止めないための措置である。
+   * anchor の `visible === false` の間は判定を飛ばし、現在のレベルと参照を保持する。
+   * 距離が非有限（`NaN`・無限大）の場合も判定を飛ばし、現在のレベルと参照を保持する。
+   * 不正な transform は本来シーン側のバグだが、1グループのために全LOD更新を止めないための措置である。
    */
   update(camera: Camera): void {
     const at = this.now();
     camera.updateWorldMatrix(true, false);
-    for (const [mesh, entry] of this.entries) {
+    for (const group of this.groups) {
       // ADR: ワールド行列の更新はマネージャ側で行う。
       // アプリの render 呼び出し前に update される保証はなく、古い行列で判定すると
       // 1フレーム遅れではなく誤ったLODに張り付く恐れがあるため、判定の前提として自前で更新する。
-      mesh.updateWorldMatrix(true, false);
-      if (mesh.visible === false) {
+      group.anchor.updateWorldMatrix(true, false);
+      if (group.anchor.visible === false) {
         continue;
       }
-      const distance = computeLodDistance(mesh, camera, this.distanceMode);
-      // ADR: NaN 座標のメッシュ1件で `selectLevel` の RangeError がループ全体を中断し、
-      // 後続メッシュが更新されなくなるのを防ぐため、非有限距離はスキップする。
-      // 不正な transform は本来シーン側のバグだが、1オブジェクトで全LOD更新を止めない。
+      const distance = computeLodDistance(group.anchor, camera, this.distanceMode);
+      // ADR: NaN 座標の anchor 1件で `selectLevel` の RangeError がループ全体を中断し、
+      // 後続グループが更新されなくなるのを防ぐため、非有限距離はスキップする。
+      // 不正な transform は本来シーン側のバグだが、1グループで全LOD更新を止めない。
       if (!Number.isFinite(distance)) {
         continue;
       }
-      const next = selectLevel(entry.level, distance, entry.set.thresholds, entry.set.hysteresis);
-      if (entry.level !== next) {
-        if (entry.level !== null) {
-          this.release(entry.set, entry.level, at);
+      const next = selectLevel(group.level, distance, group.thresholds, group.hysteresis);
+      if (group.level !== next) {
+        if (group.level !== null) {
+          for (const binding of group.bindings) {
+            this.release(binding.set, group.level, at);
+          }
         }
-        this.retain(entry.set, next, at);
-        mesh.material = entry.set.variant(next);
-        entry.level = next;
+        for (const binding of group.bindings) {
+          this.retain(binding.set, next, at);
+          binding.mesh.material = binding.set.variant(next);
+        }
+        group.level = next;
         this.switchCount++;
       }
     }
@@ -180,34 +317,35 @@ export class TextureLodManager {
   }
 
   /**
-   * メッシュの現在レベルを返す。
+   * メッシュの属するグループの現在レベルを返す。
    *
    * @param mesh - 登録済みメッシュ。
    * @returns レベル番号。初回 `update` 前は `null`。
    * @throws `Error` — `mesh` が未登録の場合。
    */
   levelOf(mesh: Mesh): number | null {
-    const entry = this.entries.get(mesh);
-    if (entry === undefined) {
+    const group = this.groupOfMesh.get(mesh);
+    if (group === undefined) {
       throw new Error('mesh は登録されていません');
     }
-    return entry.level;
+    return group.level;
   }
 
   /**
    * 稼働統計を返す。
    *
    * @returns 登録数・切替回数・レベル別台数・常駐推定バイト数。
+   * `objectCount` と `levelCounts` はグループ単位で数える。
    */
   stats(): TextureLodStats {
     let maxLevels = 0;
-    for (const entry of this.entries.values()) {
-      maxLevels = Math.max(maxLevels, entry.set.levels.length);
+    for (const group of this.groups) {
+      maxLevels = Math.max(maxLevels, group.thresholds.length);
     }
     const levelCounts: number[] = new Array<number>(maxLevels).fill(0);
-    for (const entry of this.entries.values()) {
-      if (entry.level !== null) {
-        levelCounts[entry.level]++;
+    for (const group of this.groups) {
+      if (group.level !== null) {
+        levelCounts[group.level]++;
       }
     }
     let residentBytes = 0;
@@ -217,7 +355,7 @@ export class TextureLodManager {
       }
     }
     return {
-      objectCount: this.entries.size,
+      objectCount: this.groups.size,
       switchCount: this.switchCount,
       levelCounts,
       residentBytes,
@@ -227,24 +365,34 @@ export class TextureLodManager {
   /**
    * 全登録を解除し、追跡を消去する。テクスチャは破棄しない。
    *
-   * メッシュのマテリアルはベースに戻す。テクスチャの寿命は利用者が持つ。
+   * 全束縛のマテリアルはベースに戻す。テクスチャの寿命は利用者が持つ。
    */
   dispose(): void {
-    for (const [mesh, entry] of this.entries) {
-      mesh.material = entry.set.baseMaterial;
+    for (const group of this.groups) {
+      for (const binding of group.bindings) {
+        binding.mesh.material = binding.set.baseMaterial;
+      }
     }
-    this.entries.clear();
+    this.groups.clear();
+    this.groupOfMesh.clear();
     this.tracked.clear();
     this.setRefs.clear();
   }
 
   /** レベルのテクスチャ集合を求める（重複除去）。 */
-  private static texturesOf(set: ManagedSet, level: number): Set<Texture> {
-    return new Set<Texture>(Object.values(set.levels[level].textures));
+  private static texturesOf(set: TextureLodSetContract<Material>, level: number): Set<Texture> {
+    const textures = set.levels[level].textures;
+    const result = new Set<Texture>();
+    for (const texture of Object.values(textures)) {
+      if (texture !== undefined) {
+        result.add(texture);
+      }
+    }
+    return result;
   }
 
   /** setの全テクスチャを追跡に登録する（重複除去）。set単位の初回登録時のみ呼ぶ。 */
-  private registerSet(set: ManagedSet, at: number): void {
+  private registerSet(set: TextureLodSetContract<Material>, at: number): void {
     const coarsest = TextureLodManager.texturesOf(set, set.levels.length - 1);
     for (const texture of TextureLodManager.allTexturesOf(set)) {
       // Object.values の要素は Texture であることが set 生成時に検証済み。
@@ -275,7 +423,7 @@ export class TextureLodManager {
    * ADR: テクスチャの寿命は利用者が持つ。`remove` は登録解除にすぎないため、
    * `dispose()` は呼ばない（破棄の判断は `evict` の猶予則に任せる）。
    */
-  private unregisterSet(set: ManagedSet): void {
+  private unregisterSet(set: TextureLodSetContract<Material>): void {
     const coarsest = TextureLodManager.texturesOf(set, set.levels.length - 1);
     for (const texture of TextureLodManager.allTexturesOf(set)) {
       const tracked = this.tracked.get(texture);
@@ -293,18 +441,20 @@ export class TextureLodManager {
   }
 
   /** setの全レベルのテクスチャ集合を求める（重複除去）。 */
-  private static allTexturesOf(set: ManagedSet): Set<Texture> {
+  private static allTexturesOf(set: TextureLodSetContract<Material>): Set<Texture> {
     const all = new Set<Texture>();
     for (const level of set.levels) {
       for (const texture of Object.values(level.textures)) {
-        all.add(texture);
+        if (texture !== undefined) {
+          all.add(texture);
+        }
       }
     }
     return all;
   }
 
   /** 使用開始側の参照カウント操作。破棄済みの再使用は `evicted` を戻すだけにする。 */
-  private retain(set: ManagedSet, level: number, at: number): void {
+  private retain(set: TextureLodSetContract<Material>, level: number, at: number): void {
     for (const texture of TextureLodManager.texturesOf(set, level)) {
       const tracked = this.tracked.get(texture);
       if (tracked === undefined) {
@@ -316,8 +466,8 @@ export class TextureLodManager {
     }
   }
 
-  /** 使用終了側の参照カウント操作。新旧レベルで共有されるテクスチャは差分のみ動かす。 */
-  private release(set: ManagedSet, level: number, at: number): void {
+  /** 使用終了側の参照カウント操作。全束縛を release し、その後 retain する。 */
+  private release(set: TextureLodSetContract<Material>, level: number, at: number): void {
     for (const texture of TextureLodManager.texturesOf(set, level)) {
       const tracked = this.tracked.get(texture);
       if (tracked === undefined) {

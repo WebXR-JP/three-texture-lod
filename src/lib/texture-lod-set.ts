@@ -4,7 +4,7 @@
  * @packageDocumentation
  */
 import type { Material, Texture } from 'three';
-import type { TextureLodLevel, TextureLodSetOptions, TextureSlot } from './types.js';
+import type { TextureLodLevel, TextureLodSetOptions } from './types.js';
 
 /** スカラー比較するテクスチャ設定の一覧（wrapR を除く。r187 の Texture には存在しない）。 */
 const COMPARED_PROPS = [
@@ -41,15 +41,21 @@ function isTexture(value: unknown): value is Texture {
  *
  * ADR: `Material` 基底型には `map` 等のスロットが存在しないため、
  * 値importなしで触れるよう `Record` へ読み替える。`as unknown as` を経由するのは、
- * `Material` と `Record<TextureSlot, unknown>` 間に継承関係がなく直接の `as` が効かないためである。
- * 書き込み対象は検証済みの `TextureSlot` に限定し、任意キーへの書き込みは行わない。
+ * `Material` と `Record<string, unknown>` 間に継承関係がなく直接の `as` が効かないためである。
+ * 書き込み対象は検証済みのスロット名に限定し、任意キーへの書き込みは行わない。
  */
-function slotsOf(material: Material): Partial<Record<TextureSlot, unknown>> {
-  return material as unknown as Partial<Record<TextureSlot, unknown>>;
+function slotsOf(material: Material): Partial<Record<string, unknown>> {
+  return material as unknown as Partial<Record<string, unknown>>;
 }
 
 /** レベル定義を検証し、問題があれば `Error` を投げる。 */
-function validateLevels(levels: readonly TextureLodLevel[], hysteresis: number): void {
+function validateLevels(
+  levels: readonly {
+    readonly distance: number;
+    readonly textures: Readonly<Partial<Record<string, unknown>>>;
+  }[],
+  hysteresis: number,
+): void {
   if (levels.length < 2) {
     throw new Error(`levels は2件以上必要です: ${levels.length}件`);
   }
@@ -150,7 +156,11 @@ function vec2Equals(a: { readonly x: number; readonly y: number }, b: { readonly
  * 目立つうえ、GPU側で別形式の再アップロードが発生し得る。解像度以外の見え方は全レベルで統一するのが原則であり、
  * ずれは設定ミスの可能性が高いため `console.warn` で知らせる（処理は続行する）。
  */
-function warnOnMismatchedSettings(levels: readonly TextureLodLevel[]): void {
+function warnOnMismatchedSettings(
+  levels: readonly {
+    readonly textures: Readonly<Partial<Record<string, Texture>>>;
+  }[],
+): void {
   const slotNames = Object.keys(levels[0].textures);
   const reference = levels[0].textures as Partial<Record<string, Texture>>;
   for (const slot of slotNames) {
@@ -220,13 +230,14 @@ export class TextureLodSet<M extends Material = Material> {
   /** 複製元マテリアル。生成後に変更されることはない。 */
   readonly baseMaterial: M;
   /** レベル定義。 */
-  readonly levels: readonly TextureLodLevel[];
+  readonly levels: readonly TextureLodLevel<M>[];
   /** ヒステリシス幅。レベル定義とバンドは不可分であり、マネージャではなくsetが保持する。 */
   readonly hysteresis: number;
   /** `levels` から導出した境界配列。`thresholds[i]` はレベル `i` の開始距離。 */
   readonly thresholds: readonly number[];
   private readonly variants: M[];
-  private readonly slots: readonly TextureSlot[];
+  /** 実行時のスロット名一覧。`Object.keys` で採取した文字列として保持する。 */
+  private readonly slots: readonly string[];
 
   /**
    * @param options - 生成オプション（検証・バリアント生成を即時に行う）。
@@ -242,7 +253,7 @@ export class TextureLodSet<M extends Material = Material> {
     this.levels = options.levels;
     this.hysteresis = hysteresis;
     this.thresholds = options.levels.map((level) => level.distance);
-    this.slots = Object.keys(options.levels[0].textures) as TextureSlot[];
+    this.slots = Object.keys(options.levels[0].textures);
     // ADR: 未知のスロット名は代入も退避・復元も無言で捨てられ、LODが効いていないことに気づけない。
     // 生成時に存在確認して失敗させる。`in` はプロトタイプも見るため、
     // アクセサで定義された NodeMaterial 系のスロットも通る。
@@ -267,8 +278,14 @@ export class TextureLodSet<M extends Material = Material> {
       }
       const variant = options.material.clone();
       const target = slotsOf(variant);
+      const textures = level.textures as Readonly<Partial<Record<string, Texture>>>;
       for (const slot of this.slots) {
-        target[slot] = level.textures[slot];
+        const texture = textures[slot];
+        // ADR: 検証済みのため `undefined` は来ないはずだが、型上は任意キー読みで
+        // `undefined` になり得る。無言の代入でスロットを壊さないよう弾く。
+        if (texture !== undefined) {
+          target[slot] = texture;
+        }
       }
       const baseName = options.material.name !== '' ? options.material.name : 'material';
       variant.name = `${baseName}#lod${index}`;
@@ -352,7 +369,7 @@ export class TextureLodSet<M extends Material = Material> {
         }
         if (succeeded) {
           for (const prop of lodTextureProps) {
-            if ((this.slots as readonly string[]).includes(prop)) {
+            if (this.slots.includes(prop)) {
               continue;
             }
             let hasBase = false;
@@ -371,7 +388,7 @@ export class TextureLodSet<M extends Material = Material> {
           }
         } else {
           for (const prop of nullTargets) {
-            if ((this.slots as readonly string[]).includes(prop)) {
+            if (this.slots.includes(prop)) {
               continue;
             }
             let current: unknown;

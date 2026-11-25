@@ -3,6 +3,8 @@
 three.js 向けの距離ベース・テクスチャ LOD ライブラリ。カメラ距離に応じて
 マテリアルバリアントを差し替え、遠くのオブジェクトほど低解像度テクスチャで描画する。
 `WebGPURenderer`（WebGPU / WebGL2 フォールバック）で動作する。
+複数メッシュ・複数マテリアルを同じ距離で切り替える `addGroup` と、
+VRMアバターを実行時に最適化してLOD化するデモを含む。
 
 ## 方式
 
@@ -52,6 +54,16 @@ const set = createTextureLodSet({
 const manager = new TextureLodManager({ distanceMode: 'surface', residency: 'evict' });
 manager.add(mesh, set);
 
+// 1つの距離で複数メッシュ・複数マテリアルを連動させる場合（VRMの体+顔+アウトラインなど）。
+// 全セットの距離境界とヒステリシスは一致させること。remove はグループ全体を解除する。
+manager.addGroup(
+  [
+    { mesh: bodyMesh, set: bodySet },
+    { mesh: faceMesh, set: faceSet },
+  ],
+  { anchor: bodyMesh },
+);
+
 // 毎フレーム、描画前に更新する。
 manager.update(camera);
 renderer.render(scene, camera);
@@ -71,9 +83,12 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
 - `createTextureLodSet(options)` / `TextureLodSet` — 1メッシュ分のLOD定義。
   レベルごとにバリアントマテリアルを事前生成する。`variant(level)` で取得、
   `syncFromBase()` で後付けの材質変更を全バリアントへ反映、`dispose()` で破棄。
+  スロット名はマテリアル型の `Texture | null` プロパティから導出するため、
+  MToon の `shadeMultiplyTexture` なども `as` なしで指定できる。
 - `TextureLodManager` — 複数メッシュのレベル判定と常駐管理。
-  `add(mesh, set)` / `remove(mesh)` / `update(camera)` / `levelOf(mesh)` /
-  `stats()` / `dispose()`。
+  `add(mesh, set)` / `addGroup(bindings, { anchor })` / `remove(mesh)` /
+  `update(camera)` / `levelOf(mesh)` / `stats()` / `dispose()`。
+  `addGroup` は複数メッシュを1つの距離で連動させ、統計もグループ単位になる。
 - `selectLevel(previous, distance, thresholds, hysteresis)` — ヒステリシス付き判定の純粋関数。
 - `computeLodDistance(object, camera, mode)` — 中心距離（`center`）または
   バウンディング球表面からの距離（`surface`、0クランプ）を返す。
@@ -122,12 +137,92 @@ stateDiagram-v2
 - カメラのワールド位置だけを使い、FOV・ズーム・正射影は考慮しない。
 - 基準はバウンディング球。`center` は球中心までの距離、`surface` は球面までの距離（0クランプ）。
 
+## VRMデモ
+
+`vrm.html` は、複数のVRMを読み込み、[avatar-optimizer](https://github.com/WebXR-JP/avatar-optimizer) で
+アトラス化・マテリアル統合したうえで、アバター単位でテクスチャLODを適用する実践的なシーン。
+体・顔・アウトラインが複数メッシュ・複数マテリアルに分かれても、1体を1グループとして同じレベルで切り替える。
+
+```mermaid
+flowchart TD
+  A["VRMを classic MToonMaterial で読み込む"] --> B["optimizeModel<br/>アトラス化 + マテリアル統合"]
+  B --> C["MToonAtlasNodeMaterial<br/>1024px アトラス"]
+  C --> D["1/2ずつ縮小<br/>512 / 256 / 128"]
+  D --> E["マテリアルごとに TextureLodSet"]
+  E --> F["体+顔+アウトラインを<br/>addGroup（anchor=体）"]
+  F --> G["距離 3 / 6 / 12m で切替"]
+```
+
+### 起動
+
+```sh
+pnpm install
+pnpm models:fetch   # AvatarSample_A/B/C を public/models/ へ取得（約42MB）
+pnpm dev
+# http://localhost:5173/vrm.html
+```
+
+モデルはリポジトリに含めない。`public/models/` に自分の `.vrm` を置くか、
+デモ画面へドラッグ&ドロップしてもよい（同時に最大4体）。
+サンプルのライセンスは [public/models/README.md](public/models/README.md) を参照。
+
+URLパラメータ: `?models=A,B,C,A`（読み込むモデル）、`?backend=webgl`、
+`?lod=0`（LOD無効）、`?h=0.15`、`?atlas=1024`、`?auto=0`（自動カメラ停止）、
+`?residency=keep-all`、`?evictDelay=1000`。
+
+### 方式
+
+- 読み込みは **classic MToonMaterial**。three r187 では three-vrm の `MToonNodeMaterial` が
+  `transformedNormalView` を要求してバンドルできないため、最適化後の描画だけを
+  `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換える。
+  classic のマテリアルは最適化で全て置き換わるので、WebGPURenderer では描画されない。
+- アトラスは `map` / `shadeMultiplyTexture` / `normalMap` / `emissiveMap` などの
+  使用スロットだけを実サイズで作り、未使用スロットは 8px に落とす。
+- 各スロットを 1/2 ずつ縮小して **1024 → 512 → 256 → 128** の4レベルを作る。
+  色は sRGB をリニアへ戻して平均し、RGB はアルファで重み付け、法線は再正規化する。
+  全レベルにミップマップを付け、切替時のちらつきを抑える。
+- 距離境界は `surface` で **3 / 6 / 12m**、`h=0.15`。初期構図（`?auto=0`）では4体を
+  2.7 / 5.3 / 10.7 / 16.3m に置き、L0 / L1 / L2 / L3 が同時に確認できる。
+- 1体につき最大4マテリアル（opaque / alphaTest / transparent + アウトライン）が
+  同じアトラステクスチャを共有する。`addGroup` で全メッシュを1レベルに同期させることで、
+  顔だけ先に粗くなる逆転と、参照カウントのずれを防ぐ。
+
+### 実測（WebGPU / WebGL2）
+
+4体・1024px アトラスのデモ画面:
+
+| 項目 | 値 |
+| --- | --- |
+| 最適化前 → 後（4体合計） | mesh 409 → 48、material 298 → 16 |
+| アトラス全解像度 | 53.3 MB |
+| LOD有効時の推定常駐（L0/L1/L2/L3 が1体ずつ） | 18.3 MB |
+| 1体スモーク: evict 近景 → 遠景 → 復帰 | 約14 MB → 0.21 MB → 約14 MB |
+| 復帰時の中央領域輝度比 | 1.004〜1.005（`|ratio-1| < 0.1`） |
+| パイプライン（1体、L0↔L3 を複数往復） | caches 12 → 12、fragment 12 → 12 |
+| ヒステリシス（1体） | 12点系列＋上側バンド保持3点が一致、バンド内6往復で切替0、h=0 で10回切替 |
+| 実GPUテクスチャ数（1体、近景→遠景） | 21 → 17（evictで実際に減少） |
+
+### 注意
+
+- **最大4体**。avatar-optimizer はアトラス合成のたびに一時 `WebGLRenderer` を作るため、
+  5体以上で `Too many active WebGL contexts` 警告が出ることを実測した。
+- `matcap` はUV非依存なのでLOD対象外（元テクスチャのまま）。
+- 最粗128pxではアトラスのパディングがないため、隣接するUV島の色が滲む可能性がある。
+  髪やまつげのアルファテストは最粗レベルで目視確認すること。
+- `materialColorBind` / `textureTransformBind` は最適化前のマテリアルを参照するため、
+  最適化後は効かない（LODとは別の既存制約）。
+- アバターの `SkinnedMesh.boundingSphere` はスキニング後の頂点から計算され、
+  実体より大きくずれる（実測 r=2.36、geometry は 0.85）。デモでは距離とカリングを
+  bind pose の geometry 球に固定している。
+- サンプルモデルは CC0 ではない。利用条件は [public/models/README.md](public/models/README.md)。
+
 ## 制限
 
 - 判定はオブジェクト単位。`InstancedMesh` のインスタンス単位LODには非対応
-  （メッシュ全体の球で1レベルに決まる）。
-- 対象スロットは `map` 等の代表的なマップに限定。`colorNode` 等で独自に
-  `texture()` を組んでいるマテリアルは `createVariant` フックで個別対応する。
+  （メッシュ全体の球で1レベルに決まる）。複数メッシュをまとめる場合は `addGroup` を使う。
+- LOD対象スロットはマテリアル型の `Texture | null` プロパティから導出する。
+  `colorNode` 等で独自に `texture()` を組んでいるマテリアルは自動LOD化できないため、
+  `createVariant` フックでレベルごとのノードを組み直す。
 - 圧縮テクスチャの可否はバックエンド依存。レベル間で色空間・フィルタ等の
   設定がずれると警告（`console.warn`）を出す。解像度以外の見え方は統一すること。
 - `residentBytes` は RGBA8・ミップマップ係数 4/3 の推定値であり実測ではない。
@@ -141,9 +236,13 @@ pnpm dev            # 動作確認（ブラウザで開く）
 pnpm build          # デモアプリを dist/demo/ に出力（dist/lib は残る）
 pnpm build:lib      # ライブラリを dist/lib/ に出力（デモは残る）
 pnpm build:all      # デモとライブラリの両方を生成し、dist/ 配下に共存させる
+pnpm models:fetch   # VRMデモ用のサンプルモデルを public/models/ へ取得
 ```
 
-ブラウザで開き、右上の lil-gui と左上の HUD で操作・観測する。
+- 板ポリのLODデモ: `http://localhost:5173/index.html`
+- VRMデモ: `http://localhost:5173/vrm.html`（`pnpm models:fetch` が必要）
+
+板ポリのデモでは、右上の lil-gui と左上の HUD で操作・観測する。
 
 | 操作 | 内容 |
 | --- | --- |
@@ -190,3 +289,22 @@ webgpu / webgl の両バックエンドで以下を検証する。
 `xvfb-run -a pnpm smoke` のように Xvfb 経由で実行する。
 Chrome のパスは `CHROME_PATH` 環境変数で上書きできる
 （既定: `/run/current-system/sw/bin/google-chrome`）。
+
+### VRMデモのスモーク
+
+```sh
+pnpm models:fetch   # 初回のみ
+pnpm build          # public/models を dist/demo へコピー
+pnpm smoke:vrm      # WebGPU / WebGL2 の両方
+```
+
+1体（`?models=A`）を読み込み、最適化前後のメッシュ・マテリアル数、LODセット数、
+アトラス解像度・使用スロット、バリアントの実テクスチャ幅（1024/512/256/128）を確認する。さらに
+ヒステリシス12点の系列とメッシュ間の同期、バンド内往復で切替0、h=0の境界往復、
+L0↔L3 を繰り返した後のパイプライン非増加、
+`evict` の常駐減（実GPUテクスチャ数も確認）と画素輝度の復帰、
+`keep-all` の非減、コンソール/GPU警告0を検証する。
+続けて4体（`?models=A,B,C,A&auto=0`）を読み込み、`objectCount=4`、
+初期レベル `[0,1,2,3]`、アバターごとのメッシュ内レベル同期、読み込み失敗0、
+コンソール/GPU警告0を検証する。
+スクリーンショットは `artifacts/vrm/` に保存する。

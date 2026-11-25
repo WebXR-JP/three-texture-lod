@@ -4,3 +4,6 @@ apm_modules/
 node_modules/
 dist/
 artifacts/
+
+# VRM demo models (fetch with `pnpm models:fetch`)
+public/models/*.vrm

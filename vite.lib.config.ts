@@ -4,6 +4,8 @@ import { defineConfig } from 'vite';
 // デモ（vite.config.ts）とは別物で、three は外部依存のままにする。
 // 成果物は `dist/lib/` に出す。
 export default defineConfig({
+  // ライブラリ配布物にデモ用の public/（VRMモデル等）を含めない。
+  publicDir: false,
   build: {
     lib: {
       entry: 'src/lib/index.ts',

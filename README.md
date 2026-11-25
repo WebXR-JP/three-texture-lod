@@ -231,8 +231,10 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
   配置は先頭4体の固定位置を保ち、5体目以降は中央の視線レーン（`|x| < 3.0` かつ `z > -12`）を
   空けたグリッド（間隔 2.4、最前列 z=-1.0、中央から左右へ）に置く。
   最遠は z=-20.2 付近で、カメラ（z=7.5）から約28m、fog（24〜66）が薄くかかる距離に収まる。
-- ソース上限（最大4）は、最適化時に avatar-optimizer がアトラス合成のたび
-  一時 `WebGLRenderer` を作るため。複製はこの上限と無関係である。
+- ソース上限（最大4）はデモ側の仕様（`?models` の最大4件）であり、
+  最適化のコンテキスト上限ではない。avatar-optimizer 0.6.0 はアトラス合成用に
+  共有のオフスクリーン `WebGLRenderer` を使い回すため、同時コンテキスト数は
+  ソース数・スロット数に比例しない。複製はこの上限と無関係である。
 - 複製は最適化済みシーンの bone を clone するため、VRM の Humanoid / SpringBone /
   ExpressionManager は持たない。rest pose と頭ボーンの揺らしのみで、髪の物理・
   瞬き・表情は静的になる。フル動作が必要なモデルはソースとして読み込む（上限4）。
@@ -259,14 +261,22 @@ URLパラメータ: `?models=A,B,C`（読み込むモデル。ソースは最大
 | 複製時（ソース1 + 複製3、L0/L1/L2/L3 が1体ずつ） | 最適化1回、常駐はソース1体分の約1.33倍 |
 | 既定（3ソース + 複製1） | mesh 319 → 36（rendered 48）、material 272 → 12、atlas 40.0MB、常駐 18.1MB |
 | 上限キャッシュ `?budget=32&evictDelay=5000`（3ソース + 複製1、WebGPU/WebGL とも同値） | 常駐 29.5MB（上限32MB以下、over 0、evict 17）。8MBに締めると常駐 18.1MB・over 10.1MB（= 18.1 - 8）・evict 24、レベル [0,1,2,3] 不変。350ms間隔2回で evict 増加なし。解除で上限なし・over 0。既定行の 18.1MB とは `evictDelay`（1000/5000）の条件が違う |
-| 100体（3ソース + 複製97、Xvfb） | rendered 1200 mesh、常駐 19.8MB（full 40.0MB の0.49倍）、レベル [1,1,11,87]、ringCount 100、警告0。WebGPU・静止時 frame 33.6ms / upd 1.1ms / calls 1046 / pipelines 22、徘徊時 frame 34.8ms / upd 1.1ms / calls 1056。WebGL・静止時 frame 33.4ms / upd 1.0ms / calls 1046、徘徊時 frame 35.2ms / upd 1.1ms / calls 1056。起動（読込開始〜ready）約4.4秒、`setAvatarCount(4)` 26ms・`(100)` 47ms |
+| 100体（3ソース + 複製97、Xvfb） | rendered 1200 mesh、常駐 19.8MB（full 40.0MB の0.49倍）、レベル [1,1,11,87]、ringCount 100、警告0。WebGPU・静止時 frame 34.5ms / upd 1.1ms / calls 1046 / pipelines 22、徘徊時 frame 36.2ms / upd 1.1ms / calls 1056。WebGL・静止時 frame 33.6ms / upd 1.1ms / calls 1046、徘徊時 frame 35.7ms / upd 1.1ms / calls 1056（Xvfb、run間で±1.5ms程度）。起動（読込開始〜ready）約4.4秒、`setAvatarCount(4)` 26ms・`(100)` 47ms |
 
 ### 注意
 
-- **ソースは最大4体、複製込みの総数は最大100体**。avatar-optimizer はアトラス合成のたびに一時 `WebGLRenderer` を作るため、
-  WebGL では4ソースの最適化でもコンテキスト上限に触れて `WebGL Device Lost` になることがある
-  （WebGPUでは4ソースを検証済み）。既定の3ソース + 複製を推奨する。
+- **ソースは最大4体、複製込みの総数は最大100体**。構造面では、avatar-optimizer 0.6.0 は
+  アトラス合成用のオフスクリーン `WebGLRenderer` を1つ共有するため、
+  同時WebGLコンテキスト数はソース数・スロット数に比例しない
+  （0.5.0 以前は合成のたびに一時レンダラーを生成・破棄していた）。
+  実測面では、WebGL の4ソース最適化は smoke で2回連続、警告・Device Lost なしを確認
+  （2026-11-25、Xvfb）。
   複製は最適化を再実行しないため、この上限と無関係である。
+- `?atlas=2048` はVRAM・起動時間・GCが主たる制約になる。
+  合成時の一時 `WebGLRenderTarget` が `map` / `shadeMultiplyTexture` で1枚約16MB
+  （1024なら約4MB）かかり、LOD全レベルの合計は1024の約4倍になる
+  （3ソースで約40MB → 約160〜213MB。40MBは実測、160〜213MBは4倍則からの推定）。
+  2048を使う場合はソース2〜3体を推奨する。コンテキスト数は0.6.0で比例しない。
 - `matcap` はUV非依存なのでLOD対象外（元テクスチャのまま）。
 - 最粗128pxではアトラスのパディングがないため、隣接するUV島の色が滲む可能性がある。
   髪やまつげのアルファテストは最粗レベルで目視確認すること。
@@ -370,8 +380,8 @@ L0↔L3 を繰り返した後のパイプライン非増加、
 読み込み失敗0、コンソール/GPU警告0を検証する。さらに複製（`?models=A&avatars=4&auto=0`）で
 `sourceCount=1` / `cloneCount=3`、最適化回数1、常駐がソース1体分の1.5倍未満、
 raw 頭ボーンの揺れ（SkinnedMesh の skeleton 所属と角度差）、追加/削除、h変更後の再バインドを検証する。
-4ソース（`?models=A,B,C,A&avatars=4&auto=0`）は WebGPU でのみ検証する
-（WebGLは4ソース最適化のコンテキスト上限のためスキップし、既定3ソース+複製で見る）。
+4ソース（`?models=A,B,C,A&avatars=4&auto=0`）は WebGPU / WebGL の両方で検証する
+（avatar-optimizer 0.6.0 の共有レンダラーにより、WebGL でもコンテキスト上限に触れなくなった）。
 続けて100体（`?models=A,B,C&avatars=100&auto=0&wander=0`）を WebGPU / WebGL の両方で検証する:
 100体・3ソース+複製97・`objectCount` 100・`ringCount` 100、先頭4体のレベル `[0,1,2,3]`、
 `levelCounts` 合計100・L3 が80体以上、常駐が全アトラスの1.5倍未満、エラー/GPU警告0。

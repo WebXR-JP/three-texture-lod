@@ -976,8 +976,8 @@ async function main() {
       await sleep(100);
     }
 
-    // 4ソース・複製は最適化時の一時WebGLRendererが多く、直前のページのコンテキストと合わせると
-    // 上限に達することがある。1体・4ソース・複製はそれぞれ新しいChromeで検証する。
+    // 検証ごとに状態を分離するため、1体・既定・複製・4ソース・budget・crowd は
+    // それぞれ新しい Chrome で実行する（0.6.0 の共有レンダラーでコンテキスト数はソース数に比例しない）。
     const launchBrowser = () =>
       chromium.launch({
         executablePath: CHROME_PATH,
@@ -1021,23 +1021,13 @@ async function main() {
         await clonesBrowser.close();
       }
 
-      // 4ソースは最適化時の一時WebGLRendererが36個分になり、WebGLでは
-      // コンテキスト上限に触れて Device Lost することがある（既知の制約）。
-      // 4ソースの最適化・マテリアル統合はWebGPUで検証し、WebGLは既定の3ソース+複製で見る。
+      // 0.6.0 の共有レンダラーにより、WebGL でも4ソースを検証する。
+      const fourBrowser = await launchBrowser();
       let fourSources;
-      if (backend === 'webgpu') {
-        const fourBrowser = await launchBrowser();
-        try {
-          fourSources = await checkFourSources(fourBrowser, backend);
-        } finally {
-          await fourBrowser.close();
-        }
-      } else {
-        fourSources = {
-          backend,
-          ok: true,
-          skipped: '4-source optimization exceeds the WebGL context budget; verified on WebGPU',
-        };
+      try {
+        fourSources = await checkFourSources(fourBrowser, backend);
+      } finally {
+        await fourBrowser.close();
       }
 
       const budgetBrowser = await launchBrowser();

@@ -1,9 +1,31 @@
 {
-  "name": "three-texture-lod",
-  "private": true,
+  "name": "@webxr-jp/three-texture-lod",
   "type": "module",
   "version": "0.2.0",
   "description": "three.js向け距離ベース・テクスチャLOD（マテリアルバリアント切替方式）",
+  "author": "HALBY",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WebXR-JP/three-texture-lod.git"
+  },
+  "homepage": "https://github.com/WebXR-JP/three-texture-lod#readme",
+  "bugs": {
+    "url": "https://github.com/WebXR-JP/three-texture-lod/issues"
+  },
+  "keywords": [
+    "three",
+    "three.js",
+    "webgpu",
+    "webgl",
+    "lod",
+    "texture",
+    "materials",
+    "webxr"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "module": "./dist/lib/three-texture-lod.js",
   "types": "./dist/lib/index.d.ts",
   "exports": {
@@ -22,6 +44,7 @@
     "build": "vite build",
     "build:lib": "vite build --config vite.lib.config.ts && tsc -p tsconfig.build.json",
     "build:all": "pnpm build && pnpm build:lib",
+    "prepack": "pnpm build:lib",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "smoke": "node scripts/smoke.mjs",

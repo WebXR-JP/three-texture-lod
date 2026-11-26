@@ -30,7 +30,7 @@ stateDiagram-v2
 
 ```ts
 import { WebGPURenderer, MeshStandardMaterial } from 'three/webgpu';
-import { createTextureLodSet, TextureLodManager } from 'three-texture-lod';
+import { createTextureLodSet, TextureLodManager } from '@webxr-jp/three-texture-lod';
 
 const renderer = new WebGPURenderer({ canvas, antialias: true });
 await renderer.init();
@@ -66,7 +66,15 @@ manager.update(camera);
 renderer.render(scene, camera);
 ```
 
-このパッケージは npm 公開していない private パッケージのため、利用側では workspace 参照または `file:` 依存で `dist/lib` を参照します。配布物は `pnpm build:lib` で `dist/lib/` に生成できます。
+## インストール
+
+three は peerDependency です。
+
+```sh
+pnpm add @webxr-jp/three-texture-lod three
+```
+
+開発用に配布物を生成する場合は次のコマンドを使います。
 
 ```sh
 pnpm build:lib   # dist/lib/three-texture-lod.js + dist/lib/index.d.ts を生成
@@ -112,7 +120,7 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
 - **ディスク退避**: three はテクスチャを `dispose()` しても `image` の画素配列を JS ヒープに残すため、`'evict'` だけでは VRAM は減ってもメインメモリは減りません。`spillCache` を渡すと、破棄したテクスチャの画素データ（`image.data` が `Uint8Array` のもの）を退避し、メインメモリに残る画素データを GPU 常駐分＋書き込み中の分に抑えます。読み戻しは非同期で行うため、近づいた直後は数フレームほど現在のレベルのまま表示が続きます。退避中のテクスチャは `image.data === null` になるので、マネージャ外で表示する前（LOD を外してベースマテリアルへ戻すなど）は `await spillCache.restoreAll()` で読み戻してください。
 
   ```ts
-  import { TextureSpillCache, openOpfsPixelStore } from 'three-texture-lod';
+  import { TextureSpillCache, openOpfsPixelStore } from '@webxr-jp/three-texture-lod';
 
   const spillCache = new TextureSpillCache(await openOpfsPixelStore());
   const manager = new TextureLodManager({ residency: 'evict', spillCache });
@@ -180,3 +188,7 @@ flowchart TD
 - [docs/measurements.md](docs/measurements.md) — WebGPU / WebGL2 の実測値とベンチマーク記録
 - [public/models/README.md](public/models/README.md) — VRM サンプルモデルの取得元とライセンス条件
 - [AGENTS.md](AGENTS.md) — 開発者・AI エージェント向けの設計・実装ガイドライン
+
+## ライセンス
+
+MIT License（Copyright (c) 2026 HALBY）です。詳細は [LICENSE](LICENSE) を参照してください。

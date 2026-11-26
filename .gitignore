@@ -7,3 +7,6 @@ artifacts/
 
 # VRM demo models (fetch with `pnpm models:fetch`)
 public/models/*.vrm
+
+# OpenCode worktrees (untracked working copies)
+.claude/worktrees/

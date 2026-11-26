@@ -7,8 +7,8 @@ allowBuilds:
 # デモで使う公開直後のパッケージだけ、クールダウンを免除する。
 # スコープ全体のワイルドカードにはせず、lockfileで固定したバージョンに限定する。
 minimumReleaseAgeExclude:
-  - '@webxr-jp/avatar-optimizer@0.6.0 || 0.7.0'
-  - '@webxr-jp/mtoon-atlas@0.5.1 || 0.6.0'
+  - '@webxr-jp/avatar-optimizer@0.6.0 || 0.7.0 || 0.7.1'
+  - '@webxr-jp/mtoon-atlas@0.5.1 || 0.6.0 || 0.6.1'
   - '@webxr-jp/texture-compression@0.1.1'
   - '@pixiv/three-vrm@3.6.0'
   - '@pixiv/three-vrm-core@3.6.0'

@@ -24,11 +24,11 @@ importers:
         specifier: 0.187.0
         version: 0.187.0
       '@webxr-jp/avatar-optimizer':
-        specifier: 0.7.0
-        version: 0.7.0(@gltf-transform/core@4.5.1)(@gltf-transform/extensions@4.5.1)(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)
+        specifier: 0.7.1
+        version: 0.7.1(@gltf-transform/core@4.5.1)(@gltf-transform/extensions@4.5.1)(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)
       '@webxr-jp/mtoon-atlas':
-        specifier: 0.6.0
-        version: 0.6.0(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)
+        specifier: 0.6.1
+        version: 0.6.1(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)
       lil-gui:
         specifier: 0.21.0
         version: 0.21.0
@@ -623,8 +623,8 @@ packages:
   '@vitest/spy@5.1.1':
     resolution: {integrity: sha512-6K8C6alQG1/Yc8/ZI22iJS7JEsxPdVzqtqDq+/xM4Z0mGVykemMVjLhqMy/q6/IHYG3kKD8hKSwRen/ZdyI9vQ==}
 
-  '@webxr-jp/avatar-optimizer@0.7.0':
-    resolution: {integrity: sha512-2TE3SvEZKu1SMrDXg/Agcz53X3tzAedDrtNVw/WKybXXA4w2uS16vHgczfreKdn4viSaGRIKgOfG/mK127Hadw==}
+  '@webxr-jp/avatar-optimizer@0.7.1':
+    resolution: {integrity: sha512-/vpcV0sd3jWyjFbhxebGQxs0xRYVq3FL9qAs1eMBH4rhUhpU1NdydWUKhCG0R9zT+Hb0LGSXulorz5HizHlaIA==}
     peerDependencies:
       '@gltf-transform/core': ^4.0.0
       '@gltf-transform/extensions': ^4.0.0
@@ -632,8 +632,8 @@ packages:
       '@pixiv/three-vrm-materials-mtoon': ^3.4.4
       three: '>=0.181'
 
-  '@webxr-jp/mtoon-atlas@0.6.0':
-    resolution: {integrity: sha512-wjImNuucxeRqk5rbs70XKqrWb2pqjOlclyu6mVlF+ZX2kkQudCa6TCezihQrIiHwJ9OHNEBdiUykn4LZb6alRg==}
+  '@webxr-jp/mtoon-atlas@0.6.1':
+    resolution: {integrity: sha512-g8vpIXdYkEykVNN+hTI9PwNo/kuO2Ok0QUQIN/3n4uAydi+EwKN/cyH4I+h9htzFJEI5hvH/GVxqb/VB1LE9dQ==}
     peerDependencies:
       '@pixiv/three-vrm': ^3.4.4
       '@pixiv/three-vrm-materials-mtoon': ^3.4.4
@@ -2054,7 +2054,7 @@ snapshots:
 
   '@vitest/spy@5.1.1': {}
 
-  '@webxr-jp/avatar-optimizer@0.7.0(@gltf-transform/core@4.5.1)(@gltf-transform/extensions@4.5.1)(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)':
+  '@webxr-jp/avatar-optimizer@0.7.1(@gltf-transform/core@4.5.1)(@gltf-transform/extensions@4.5.1)(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)':
     dependencies:
       '@gltf-transform/core': 4.5.1
       '@gltf-transform/extensions': 4.5.1
@@ -2066,7 +2066,7 @@ snapshots:
       '@pixiv/three-vrm-core': 3.6.0(three@0.187.0)
       '@pixiv/three-vrm-materials-mtoon': 3.6.0(three@0.187.0)
       '@pixiv/three-vrm-node-constraint': 3.6.0(three@0.187.0)
-      '@webxr-jp/mtoon-atlas': 0.6.0(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)
+      '@webxr-jp/mtoon-atlas': 0.6.1(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)
       '@webxr-jp/texture-compression': 0.1.1
       canvas: 3.2.3
       jimp: 1.7.0
@@ -2078,7 +2078,7 @@ snapshots:
       - supports-color
       - texture-compressor
 
-  '@webxr-jp/mtoon-atlas@0.6.0(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)':
+  '@webxr-jp/mtoon-atlas@0.6.1(@pixiv/three-vrm-materials-mtoon@3.6.0(three@0.187.0))(@pixiv/three-vrm@3.6.0(three@0.187.0))(three@0.187.0)':
     dependencies:
       '@pixiv/three-vrm': 3.6.0(three@0.187.0)
       '@pixiv/three-vrm-materials-mtoon': 3.6.0(three@0.187.0)

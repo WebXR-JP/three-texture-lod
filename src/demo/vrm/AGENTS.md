@@ -4,7 +4,7 @@ VRM × テクスチャ LOD デモ（`vrm.html` / `src/demo/vrm/`）の実装仕�
 
 ## 読み込みと最適化
 
-- three r187 では `@pixiv/three-vrm` の `MToonNodeMaterial` がバンドル要件と合わないため、読み込みは classic `MToonMaterial` で行い、`@webxr-jp/avatar-optimizer`（0.7.0）でアトラス化・マテリアル統合したあと `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換えます。
+- three r187 では `@pixiv/three-vrm` の `MToonNodeMaterial` がバンドル要件と合わないため、読み込みは classic `MToonMaterial` で行い、`@webxr-jp/avatar-optimizer`（0.7.1）でアトラス化・マテリアル統合したあと `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換えます。
 - 使用されているスロット（`map`, `shadeMultiplyTexture`, `normalMap`, `emissiveMap` 等）だけを実サイズでアトラス化し、未使用スロットは 8px に落とします。
 - `matcap` は UV 非依存のため LOD 対象外です。また `materialColorBind` / `textureTransformBind` は最適化後のマテリアルには効きません。
 - `?compress=1`（既定 OFF）または GUI の `テクスチャ圧縮(KTX2)` トグルで `optimizeModel` に `textureCompression`（UASTC + `generateMipmaps: true`）を渡し、共有 `KTX2Loader`（three 同梱ローカル transcoder）で `CompressedTexture` へトランスコードします。

@@ -55,6 +55,7 @@ import { LOD_DISTANCES, LOD_TIERS, tierIndexForResolution } from './tiers.js';
 import { createEnvironment, createLevelRings } from './environment.js';
 import { buildSlots } from './layout.js';
 import { createAvatarLabel, type AvatarLabel } from './labels.js';
+import { describeGpu, gpuLabel } from '../gpu.js';
 import {
   WANDER_TUNING,
   applyWander,
@@ -148,6 +149,7 @@ function clampNumber(value: number, min: number, max: number, fallback: number):
 
 const renderer = new WebGPURenderer({ canvas, antialias: true, forceWebGL });
 await renderer.init();
+const gpu = describeGpu(renderer);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = SRGBColorSpace;
@@ -1055,11 +1057,6 @@ function pipelineInfo(): { caches: number; fragmentPrograms: number } {
   };
 }
 
-function backendName(): string {
-  const backend = renderer.backend as unknown as { isWebGPUBackend?: boolean };
-  return backend.isWebGPUBackend === true ? 'webgpu' : 'webgl';
-}
-
 function applyManualLevel(): void {
   if (manualLevel === null) return;
   for (const avatar of avatars) {
@@ -1179,7 +1176,7 @@ function updateHud(): void {
   if (avatars.length > 12) rows.push(`  … +${avatars.length - 12} more`);
 
   hudBodyEl.textContent = [
-    `backend   ${backendName()}`,
+    `backend   ${gpuLabel(gpu)}`,
     `models    src ${sources} / avatars ${avatars.length} (clones ${clones})`,
     `optimize  ${(optimizeMs / 1000).toFixed(1)}s  atlas ${atlasResolution}px${compressTextures ? '  KTX2' : ''}`,
     `meshes    ${before.meshes} → ${after.meshes}  (rendered ${renderedMeshes})`,
@@ -1307,7 +1304,9 @@ const api = {
     const pipeline = pipelineInfo();
     return {
       status,
-      backend: backendName(),
+      backend: gpu.backend,
+      gpuAdapter: gpu.adapter,
+      gpuSoftware: gpu.software,
       frame,
       lodEnabled,
       compressTextures,

@@ -3,6 +3,7 @@
 // 前提: `pnpm build` 済み。`vite preview` を子プロセスで起動し、検証後にkillする。
 // Chrome は headed で起動する（headless では WebGPU の adapter が取れないため）。
 // 表示できない環境では `xvfb-run -a pnpm smoke` のように Xvfb 経由で実行する。
+// Xvfb では WebGPU が SwiftShader になる。`SMOKE_REQUIRE_HW_GPU=1` でソフトウェア描画を失敗扱いにする。
 //
 // 待機は固定sleepに依存せず、`stats().frame` が進むこと＋条件ポーリングで行う。
 // 近景は `setCameraZ(0)` を使う。center モードで距離0のプローブ配置は
@@ -16,6 +17,7 @@ import { PNG } from 'pngjs';
 const PORT = 4174;
 const BASE_URL = `http://localhost:${PORT}/`;
 const CHROME_PATH = process.env.CHROME_PATH ?? '/run/current-system/sw/bin/google-chrome';
+const REQUIRE_HW_GPU = process.env.SMOKE_REQUIRE_HW_GPU === '1';
 const ARTIFACTS_DIR = new URL('../artifacts/', import.meta.url);
 
 /** ポーリング付き待機。predicate が真になるまで待つ。 */
@@ -190,6 +192,12 @@ async function checkBackend(browser, backend) {
     await page.goto(`${BASE_URL}?backend=${backend}&auto=0`, { waitUntil: 'load' });
     await waitFor(page, () => window.__lodDemo?.ready === true, { timeoutMs: 60000 });
     await settle(page, 5);
+
+    const { gpuAdapter, gpuSoftware } = await statsOf(page);
+    checks.gpu = { adapter: gpuAdapter, software: gpuSoftware };
+    if (REQUIRE_HW_GPU && gpuSoftware) {
+      throw new Error(`ソフトウェア実装で描画している: ${gpuAdapter}`);
+    }
 
     // 2.5 基本検証: 近距離で L0 と L2 が混在する。
     await page.evaluate(() => window.__lodDemo.setCameraZ(0));

@@ -6,6 +6,8 @@
 
 - `pnpm smoke` / `pnpm smoke:vrm` は `pnpm build` 済み（`dist/demo/` 生成済み）を前提とし、`vite preview` を子プロセスで起動して検証後に終了します。VRM スモークは `pnpm models:fetch` も必要です。
 - WebGPU の adapter を取得するため、Playwright（`playwright-core`）で **headed Chrome** を起動します。画面がない環境では `xvfb-run -a pnpm smoke` のように Xvfb 経由で実行します。
+- 実 GPU で WebGPU を検証したいときは、Xvfb を使わず実ディスプレイ（X / Wayland セッション）上で実行します。Xvfb では WebGPU が SwiftShader になり、headless では adapter 自体が取れません。
+- 描画に使った GPU は結果 JSON の `gpu`（`adapter` と、ソフトウェア実装なら true になる `software`）に出ます。`SMOKE_REQUIRE_HW_GPU=1` を付けると、ソフトウェア描画のバックエンドを失敗扱いにします。
 - Chrome のパスは環境変数 `CHROME_PATH` で上書きできます（既定: `/run/current-system/sw/bin/google-chrome`）。
 - 待機は固定 sleep に頼らず `stats().frame` の進行と条件ポーリングで行います（群衆徘徊の待ち時間は模擬時間 `stats().elapsed` を基準にします）。
 - 結果は JSON で標準出力し、アサーション失敗時は exit 1 で終了します。スクリーンショットは `artifacts/` および `artifacts/vrm/` に保存します。

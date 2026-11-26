@@ -5,6 +5,7 @@
 // - `pnpm build` 済み（public/models が dist/demo にコピーされる）
 // Chrome は headed で起動する（headless では WebGPU の adapter が取れないため）。
 // 表示できない環境では `xvfb-run -a pnpm smoke:vrm` のように Xvfb 経由で実行する。
+// Xvfb では WebGPU が SwiftShader になる。`SMOKE_REQUIRE_HW_GPU=1` でソフトウェア描画を失敗扱いにする。
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -17,6 +18,7 @@ const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const PORT = 4176;
 const BASE_URL = `http://localhost:${PORT}`;
 const CHROME_PATH = process.env.CHROME_PATH ?? '/run/current-system/sw/bin/google-chrome';
+const REQUIRE_HW_GPU = process.env.SMOKE_REQUIRE_HW_GPU === '1';
 const ARTIFACTS_DIR = resolve(ROOT, 'artifacts/vrm');
 const MODEL_NAMES = ['A', 'B', 'C'];
 const MODEL_PATHS = MODEL_NAMES.map((name) => ({
@@ -1947,6 +1949,12 @@ async function checkBackend(browser, backend) {
     const stats = await statsOf(page);
     result.stats = stats;
     assert(stats.backend === backend, `${backend}: backend が ${stats.backend} になっている`);
+    // 以降の検証も同じ起動フラグの Chrome で行うため、GPU の判定はここで一度だけ行う。
+    result.gpu = { adapter: stats.gpuAdapter, software: stats.gpuSoftware };
+    assert(
+      !(REQUIRE_HW_GPU && stats.gpuSoftware),
+      `${backend}: ソフトウェア実装で描画している: ${stats.gpuAdapter}`,
+    );
     assert(stats.avatars.length === 1, `${backend}: アバター数が ${stats.avatars.length}`);
     assert(stats.manager.objectCount === 1, `${backend}: manager.objectCount が ${stats.manager.objectCount}`);
 

@@ -13,6 +13,7 @@ import {
 import { createTextureLodSet, TextureLodManager } from '../lib/index.js';
 import type { TextureLodSet } from '../lib/index.js';
 import type { DistanceMode, ResidencyMode } from '../lib/index.js';
+import { describeGpu, gpuLabel } from './gpu.js';
 import { createLodTextures } from './textures.js';
 
 /**
@@ -40,6 +41,10 @@ interface LodDemoApi {
     levelCounts: number[];
     residentBytes: number;
     backend: string;
+    /** 描画に使っている GPU の名前（`describeGpu` を参照）。 */
+    gpuAdapter: string;
+    /** ソフトウェア実装で描画しているとき true。 */
+    gpuSoftware: boolean;
     pipelineCaches: number;
     fragmentPrograms: number;
     drawCalls: number;
@@ -120,6 +125,7 @@ if (!(canvas instanceof HTMLCanvasElement)) {
 
 const renderer = new WebGPURenderer({ canvas, antialias: true, forceWebGL });
 await renderer.init();
+const gpu = describeGpu(renderer);
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 
 const scene = new Scene();
@@ -251,12 +257,6 @@ function setProbeDistance(distance: number): void {
   // surface時は半径分だけ余分に離す（computeLodDistance と一致させる）。
   const radius = settings.distanceMode === 'surface' ? probeRadius() : 0;
   camera.position.set(0, CAM_Y, PROBE_POS[2] + distance + radius);
-}
-
-/** バックエンド名。`backend` は公開フィールドだが具象フラグは構造で読む。 */
-function backendName(): string {
-  const backend = renderer.backend as unknown as { isWebGPUBackend?: boolean };
-  return backend.isWebGPUBackend === true ? 'webgpu' : 'webgl';
 }
 
 /**
@@ -439,7 +439,7 @@ function updateHud(): void {
   lastSwitchCount = stats.switchCount;
   const counts = [0, 1, 2].map((i) => `L${i}:${stats.levelCounts[i] ?? 0}`).join(' ');
   hud.textContent =
-    `backend: ${backendName()}\n` +
+    `backend: ${gpuLabel(gpu)}\n` +
     `objects: ${stats.objectCount}  switches: ${stats.switchCount} (${switchesPerSec.toFixed(1)}/s)\n` +
     `levels: ${counts}\n` +
     `resident: ${(stats.residentBytes / 1048576).toFixed(2)} MB\n` +
@@ -460,7 +460,9 @@ window.__lodDemo = {
       switchCount: s.switchCount,
       levelCounts: [...s.levelCounts],
       residentBytes: s.residentBytes,
-      backend: backendName(),
+      backend: gpu.backend,
+      gpuAdapter: gpu.adapter,
+      gpuSoftware: gpu.software,
       pipelineCaches: pipelines.caches,
       fragmentPrograms: pipelines.fragmentPrograms,
       drawCalls: renderer.info.render.calls,

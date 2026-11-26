@@ -3,6 +3,7 @@
  *
  * @packageDocumentation
  */
+import { estimateTextureBytes } from './compressed-texture.js';
 import { computeLodDistance } from './lod-distance.js';
 import { selectLevel } from './select-level.js';
 import {
@@ -710,12 +711,12 @@ export class TextureLodManager {
         if (bytesOf === null) {
           bytesOf = new Map<Texture, number>();
           for (const texture of this.tracked.keys()) {
-            bytesOf.set(texture, estimateBytes(texture));
+            bytesOf.set(texture, estimateTextureBytes(texture));
           }
         }
         let total = 0;
         for (const texture of union) {
-          total += bytesOf.get(texture) ?? estimateBytes(texture);
+          total += bytesOf.get(texture) ?? estimateTextureBytes(texture);
         }
         predictCache.set(key, total);
         return total;
@@ -831,7 +832,7 @@ export class TextureLodManager {
     let pinnedBytes = 0;
     for (const [texture, tracked] of this.tracked) {
       if (!tracked.evicted) {
-        const bytes = estimateBytes(texture);
+        const bytes = estimateTextureBytes(texture);
         residentBytes += bytes;
         // ADR: `release` 後に参照0になったテクスチャも `pins` が残れば常駐のため、
         // 必要量には `refs > 0 || pins > 0` の両方を含める。set の最粗テクスチャは
@@ -1022,7 +1023,7 @@ export class TextureLodManager {
       if (tracked.evicted) {
         continue;
       }
-      const bytes = estimateBytes(texture);
+      const bytes = estimateTextureBytes(texture);
       resident += bytes;
       if (tracked.refs === 0 && tracked.pins === 0 && bytes > 0) {
         candidates.push({ texture, tracked, bytes });
@@ -1041,30 +1042,4 @@ export class TextureLodManager {
       resident -= candidate.bytes;
     }
   }
-}
-
-/**
- * 常駐テクスチャの推定バイト数を求める。
- *
- * RGBA8（1画素4バイト）にミップマップ係数 4/3 を掛けた推定値であり、実測値ではない。
- * 画像を持たないテクスチャは 0 とみなす。
- * `texture.mipmaps` 等の個別ミップは考慮しない（係数 4/3 に折り込み済みの概算とする）。
- */
-function estimateBytes(texture: Texture): number {
-  // ADR: `texture.image` の型は three のバージョンで `any` のため、
-  // `as` ではなく `unknown` 経由の絞り込みで幅・高さだけを安全に読む。
-  // 幅・高さが数値でなければ 0 とみなし、推定値としての性質を保つ。
-  const image: unknown = texture.image;
-  let width = 0;
-  let height = 0;
-  if (typeof image === 'object' && image !== null) {
-    const { width: w, height: h } = image as { width?: unknown; height?: unknown };
-    if (typeof w === 'number' && Number.isFinite(w)) {
-      width = w;
-    }
-    if (typeof h === 'number' && Number.isFinite(h)) {
-      height = h;
-    }
-  }
-  return (width * height * 4 * 4) / 3;
 }

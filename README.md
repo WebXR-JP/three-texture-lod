@@ -85,6 +85,8 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
   ヒステリシス付きレベル判定の純粋関数です。
 - `computeLodDistance(object, camera, mode)`
   カメラのワールド位置からバウンディング球中心（`center`）または球表面（`surface`、0クランプ）までの距離を返します。
+- `isCompressedTexture(value)` / `estimateTextureBytes(texture)` / `sliceCompressedTexture(source, mipOffset)` / `createCompressedTextureMipLevels(source, maxDimensions, options)`
+  スロット単位での `CompressedTexture` 判定、ミップ実バイト合計・非圧縮推定バイト算出、および 2D `CompressedTexture` のミップスライス生成を提供します。
 
 ### マネージャとセットの設定
 
@@ -102,7 +104,7 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
 ### 利用上のポイント
 
 - **最粗レベルの常駐**: `'evict'` でも各セットの最粗レベルはピン留めされ、遠景で描画が欠けません。破棄されたテクスチャが近景で再び使われる際は GPU への再アップロードが走ります。管理外のメッシュと同一 `Texture` を共有する場合は `'keep-all'` を使うか管理対象に含めてください。
-- **容量の判定基準**: `residentBytes` や `requiredBytes` は RGBA8 とミップマップ係数（4/3）に基づく推定値です。予算上限を設定しても現用中と最粗レベルは保護されるため、予算が厳しい場合は超過が残ります（`stats().overBudgetBytes` で確認できます）。
+- **容量の判定基準**: `residentBytes` や `requiredBytes` は非圧縮テクスチャが RGBA8 とミップマップ係数（4/3）に基づく推定値、`CompressedTexture` が `mipmaps[].data.byteLength` の合計実バイト数です（スロット単位で圧縮・非圧縮が混在しても合算されます）。予算上限を設定しても現用中と最粗レベルは保護されるため、予算が厳しい場合は超過が残ります（`stats().overBudgetBytes` で確認できます）。
 - **予算適応の 2 軸制御**: `adaptiveThresholdScale` を有効にすると、必要常駐量（現用＋最粗）が予算内に収まるよう「距離しきい値の縮小」と「Tier 上限の引き上げ（`levelCap: false` で無効化可）」の 2 軸で自動調整します。
 - **非表示オブジェクト**: `visible === false` のグループは更新を飛ばして参照を保持するため、そのテクスチャは破棄対象になりません。
 - **対象外のマテリアルと機能**: 判定はオブジェクト単位で、`InstancedMesh` のインスタンス単位 LOD には対応していません。`colorNode` 等で独自に `texture()` を組む場合は `createVariant` フックでレベルごとのノードを組み立ててください。また、解像度以外のテクスチャ設定（色空間やフィルタなど）はレベル間で揃えてください。
@@ -148,6 +150,7 @@ flowchart TD
 | `?models=A,B,C` | VRM | 読み込むモデルを指定する（最大 4 ソース） |
 | `?avatars=4` | VRM | 総アバター数（1〜100）。不足分は最適化済みモデルの複製で補う |
 | `?atlas=1024` | VRM | アトラス解像度（256〜4096、既定 1024） |
+| `?compress=1` | VRM | KTX2 テクスチャ圧縮を有効化する（既定無効） |
 | `?top=1024` | VRM | 許可する最細の解像度 Tier 上限（4096 / 2048 / 1024 / 512 / 256） |
 | `?budget=32` | VRM | 常駐メモリ上限（MB、`0` で無効） |
 | `?adaptive=0` | VRM | 予算適応による距離スケール・Tier 上限の自動調整を無効にする |

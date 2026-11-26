@@ -4,16 +4,17 @@ VRM × テクスチャ LOD デモ（`vrm.html` / `src/demo/vrm/`）の実装仕�
 
 ## 読み込みと最適化
 
-- three r187 では `@pixiv/three-vrm` の `MToonNodeMaterial` がバンドル要件と合わないため、読み込みは classic `MToonMaterial` で行い、`@webxr-jp/avatar-optimizer` でアトラス化・マテリアル統合したあと `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換えます。
+- three r187 では `@pixiv/three-vrm` の `MToonNodeMaterial` がバンドル要件と合わないため、読み込みは classic `MToonMaterial` で行い、`@webxr-jp/avatar-optimizer`（0.7.0）でアトラス化・マテリアル統合したあと `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換えます。
 - 使用されているスロット（`map`, `shadeMultiplyTexture`, `normalMap`, `emissiveMap` 等）だけを実サイズでアトラス化し、未使用スロットは 8px に落とします。
 - `matcap` は UV 非依存のため LOD 対象外です。また `materialColorBind` / `textureTransformBind` は最適化後のマテリアルには効きません。
+- `?compress=1`（既定 OFF）または GUI の `テクスチャ圧縮(KTX2)` トグルで `optimizeModel` に `textureCompression`（UASTC + `generateMipmaps: true`）を渡し、共有 `KTX2Loader`（three 同梱ローカル transcoder）で `CompressedTexture` へトランスコードします。
 
 ## 絶対解像度 Tier と縮小（`tiers.ts` / `downscale.ts`）
 
 - 5 段階の絶対解像度 Tier `LOD_TIERS = [4096, 2048, 1024, 512, 256]` と距離境界 `LOD_DISTANCES = [0, 3, 6, 12, 24]`（`surface` 距離、`h = 0.15`）を使います。
-- 各テクスチャは整数分割 `divisor = max(1, ceil(maxDim / T))` で縮小し、非 2 冪のソース幅でも長辺が Tier 以下に収まるようにします。ソース解像度が Tier に満たないレベルは最大解像度にクランプし、同一 `Texture` を複数レベルで共有します。
+- `createTierTexturesForSlot` でスロット単位に `isCompressedTexture` を判定し、圧縮スロットは `createCompressedTextureMipLevels` で埋め込みミップチェーンをスライスし、非圧縮スロットは整数分割 `divisor = max(1, ceil(maxDim / T))` で縮小します（非 2 冪のソース幅でも長辺が Tier 以下に収まる）。ソース解像度が Tier に満たないレベルは最大解像度にクランプし、同一 `Texture` を複数レベルで共有します。
 - `?atlas=256` は全 Tier が同一テクスチャになるためデバッグ用途に限定してください。
-- 色スロットは sRGB をリニアに戻してアルファ重み付け平均を取り、法線はベクトル再正規化を行います。全レベルでミップマップ（`LinearMipmapLinearFilter`）を有効化し、設定ずれ警告とちらつきを防ぎます。
+- 非圧縮スロットは色スロットで sRGB→リニア変換とアルファ重み付け平均、法線でベクトル再正規化を行い、全レベルでミップマップ（`LinearMipmapLinearFilter`・`generateMipmaps = true`）を有効化します。圧縮スロットは `generateMipmaps = false` を維持し、埋め込みミップを使います。
 - 最粗 256px ではアトラスのパディングがないため、髪やまつげなどアルファテスト領域で隣接 UV 島の色が滲む場合があります。
 
 ## バウンディング球の固定
@@ -37,6 +38,7 @@ VRM × テクスチャ LOD デモ（`vrm.html` / `src/demo/vrm/`）の実装仕�
 | `?lod=0` | LOD 無効 |
 | `?top=1024` | 手動の Tier 上限（非 Tier 値はその値以下で最大の Tier に丸め、`<= 0` は 256、非数値は無視。`?lod=0`・手動レベル固定時は無効） |
 | `?atlas=1024` | アトラス解像度（`256〜4096`、既定 `1024`） |
+| `?compress=1` | KTX2 テクスチャ圧縮を有効化（既定無効） |
 | `?h=0.15` | ヒステリシス幅（`0〜0.3`） |
 | `?residency=keep-all` | 常駐モード（`evict` / `keep-all`） |
 | `?evictDelay=1000` | `evict` 猶予 ms（`0〜10000`） |

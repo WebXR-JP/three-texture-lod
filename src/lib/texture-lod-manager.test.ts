@@ -6,7 +6,22 @@
  * GPUなしで動くよう three の core クラスのみを使い、時計は注入して時間を操作する。
  */
 import { describe, expect, it, vi } from 'vitest';
-import { DataTexture, Material, Mesh, MeshStandardMaterial, PerspectiveCamera, PlaneGeometry, Texture } from 'three';
+import {
+  CompressedTexture,
+  DataTexture,
+  LinearFilter,
+  LinearMipmapLinearFilter,
+  Material,
+  Mesh,
+  MeshStandardMaterial,
+  PerspectiveCamera,
+  PlaneGeometry,
+  RGBA_BPTC_Format,
+  Texture,
+  UnsignedByteType,
+  type CompressedTextureMipmap,
+} from 'three';
+import { createCompressedTextureMipLevels, estimateTextureBytes } from './compressed-texture.js';
 import { createTextureLodSet } from './texture-lod-set.js';
 import { buildScaleLadder } from './threshold-scale.js';
 import { TextureLodManager } from './texture-lod-manager.js';
@@ -2960,5 +2975,138 @@ describe('TextureLodManager 2軸予算適応（距離スケール＋Tier上限�
           adaptiveThresholdScale: { levelCap: 'yes' as unknown as boolean },
         }),
     ).toThrow(RangeError);
+  });
+});
+
+function compressedTex(size: number): CompressedTexture {
+  const mipmaps: CompressedTextureMipmap[] = [];
+  let s = size;
+  while (true) {
+    const blocks = Math.max(1, Math.ceil(s / 4));
+    mipmaps.push({ data: new Uint8Array(blocks * blocks * 16), width: s, height: s });
+    if (s <= 1) break;
+    s = Math.max(1, Math.floor(s / 2));
+  }
+  const tex = new CompressedTexture(mipmaps, size, size, RGBA_BPTC_Format, UnsignedByteType);
+  tex.minFilter = LinearMipmapLinearFilter;
+  tex.magFilter = LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+describe('TextureLodManager 圧縮テクスチャ・スロット混在', () => {
+  it('圧縮スロットと非圧縮スロットの混在で resident/required/pinnedBytes が正確に集計される', () => {
+    const base = new MeshStandardMaterial({ name: 'mixed' });
+    const comp = compressedTex(64);
+    const compLevels = createCompressedTextureMipLevels(comp, [64, 32, 16]);
+    const normalLevels = [dataTexture(16), dataTexture(8), dataTexture(4)];
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: compLevels[0], normalMap: normalLevels[0] } },
+        { distance: 10, textures: { map: compLevels[1], normalMap: normalLevels[1] } },
+        { distance: 20, textures: { map: compLevels[2], normalMap: normalLevels[2] } },
+      ],
+    });
+    const manager = new TextureLodManager({ distanceMode: 'center', evictDelayMs: 0 });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5)); // L0: compLevels[0] + normalLevels[0]、最粗pin: compLevels[2] + normalLevels[2]
+      const expectedNear =
+        estimateTextureBytes(compLevels[0]) +
+        bytes(16) +
+        estimateTextureBytes(compLevels[2]) +
+        bytes(4);
+      const expectedPinned = estimateTextureBytes(compLevels[2]) + bytes(4);
+      expect(manager.stats().residentBytes).toBeCloseTo(expectedNear, 10);
+      expect(manager.stats().requiredBytes).toBeCloseTo(expectedNear, 10);
+      expect(manager.stats().pinnedBytes).toBeCloseTo(expectedPinned, 10);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('圧縮テクスチャ基準の maxResidentBytes と adaptiveThresholdScale が動作する', () => {
+    let now = 0;
+    const base = new MeshStandardMaterial({ name: 'comp-budget' });
+    const comp = compressedTex(64);
+    const compLevels = createCompressedTextureMipLevels(comp, [64, 32, 16]);
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: compLevels[0] } },
+        { distance: 10, textures: { map: compLevels[1] } },
+        { distance: 20, textures: { map: compLevels[2] } },
+      ],
+    });
+    const l1AndPin = estimateTextureBytes(compLevels[1]) + estimateTextureBytes(compLevels[2]);
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 1_000_000,
+      maxResidentBytes: l1AndPin,
+      adaptiveThresholdScale: true,
+    });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      // L0+L2 では予算超のため L1 へキャップされ、requiredBytes <= budget を満たす。
+      expect(manager.levelOf(mesh)).toBe(1);
+      expect(manager.stats().finestLevel).toBe(1);
+      expect(manager.stats().requiredBytes).toBeLessThanOrEqual(l1AndPin);
+    } finally {
+      manager.dispose();
+    }
+  });
+
+  it('evict で CompressedTexture.dispose が呼ばれ、再使用で復帰する', () => {
+    let now = 0;
+    const base = new MeshStandardMaterial({ name: 'comp-evict' });
+    const comp = compressedTex(32);
+    const compLevels = createCompressedTextureMipLevels(comp, [32, 16, 8]);
+    const spy0 = vi.spyOn(compLevels[0], 'dispose');
+    const spy2 = vi.spyOn(compLevels[2], 'dispose');
+    const set = createTextureLodSet({
+      material: base,
+      levels: [
+        { distance: 0, textures: { map: compLevels[0] } },
+        { distance: 10, textures: { map: compLevels[1] } },
+        { distance: 20, textures: { map: compLevels[2] } },
+      ],
+    });
+    const manager = new TextureLodManager({
+      distanceMode: 'center',
+      now: () => now,
+      evictDelayMs: 500,
+    });
+    const mesh = sceneMesh(base);
+    try {
+      manager.add(mesh, set);
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+
+      now = 1000;
+      manager.update(cameraAt(25)); // L2 に移行、compLevels[0] 解放開始
+      now = 1600;
+      manager.update(cameraAt(25));
+      expect(spy0).toHaveBeenCalledTimes(1);
+      expect(spy2).not.toHaveBeenCalled();
+      expect(manager.stats().evictCount).toBe(2); // L0 と未参照 L1 が破棄される
+
+      // L0 へ復帰すると L0 が再追跡され、以降の更新で再破棄されない。
+      now = 2000;
+      manager.update(cameraAt(5));
+      expect(manager.levelOf(mesh)).toBe(0);
+      expect(manager.stats().residentBytes).toBe(
+        estimateTextureBytes(compLevels[0]) + estimateTextureBytes(compLevels[2]),
+      );
+      now = 3000;
+      manager.update(cameraAt(5));
+      expect(spy0).toHaveBeenCalledTimes(1);
+    } finally {
+      manager.dispose();
+    }
   });
 });

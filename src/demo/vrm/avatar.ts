@@ -7,13 +7,16 @@
  * classic のマテリアルは最適化で全て置き換わるので、WebGPURenderer では描画されない。
  */
 import type { VRM, VRMHumanBoneName } from '@pixiv/three-vrm';
-import { loadVRM, optimizeModel } from '@webxr-jp/avatar-optimizer';
+import { UastcQuality, loadVRM, optimizeModel } from '@webxr-jp/avatar-optimizer';
 import { MToonAtlasNodeMaterial } from '@webxr-jp/mtoon-atlas/nodes';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
 import { Mesh, Quaternion, Vector3, type Material, type Object3D, type Texture } from 'three/webgpu';
 import type { WebGPURenderer } from 'three/webgpu';
 import {
   createTextureLodSet,
+  estimateTextureBytes,
+  isCompressedTexture,
   type TextureLodBinding,
   type TextureLodLevel,
   type TextureLodSet,
@@ -21,10 +24,11 @@ import {
 } from '../../lib/index.js';
 import {
   createDownscaledTexture,
+  createTierTexturesForSlot,
   enableMipmaps,
   type DownsampleKind,
 } from './downscale.js';
-import { LOD_DISTANCES, LOD_TIERS, tierDivisor } from './tiers.js';
+import { LOD_DISTANCES, LOD_TIERS } from './tiers.js';
 
 /** アトラス化される MToon のテクスチャスロット。matcap はUV非依存なので対象外。 */
 const ATLAS_SLOTS = [
@@ -43,6 +47,19 @@ type AtlasSlot = (typeof ATLAS_SLOTS)[number];
 const HEAD_YAW_AXIS = new Vector3(0, 1, 0);
 const headYaw = new Quaternion();
 
+// レンダラー単位で KTX2Loader を 1 つだけ保持し、Worker・WASM の重複生成と警告を防ぐ。
+const ktx2Loaders = new WeakMap<WebGPURenderer, KTX2Loader>();
+
+function getKtx2Loader(renderer: WebGPURenderer): KTX2Loader {
+  let loader = ktx2Loaders.get(renderer);
+  if (!loader) {
+    loader = new KTX2Loader();
+    loader.detectSupport(renderer);
+    ktx2Loaders.set(renderer, loader);
+  }
+  return loader;
+}
+
 /** LODの距離境界（surface距離、メートル）は `tiers.ts` の定義を使う。 */
 export { LOD_DISTANCES };
 
@@ -60,6 +77,7 @@ export interface AvatarStats {
   optimizeMs: number;
   atlasBytes: number;
   usedSlots: AtlasSlot[];
+  compressedSlots: AtlasSlot[];
   atlasResolution: number;
 }
 
@@ -360,6 +378,7 @@ export interface LoadAvatarOptions {
   renderer: WebGPURenderer;
   atlasResolution: number;
   hysteresis: number;
+  compressTextures?: boolean;
   onProgress?: (message: string) => void;
 }
 
@@ -369,14 +388,23 @@ export interface LoadAvatarOptions {
  * `manager.addGroup(bindings, { anchor })` は呼び出し側で行う。
  */
 export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHandle> {
-  const { name, source, renderer, atlasResolution, hysteresis, onProgress } = options;
+  const {
+    name,
+    source,
+    renderer,
+    atlasResolution,
+    hysteresis,
+    compressTextures = false,
+    onProgress,
+  } = options;
   onProgress?.(`${name}: VRMを読み込み中`);
 
+  const ktx2Loader = getKtx2Loader(renderer);
   const loaded = await loadVRM(source, {
     // classic MToonMaterial で読み込む。最適化後に全て MToonAtlasNodeMaterial へ置き換わる。
     // 型は GLSL 版のコンストラクタを要求するため、ここだけ境界としてキャストする。
     mtoonAtlasMaterialType: MToonAtlasNodeMaterial as never,
-    ktx2Renderer: renderer,
+    ktx2Loader,
   });
   if (loaded.isErr()) {
     throw new Error(`${name}: 読み込みに失敗しました: ${JSON.stringify(loaded.error)}`);
@@ -400,11 +428,26 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
     if (!used.has(slot as AtlasSlot)) slotResolutions[slot] = 8;
   }
 
-  onProgress?.(`${name}: アトラス化・マテリアル統合中（${atlasResolution}px）`);
+  onProgress?.(
+    `${name}: アトラス化${compressTextures ? '・KTX2圧縮' : ''}・マテリアル統合中（${atlasResolution}px）`,
+  );
   const started = performance.now();
   const optimized = await optimizeModel(vrm, {
     atlas: { defaultResolution: atlasResolution, slotResolutions },
     atlasMaterialType: MToonAtlasNodeMaterial as never,
+    // ADR: avatar-optimizer 0.7.0 は未指定項目を undefined のまま渡す場合があるため、
+    // LOD 用ミップチェーン生成を含め圧縮パラメータを明示する。
+    ...(compressTextures
+      ? {
+          textureCompression: {
+            quality: UastcQuality.Default,
+            compressionLevel: 3,
+            generateMipmaps: true,
+            supercompression: true,
+          },
+          ktx2Loader,
+        }
+      : {}),
   });
   if (optimized.isErr()) {
     throw new Error(`${name}: 最適化に失敗しました: ${JSON.stringify(optimized.error)}`);
@@ -450,24 +493,30 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
     throw new Error(`${name}: アトラスマテリアルが生成されませんでした`);
   }
 
-  // アトラスは LinearFilter・ミップなしで生成される。全レベルで揃えてミップを有効にする。
+  // 非圧縮アトラスは LinearFilter・ミップなしで生成されるため、全レベルで揃えてミップを有効にする。
+  // 圧縮テクスチャは埋め込みミップを使うため generateMipmaps=false を保ち、実バイト数を集計する。
   const atlasTextures = new Set<Texture>();
+  const compressedSlotSet = new Set<AtlasSlot>();
   for (const material of atlasMaterials) {
     for (const slot of ATLAS_SLOTS) {
       const texture = (material as unknown as Record<string, unknown>)[slot];
-      if (isTexture(texture)) {
-        enableMipmaps(texture);
-        atlasTextures.add(texture);
+      if (!isTexture(texture)) continue;
+      enableMipmaps(texture);
+      atlasTextures.add(texture);
+      if (isCompressedTexture(texture)) {
+        const image = texture.image as { width?: number; height?: number } | undefined;
+        if ((image?.width ?? 0) >= 64 && (image?.height ?? 0) >= 64) {
+          compressedSlotSet.add(slot);
+        }
       }
     }
   }
   let atlasBytes = 0;
   for (const texture of atlasTextures) {
-    const image = texture.image as { width: number; height: number };
-    atlasBytes += (image.width * image.height * 4 * 4) / 3;
+    atlasBytes += estimateTextureBytes(texture);
   }
 
-  // 同じ元テクスチャからは同じ縮小テクスチャを共有する。
+  // 同じ元テクスチャからは同じ縮小・スライステクスチャを共有する。
   const scaledCache = new Map<Texture, Map<number, Texture>>();
   const scaled = (sourceTexture: Texture, divisor: number, kind: DownsampleKind): Texture => {
     let byDivisor = scaledCache.get(sourceTexture);
@@ -481,6 +530,18 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
       byDivisor.set(divisor, texture);
     }
     return texture;
+  };
+  const compressedTierCache = new Map<Texture, readonly Texture[]>();
+  const slotTierTextures = (sourceTexture: Texture, kind: DownsampleKind): readonly Texture[] => {
+    if (isCompressedTexture(sourceTexture)) {
+      let cached = compressedTierCache.get(sourceTexture);
+      if (!cached) {
+        cached = createTierTexturesForSlot(sourceTexture, LOD_TIERS, kind);
+        compressedTierCache.set(sourceTexture, cached);
+      }
+      return cached;
+    }
+    return createTierTexturesForSlot(sourceTexture, LOD_TIERS, kind, scaled);
   };
 
   const buildSets = (
@@ -500,14 +561,12 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
           slot,
           texture,
           kind: kindOf(slot),
-          maxDim: Math.max(image.width ?? 0, image.height ?? 0),
         };
       }).filter(
         (entry): entry is {
           slot: AtlasSlot;
           texture: Texture;
           kind: DownsampleKind;
-          maxDim: number;
         } => entry !== null,
       );
 
@@ -517,18 +576,18 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
         );
       }
 
+      const slotLevels = texturesBySlot.map((entry) => ({
+        slot: entry.slot,
+        textures: slotTierTextures(entry.texture, entry.kind),
+      }));
+
       const levels: TextureLodLevel<MToonAtlasNodeMaterial>[] = LOD_DISTANCES.map(
         (distance, index) => {
-          const tier = LOD_TIERS[index];
           const textures: Partial<
             Record<TextureSlotOf<MToonAtlasNodeMaterial>, Texture>
           > = {};
-          for (const entry of texturesBySlot) {
-            textures[entry.slot] = scaled(
-              entry.texture,
-              tierDivisor(entry.maxDim, tier),
-              entry.kind,
-            );
+          for (const entry of slotLevels) {
+            textures[entry.slot] = entry.textures[index];
           }
           return { distance, textures };
         },
@@ -571,6 +630,7 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
       optimizeMs,
       atlasBytes,
       usedSlots: [...used],
+      compressedSlots: [...compressedSlotSet],
       atlasResolution,
     },
     sets: initialSets,
@@ -680,6 +740,7 @@ export function instantiateAvatar(template: AvatarTemplate, name: string): Avata
       optimizeMs: 0,
       atlasBytes: 0,
       usedSlots: [],
+      compressedSlots: [],
       atlasResolution: template.stats.atlasResolution,
     },
     update(delta: number) {

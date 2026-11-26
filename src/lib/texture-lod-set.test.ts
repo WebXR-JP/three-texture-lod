@@ -5,8 +5,20 @@
  * NodeMaterial 系の回帰テストでは `NodeMaterial.copy` の深いコピー挙動に対する退避手順を確かめる。
  */
 import { describe, expect, it, vi } from 'vitest';
-import { DataTexture, MeshStandardMaterial, SRGBColorSpace, type Texture } from 'three';
+import {
+  CompressedTexture,
+  DataTexture,
+  LinearFilter,
+  LinearMipmapLinearFilter,
+  MeshStandardMaterial,
+  RGBA_BPTC_Format,
+  SRGBColorSpace,
+  UnsignedByteType,
+  type CompressedTextureMipmap,
+  type Texture,
+} from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
+import { createCompressedTextureMipLevels } from './compressed-texture.js';
 import { createTextureLodSet, TextureLodSet } from './texture-lod-set.js';
 import type { TextureLodLevel } from './types.js';
 
@@ -15,6 +27,23 @@ function dataTexture(size: number): DataTexture {
   const texture = new DataTexture(new Uint8Array(size * size * 4), size, size);
   texture.needsUpdate = true;
   return texture;
+}
+
+/** ミップチェーンを持つ正方形 CompressedTexture を作る。 */
+function compressedTexture(size: number): CompressedTexture {
+  const mipmaps: CompressedTextureMipmap[] = [];
+  let s = size;
+  while (true) {
+    const blocks = Math.max(1, Math.ceil(s / 4));
+    mipmaps.push({ data: new Uint8Array(blocks * blocks * 16), width: s, height: s });
+    if (s <= 1) break;
+    s = Math.max(1, Math.floor(s / 2));
+  }
+  const tex = new CompressedTexture(mipmaps, size, size, RGBA_BPTC_Format, UnsignedByteType);
+  tex.minFilter = LinearMipmapLinearFilter;
+  tex.magFilter = LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
 }
 
 function levels3(): { base: MeshStandardMaterial; levels: TextureLodLevel[]; maps: DataTexture[] } {
@@ -423,6 +452,49 @@ describe('TextureLodSet', () => {
     expect(set.variant(0).shadeMultiplyTexture).toBe(nearShade);
     expect(set.variant(1).shadeMultiplyTexture).toBe(farShade);
     expect(set.variant(1).map).toBe(farMap);
+  });
+
+  it('圧縮スロットと非圧縮スロットの混在でも警告なしでバリアント生成・共有・syncFromBaseできる', () => {
+    const base = new MeshStandardNodeMaterial({ name: 'mixed' });
+    const compressedMap = compressedTexture(64);
+    compressedMap.colorSpace = SRGBColorSpace;
+    const mapTiers = createCompressedTextureMipLevels(compressedMap, [256, 128, 64, 32]);
+    const normalHi = dataTexture(32);
+    const normalLow = dataTexture(16);
+    base.map = compressedMap;
+    base.normalMap = normalHi;
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const set = createTextureLodSet({
+        material: base,
+        levels: [
+          { distance: 0, textures: { map: mapTiers[0], normalMap: normalHi } },
+          { distance: 5, textures: { map: mapTiers[1], normalMap: normalHi } },
+          { distance: 10, textures: { map: mapTiers[2], normalMap: normalHi } },
+          { distance: 20, textures: { map: mapTiers[3], normalMap: normalLow } },
+        ],
+      });
+      expect(warnSpy).not.toHaveBeenCalled();
+      // L0-L2 は同じ圧縮テクスチャ・同じ法線のため実体を共有する。
+      expect(set.variant(0)).toBe(set.variant(1));
+      expect(set.variant(1)).toBe(set.variant(2));
+      expect(set.variant(2)).not.toBe(set.variant(3));
+      expect(set.canonicalLevel(2)).toBe(0);
+      expect(set.variant(3).map).toBe(mapTiers[3]);
+      expect(set.variant(3).normalMap).toBe(normalLow);
+
+      // syncFromBase で圧縮テクスチャが上書き・破壊されない。
+      base.color.set(0x336699);
+      set.syncFromBase();
+      expect(set.variant(0).map).toBe(compressedMap);
+      expect(set.variant(3).map).toBe(mapTiers[3]);
+      expect(compressedMap.image).toEqual({ width: 64, height: 64 });
+      expect(mapTiers[3].image).toEqual({ width: 32, height: 32 });
+      expect(set.variant(3).color.getHex()).toBe(0x336699);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });
 

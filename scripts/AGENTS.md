@@ -30,6 +30,7 @@ WebGPU / WebGL2 の両バックエンドで VRM デモを検証します。
 - **100 体群衆**: `objectCount` / `ringCount` 100、L3+L4 が 80 体以上、静止 3 秒のフレーム性能計測、徘徊 ON（模擬時間 7 秒で 9 割移動・home 誤差 0.75 以内・最小間隔 0.4 以上）、徘徊 OFF での home 一致（`1e-6`）、`4 ↔ 100` 体往復後のパイプライン非増加
 - **上限キャッシュと予算適応**: 予算なし（`?evictDelay=10000&adaptive=0`）から動的予算を設定した際のレベル不変キャッシュ掃引、8MB 締めでの `resident === required` 維持と解除、予算適応 `?budget=32` での 2 軸制御（scale＋finestLevel）・2MB 締めでの下限到達・解除後 60 秒以内の復帰と 5 秒静定・世代番号不変の再適用
 - **4096 と Tier 上限**: WebGPU で `?atlas=4096&top=1024`（`topLevel=2`, `finestLevel=2`, map 幅 `[4096,2048,1024,512,256]` 等）と `?atlas=4096&budget=64`（`finestLevel=2`, `scale=1`, 解除 30 秒以内で復帰）、WebGL で軽量 `?atlas=1024&top=1024`
+- **圧縮テクスチャ（`?compress=1`）**: WebGPU / WebGL2 で `compressTextures=true`・`compressedSlots`・全レベル `CompressedTexture`・`map` 幅 `[1024,1024,1024,512,256]` とミップ数 `[11,11,11,10,9]`・`atlasBytes` 削減・L0→L3→L4→L0 での `evict` と輝度復帰・パイプライン非増加・エラーゼロを確認
 
 ## `scripts/fetch-models.mjs`（`pnpm models:fetch`）
 

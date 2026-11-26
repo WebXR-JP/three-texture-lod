@@ -18,7 +18,7 @@
  * - `?h=0.15` ヒステリシス幅
  * - `?atlas=1024` アトラス解像度（256〜4096、既定1024）
  * - `?compress=1` KTX2 テクスチャ圧縮を有効化（既定無効）
- * - `?auto=0` 自動カメラを停止
+ * - `?auto=1` 自動カメラを有効化（既定は WASD 一人称）
  * - `?residency=keep-all` 常駐モード
  * - `?evictDelay=1000` evict の猶予ms
  * - `?budget=32` 常駐上限MB（0で無効、既定0。0〜4096）
@@ -28,7 +28,6 @@
  * - `?hud=0` HUDを折りたたんで起動（`?hud=1` で展開。一時的な上書きで localStorage には保存されない。既定は展開）
  */
 import GUI from 'lil-gui';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   ACESFilmicToneMapping,
   PerspectiveCamera,
@@ -64,6 +63,12 @@ import {
   stepWander,
   type WanderState,
 } from './wander.js';
+import {
+  applyLook,
+  createFirstPersonState,
+  stepFirstPerson,
+  type FirstPersonInput,
+} from './first-person.js';
 
 const canvas = document.getElementById('scene');
 if (!(canvas instanceof HTMLCanvasElement)) {
@@ -81,7 +86,7 @@ let budgetMB = clampNumber(Math.round(Number(params.get('budget') ?? 0)), 0, 409
 let lodEnabled = params.get('lod') !== '0';
 // 退避先を開けない環境（非セキュアコンテキスト等）では退避なしで続ける。
 const spillCache = params.get('spill') === '1' ? await openSpillCache() : null;
-let autoCamera = params.get('auto') !== '0';
+let autoCamera = params.get('auto') === '1';
 let wanderEnabled = params.get('wander') !== '0';
 // 予算適応の距離しきい値スケール。既定で有効（予算0では実質無効。
 // 予算がなくても manager には adaptive を渡し、後から `setMaxResidentBytes` で
@@ -158,21 +163,163 @@ renderer.toneMappingExposure = 1.02;
 
 const scene = new Scene();
 const camera = new PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 150);
+// 一人称では yaw/pitch を直接書くため、オイラー順序を YXZ に固定する。
+camera.rotation.order = 'YXZ';
 camera.position.set(0, 1.55, 7.5);
 camera.lookAt(CAMERA_CENTER);
 
 const environment = createEnvironment(scene);
 
-// ユーザーがドラッグで距離を変えられるようにする。自動カメラ中は無効化する。
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.copy(CAMERA_CENTER);
-controls.enableDamping = true;
-controls.dampingFactor = 0.06;
-controls.enablePan = false;
-controls.minDistance = 1.2;
-controls.maxDistance = 40;
-controls.maxPolarAngle = Math.PI * 0.55;
-controls.update();
+// ---------------------------------------------------------------- 一人称カメラ
+
+/** 一人称の状態。初期位置は従来の構図（0, 7.5）で、向きは初期 lookAt から同期する。 */
+const fpState = createFirstPersonState(0, 7.5);
+
+/**
+ * カメラの姿勢から一人称の状態を同期する。自動カメラとの切替時に呼ぶ。
+ * 位置・向きを引き継ぐため、切替の瞬間に視点が跳ばない。
+ */
+function syncFirstPersonFromCamera(): void {
+  fpState.x = camera.position.x;
+  fpState.y = camera.position.y;
+  fpState.z = camera.position.z;
+  fpState.yaw = camera.rotation.y;
+  fpState.pitch = camera.rotation.x;
+  fpState.vx = 0;
+  fpState.vz = 0;
+}
+
+syncFirstPersonFromCamera();
+
+/** 押下中のキー（`event.code`）。移動とダッシュの判定に使う。 */
+const pressedKeys = new Set<string>();
+/** Pointer Lock 中かどうか。ロック中だけマウス視点を受け付ける。 */
+let pointerLocked = false;
+
+/** 移動キー（WASD + 矢印キー）。押下で自動カメラを解除する対象。 */
+const MOVE_CODES = new Set([
+  'KeyW',
+  'KeyA',
+  'KeyS',
+  'KeyD',
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+]);
+
+/**
+ * 編集可能な要素がイベント対象かを返す。入力欄でのキー操作を
+ * カメラ操作と誤爆させないため、H キーと移動キーの両方で使う。
+ */
+function isEditableTarget(target: EventTarget | null): boolean {
+  const element = target as HTMLElement | null;
+  if (!element) return false;
+  return (
+    element.tagName === 'INPUT' ||
+    element.tagName === 'TEXTAREA' ||
+    element.tagName === 'SELECT' ||
+    element.isContentEditable
+  );
+}
+
+/** 押下状態を全てクリアする。ロック解除時と自動カメラ有効化時に呼ぶ。 */
+function clearPressedKeys(): void {
+  pressedKeys.clear();
+}
+
+/**
+ * 自動カメラの有効・無効を切り替える共通処理。有効化時は Pointer Lock を抜けて
+ * 押下キーをクリアし、無効化時は現在のカメラ姿勢へ状態を同期する。
+ */
+function setAutoCameraEnabled(on: boolean): void {
+  autoCamera = on;
+  guiState.autoCamera = on;
+  if (on) {
+    if (document.pointerLockElement) document.exitPointerLock();
+    clearPressedKeys();
+  } else {
+    syncFirstPersonFromCamera();
+  }
+}
+
+/** 押下中のキーから移動入力を組み立てる。 */
+function readFirstPersonInput(): FirstPersonInput {
+  let forward = 0;
+  let right = 0;
+  if (pressedKeys.has('KeyW') || pressedKeys.has('ArrowUp')) forward += 1;
+  if (pressedKeys.has('KeyS') || pressedKeys.has('ArrowDown')) forward -= 1;
+  if (pressedKeys.has('KeyD') || pressedKeys.has('ArrowRight')) right += 1;
+  if (pressedKeys.has('KeyA') || pressedKeys.has('ArrowLeft')) right -= 1;
+  return {
+    forward,
+    right,
+    sprint: pressedKeys.has('ShiftLeft') || pressedKeys.has('ShiftRight'),
+  };
+}
+
+/** 一人称の状態を進めてカメラへ書き戻す。自動カメラが無効のときだけ呼ぶ。 */
+function updateFirstPerson(delta: number): void {
+  stepFirstPerson(fpState, delta, readFirstPersonInput());
+  camera.position.set(fpState.x, fpState.y, fpState.z);
+  camera.rotation.set(fpState.pitch, fpState.yaw, 0);
+}
+
+// クリックで Pointer Lock に入る。自動カメラ中は先に解除して姿勢を引き継ぐ。
+renderer.domElement.addEventListener('click', () => {
+  if (autoCamera) setAutoCameraEnabled(false);
+  try {
+    const result = renderer.domElement.requestPointerLock() as unknown as
+      | Promise<void>
+      | undefined;
+    if (result !== undefined && typeof result.catch === 'function') {
+      result.catch((error: unknown) => {
+        showToast(`ポインターロックを開始できません: ${String((error as Error)?.message ?? error)}`);
+      });
+    }
+  } catch (error) {
+    showToast(`ポインターロックを開始できません: ${String((error as Error)?.message ?? error)}`);
+  }
+});
+
+document.addEventListener('pointerlockchange', () => {
+  pointerLocked = document.pointerLockElement === renderer.domElement;
+  if (pointerLocked) {
+    // ロック開始時は自動カメラを解除し、マウス操作を一人称へ切り替える。
+    if (autoCamera) setAutoCameraEnabled(false);
+  } else {
+    // ロック解除時は押下状態をクリアし、離れた指のキーが残らないようにする。
+    clearPressedKeys();
+  }
+});
+
+// ロック中だけマウス視点を受け付ける。
+document.addEventListener('mousemove', (event) => {
+  if (!pointerLocked) return;
+  applyLook(fpState, event.movementX, event.movementY);
+});
+
+window.addEventListener('keydown', (event) => {
+  if (isEditableTarget(event.target)) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (MOVE_CODES.has(event.code)) {
+    pressedKeys.add(event.code);
+    // 移動キー押下時は自動カメラを解除し、現在の姿勢から歩き始める。
+    if (autoCamera) setAutoCameraEnabled(false);
+    if (event.code.startsWith('Arrow')) event.preventDefault();
+  } else if (event.code === 'ShiftLeft' || event.code === 'ShiftRight') {
+    pressedKeys.add(event.code);
+  }
+});
+
+window.addEventListener('keyup', (event) => {
+  pressedKeys.delete(event.code);
+});
+
+// フォーカスを失ったら押下状態をクリアし、戻ったときの暴走を防ぐ。
+window.addEventListener('blur', () => {
+  clearPressedKeys();
+});
 
 const errors: string[] = [];
 window.addEventListener('error', (event) => errors.push(String(event.message)));
@@ -588,18 +735,13 @@ function setTopLevel(level: number | null): void {
 // ---------------------------------------------------------------- カメラ
 
 function setCamera(z: number, x = 0, y = 1.55): void {
-  autoCamera = false;
-  guiState.autoCamera = false;
+  setAutoCameraEnabled(false);
   camera.position.set(x, y, z);
-  controls.target.copy(CAMERA_CENTER);
-  controls.update();
+  camera.lookAt(CAMERA_CENTER);
+  syncFirstPersonFromCamera();
 }
 
 function updateAutoCamera(delta: number): void {
-  if (!autoCamera) {
-    controls.update();
-    return;
-  }
   // 前後にゆっくりドリーし、横に少し揺らす。初期構図から大きく外れない範囲にする。
   cameraAngle += delta * 0.24;
   camera.position.set(
@@ -614,8 +756,7 @@ function updateAutoCamera(delta: number): void {
 function setAvatarSurfaceDistance(index: number, distance: number): boolean {
   const avatar = avatars[index];
   if (!avatar) return false;
-  autoCamera = false;
-  guiState.autoCamera = false;
+  setAutoCameraEnabled(false);
   avatar.anchor.updateWorldMatrix(true, false);
   if (!avatar.anchor.geometry.boundingSphere) avatar.anchor.geometry.computeBoundingSphere();
   const sphere = avatar.anchor.geometry.boundingSphere;
@@ -627,8 +768,8 @@ function setAvatarSurfaceDistance(index: number, distance: number): boolean {
   const scaleZ = Math.hypot(e[8], e[9], e[10]);
   const radius = sphere.radius * Math.max(scaleX, scaleY, scaleZ);
   camera.position.set(center.x, center.y + radius * 0.15, center.z + radius + distance);
-  controls.target.copy(center);
-  controls.update();
+  camera.lookAt(center);
+  syncFirstPersonFromCamera();
   return true;
 }
 
@@ -695,16 +836,7 @@ window.addEventListener('keydown', (event) => {
   if (event.repeat) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   if (event.key !== 'h' && event.key !== 'H') return;
-  const target = event.target as HTMLElement | null;
-  if (
-    target &&
-    (target.tagName === 'INPUT' ||
-      target.tagName === 'TEXTAREA' ||
-      target.tagName === 'SELECT' ||
-      target.isContentEditable)
-  ) {
-    return;
-  }
+  if (isEditableTarget(event.target)) return;
   setHudCollapsed(!hudCollapsed);
 });
 // 起動時の適用は保存しない。`?hud` は次回以降の既定を変えない一時的な上書き。
@@ -916,17 +1048,6 @@ function applyBudgetToManager(): void {
   }
 }
 
-// 自動カメラ中でもドラッグ開始で自動を止め、ユーザー操作を優先する。
-controls.addEventListener('start', () => {
-  if (autoCamera) {
-    autoCamera = false;
-    guiState.autoCamera = false;
-    // 自動カメラ中は controls.update() を呼んでいないため、内部状態を現在のカメラへ同期する。
-    controls.target.copy(CAMERA_CENTER);
-    controls.update();
-  }
-});
-
 const gui = new GUI({ title: 'Texture LOD' });
 gui.add(guiState, 'lod').name('LOD有効').onChange((value: boolean) => {
   setLodEnabled(value);
@@ -1006,13 +1127,7 @@ function updateBudgetController(): void {
   thresholdScaleController.disable();
 }
 updateBudgetController();
-gui.add(guiState, 'autoCamera').name('自動カメラ').onChange((value: boolean) => {
-  autoCamera = value;
-  if (!value) {
-    controls.target.copy(CAMERA_CENTER);
-    controls.update();
-  }
-}).listen();
+gui.add(guiState, 'autoCamera').name('自動カメラ').onChange(setAutoCameraEnabled).listen();
 gui
   .add(guiState, 'forceLevel', ['auto', '0', '1', '2', '3', '4'])
   .name('レベル固定')
@@ -1248,7 +1363,8 @@ function animate(now: number): void {
       if (wanderEnabled) stepWander(walkers[index], delta);
       applyWander(walkers[index], avatar.root, baseYaws[index]);
     }
-    updateAutoCamera(delta);
+    if (autoCamera) updateAutoCamera(delta);
+    else updateFirstPerson(delta);
 
     if (manualLevel !== null) applyManualLevel();
     else if (lodEnabled && !restoringSpill) manager.update(camera);
@@ -1366,12 +1482,7 @@ const api = {
   },
   setCamera,
   setAutoCamera(on: boolean) {
-    autoCamera = on;
-    guiState.autoCamera = on;
-    if (!on) {
-      controls.target.copy(CAMERA_CENTER);
-      controls.update();
-    }
+    setAutoCameraEnabled(on);
   },
   setAvatarSurfaceDistance,
   setHudCollapsed: (collapsed: boolean): boolean => {
@@ -1490,12 +1601,7 @@ const api = {
       setLodEnabled(lodEnabled);
     }
     if (partial.autoCamera !== undefined) {
-      autoCamera = partial.autoCamera;
-      guiState.autoCamera = autoCamera;
-      if (!autoCamera) {
-        controls.target.copy(CAMERA_CENTER);
-        controls.update();
-      }
+      setAutoCameraEnabled(partial.autoCamera);
     }
     if (partial.wander !== undefined) {
       setWanderEnabled(partial.wander);

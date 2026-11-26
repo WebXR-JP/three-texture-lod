@@ -48,7 +48,26 @@ type CompressedTextureConstructor = new (
   colorSpace?: string,
 ) => CompressedTexture;
 
-/** `mipmaps` 配列の `data.byteLength` を合算する。 */
+/** 退避中ミップスタブの元バイト長。`estimateTextureBytes` が退避中も実バイト数を維持するために使う。 */
+const spilledMipBytes = new WeakMap<object, number>();
+
+/**
+ * 退避中ミップスタブに元の実バイト長を記録する（ライブラリ内部用）。
+ *
+ * ADR: `TextureLodManager` の予算適応 `predict()` は破棄・退避済みテクスチャにも
+ * `estimateTextureBytes` を呼び出して必要常駐量を計算する。退避中に `data` を外した
+ * `CompressedTexture` が `0` を返すと予測が壊れて予算適応が振動するため、スタブへ実バイト数を残す。
+ *
+ * @param stub - `mipmaps` 配列へ差し替える退避用スタブオブジェクト。
+ * @param byteLength - 元の `mip.data.byteLength`。
+ */
+export function recordSpilledMipBytes(stub: object, byteLength: number): void {
+  if (Number.isFinite(byteLength) && byteLength > 0) {
+    spilledMipBytes.set(stub, byteLength);
+  }
+}
+
+/** `mipmaps` 配列の `data.byteLength`（退避中は記録済みバイト長）を合算する。 */
 function sumMipmapBytes(mipmaps: unknown): number {
   if (!Array.isArray(mipmaps)) {
     return 0;
@@ -59,12 +78,16 @@ function sumMipmapBytes(mipmaps: unknown): number {
       continue;
     }
     const data = (mip as { data?: unknown }).data;
-    if (typeof data !== 'object' || data === null) {
-      continue;
+    if (typeof data === 'object' && data !== null) {
+      const byteLength = (data as { byteLength?: unknown }).byteLength;
+      if (typeof byteLength === 'number' && Number.isFinite(byteLength) && byteLength > 0) {
+        total += byteLength;
+        continue;
+      }
     }
-    const byteLength = (data as { byteLength?: unknown }).byteLength;
-    if (typeof byteLength === 'number' && Number.isFinite(byteLength) && byteLength > 0) {
-      total += byteLength;
+    const spilled = spilledMipBytes.get(mip);
+    if (spilled !== undefined) {
+      total += spilled;
     }
   }
   return total;

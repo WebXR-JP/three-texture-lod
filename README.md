@@ -117,7 +117,7 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
 - **最粗レベルの常駐**: `'evict'` でも各セットの最粗レベルはピン留めされ、遠景で描画が欠けません。破棄されたテクスチャが近景で再び使われる際は GPU への再アップロードが走ります。管理外のメッシュと同一 `Texture` を共有する場合は `'keep-all'` を使うか管理対象に含めてください。
 - **容量の判定基準**: `residentBytes` や `requiredBytes` は非圧縮テクスチャが RGBA8 とミップマップ係数（4/3）に基づく推定値、`CompressedTexture` が `mipmaps[].data.byteLength` の合計実バイト数です（スロット単位で圧縮・非圧縮が混在しても合算されます）。予算上限を設定しても現用中と最粗レベルは保護されるため、予算が厳しい場合は超過が残ります（`stats().overBudgetBytes` で確認できます）。
 - **予算適応の 2 軸制御**: `adaptiveThresholdScale` を有効にすると、必要常駐量（現用＋最粗）が予算内に収まるよう「距離しきい値の縮小」と「Tier 上限の引き上げ（`levelCap: false` で無効化可）」の 2 軸で自動調整します。
-- **ディスク退避**: three はテクスチャを `dispose()` しても `image` の画素配列を JS ヒープに残すため、`'evict'` だけでは VRAM は減ってもメインメモリは減りません。`spillCache` を渡すと、破棄したテクスチャの画素データ（`image.data` が `Uint8Array` のもの）を退避し、メインメモリに残る画素データを GPU 常駐分＋書き込み中の分に抑えます。読み戻しは非同期で行うため、近づいた直後は数フレームほど現在のレベルのまま表示が続きます。退避中のテクスチャは `image.data === null` になるので、マネージャ外で表示する前（LOD を外してベースマテリアルへ戻すなど）は `await spillCache.restoreAll()` で読み戻してください。
+- **ディスク退避**: three はテクスチャを `dispose()` しても `image` や `mipmaps` のデータを JS ヒープに残すため、`'evict'` だけでは VRAM は減ってもメインメモリは減りません。`spillCache` を渡すと、破棄したテクスチャのデータ（`DataTexture` の各種 TypedArray・ミップ配列付き、KTX2 等の `CompressedTexture` 2D/Array/Cube、`ImageBitmap` / `HTMLImageElement` / `HTMLCanvasElement` / `OffscreenCanvas` / `ImageData`）を退避し、メインメモリに残るデータを GPU 常駐分＋書き込み中の分に抑えます。読み戻しは非同期で行うため、近づいた直後は数フレームほど現在のレベルのまま表示が続きます。退避中のテクスチャは表示用データが外れているため、マネージャ外で表示する前（LOD を外してベースマテリアルへ戻すなど）は `await spillCache.restoreAll()` で読み戻してください。
 
   ```ts
   import { TextureSpillCache, openOpfsPixelStore } from '@webxr-jp/three-texture-lod';
@@ -181,7 +181,7 @@ flowchart TD
 
 ### 高解像度アトラスの目安
 
-`?atlas=2048` や `?atlas=4096` では、VRAM だけでなく縮小元の `DataTexture` 配列も JS ヒープに残るためメモリ消費が大きくなります。`4096` を試す場合はソース 1 体（または `?budget=256` などの予算指定と併用）、`2048` はソース 2〜3 体での利用をおすすめします。`?spill=1` を併用すると、使っていないレベルの画素配列が JS ヒープから外れます。
+`?atlas=2048` や `?atlas=4096` では、VRAM だけでなく縮小元の `DataTexture` 配列や `?compress=1` 時の圧縮ミップ列もメインメモリに残るためメモリ消費が大きくなります。`4096` を試す場合はソース 1 体（または `?budget=256` などの予算指定と併用）、`2048` はソース 2〜3 体での利用をおすすめします。`?spill=1` を併用すると、使っていないレベルの配列や圧縮ミップデータがメインメモリから外れます。
 
 ## 関連ドキュメント
 

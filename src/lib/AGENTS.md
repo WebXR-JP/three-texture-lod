@@ -37,7 +37,11 @@
 - **退避の契機**: マネージャは `spillCache` 指定時、`evict` で `dispose()` したテクスチャの画素データを退避します。読み戻したまま未参照・非ピンで終わった分は、次の掃引で猶予を待たずに再退避します（書き込み済みならストアへは書き直しません）。
 - **表示前の読み戻し待ち**: レベル切替は、そのレベルの全束縛・全スロットの画素データが揃ってから行います。揃うまでは現在のレベル（初回は最粗レベル）を保ち、上限（`cap`）より細かいまま待つ場合があります。待機中のテクスチャは同じ `update()` の掃引で再退避しません。
 - **状態の単位と寿命**: 退避状態は `texture.source` 単位でキャッシュが持ち、マネージャの作り直しをまたいで引き継ぎます。新しいマネージャは退避中のテクスチャを破棄済み（`residentBytes` 対象外）として登録します。
-- **対象と契約**: 退避対象は `image.data` が `ArrayBuffer` 上の `Uint8Array` の画像だけで、画素を `mipmaps` に持つ圧縮テクスチャはメモリに残します。画素内容は登録後に変わらないものとして扱います。書き込みに失敗した画像は以後退避せず、読み戻しに失敗した画像は準備済みにならないまま `failureCount` に数えます。
+- **対象と契約**: 退避対象は次のとおり（画素・圧縮内容は登録後に変わらないものとして扱う）。
+  - `DataTexture` 等の TypedArray 画像（`Uint8Array`・`Float32Array`・`Uint16Array` 等、`SharedArrayBuffer` 除く）
+  - `CompressedTexture`（2D / Array / Cube）およびミップ配列を持つ `DataTexture`（KTX2 生データ等）。`sliceCompressedTexture` による共有ミップオブジェクトは書き換えず、`mipmaps` 配列をスタブ配列（`recordSpilledMipBytes` で元の実バイト長を保持）へ差し替えることで共有先レベルを壊さず `estimateTextureBytes` を維持する
+  - `ImageBitmap`・`HTMLImageElement`・`HTMLCanvasElement`・`OffscreenCanvas`・`ImageData` を持つ通常 `Texture` / `CanvasTexture`（退避中は `source.data = { width, height }` として `estimateTextureBytes` を維持し、`ImageBitmap.close()` は `spilled` 確定時にのみ呼ぶ。`HTMLImageElement` が `complete === false` の間は保留し、復元時は `ImageBitmap` 化せずキャンバスで戻す）
+  - レンダーターゲット・深度・動画・`HTMLTexture`・非圧縮 `CubeTexture`・未対応形式は退避しない。抽出や書き込みに失敗した画像は以後退避せず、読み戻しに失敗した画像は準備済みにならないまま `failureCount` に数える。
 - **OPFS ストア**: `openOpfsPixelStore` はページごとのセッションディレクトリを Web Locks のロックで示し、開くときにロックのないディレクトリ（閉じたページの残り）を削除します。
 
 ## テスト

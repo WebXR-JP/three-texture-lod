@@ -1,9 +1,10 @@
 /**
- * GPU から外したテクスチャの画素データをメインメモリから外部ストアへ退避する。
+ * GPU から外したテクスチャの画素・圧縮データをメインメモリから外部ストアへ退避する。
  *
  * @packageDocumentation
  */
 import type { Texture } from 'three';
+import { createSpillAdapter, type SpillAdapter } from './texture-spill-adapters.js';
 
 /**
  * 退避先の永続ストア。キーごとにバイト列を1件保持する。
@@ -35,26 +36,26 @@ export interface TexturePixelStore {
 export interface TextureSpillStats {
   /** 画素データがメインメモリになく、ストアにだけある画像の数（読み戻し中を含む）。 */
   readonly spilledCount: number;
-  /** `spilledCount` に数えた画像の画素データ実バイト数の合計。 */
+  /** `spilledCount` に数えた画像の画素・圧縮データ実バイト数の合計。 */
   readonly spilledBytes: number;
   /** ストアから読み戻し中の画像の数。 */
   readonly restoringCount: number;
-  /** 書き込み・読み出しが失敗した累計回数。 */
+  /** 書き込み・読み出し・変換が失敗した累計回数。 */
   readonly failureCount: number;
 }
 
 /**
  * 画像1件の退避状態。
  *
- * - `resident`: 画素データがテクスチャ上にある。
- * - `detached`: テクスチャからは外したが、書き込み完了まで `data` を手元に持つ。
- * - `spilled`: 画素データはストアにだけある。
+ * - `resident`: データがテクスチャ上にある。
+ * - `detached`: テクスチャからは外したが、書き込み完了まで復元用スナップショットを手元に持つ。
+ * - `spilled`: データはストアにだけある。
  * - `reading`: ストアから読み戻し中。`done` は読み戻しの成否が確定したときに解決する。
- * - `lost`: 読み戻しに失敗し、画素データを復元できない。
+ * - `lost`: 読み戻しに失敗し、データを復元できない。
  */
 type SpillPhase =
   | { readonly kind: 'resident' }
-  | { readonly kind: 'detached'; readonly data: Uint8Array<ArrayBuffer> }
+  | { readonly kind: 'detached'; readonly snapshot: unknown }
   | { readonly kind: 'spilled' }
   | { readonly kind: 'reading'; readonly done: Promise<void> }
   | { readonly kind: 'lost' };
@@ -62,38 +63,34 @@ type SpillPhase =
 /** 画像1件分の追跡情報。 */
 interface SpillEntry {
   readonly key: string;
-  /** 退避対象の画像オブジェクト（`texture.source.data`）。`data` プロパティだけを差し替える。 */
-  readonly image: PixelImage;
-  readonly byteLength: number;
+  readonly adapter: SpillAdapter;
   phase: SpillPhase;
   /** ストアに現在の内容が書き込み済みなら `true`。再退避で書き直さないために使う。 */
   persisted: boolean;
   /** 書き込みが進行中なら `true`。 */
   writing: boolean;
-  /** 書き込みに失敗した画像は以後退避しない。 */
+  /** 抽出や書き込みに失敗した画像・外部で別形式に差し替えられた画像は以後退避しない。 */
   spillable: boolean;
 }
 
-/** `DataTexture` 形式の画像。`data` が `null` の間は退避中を表す。 */
-interface PixelImage {
-  data: Uint8Array<ArrayBuffer> | null;
-  readonly width: number;
-  readonly height: number;
-}
-
 /**
- * テクスチャ画素データのディスク退避キャッシュ。
+ * テクスチャデータのディスク退避キャッシュ。
  *
- * GPU から破棄済みのテクスチャについて、`image.data`（`Uint8Array`）をストアへ書き出して
+ * GPU から破棄済みのテクスチャについて、CPU 側の画素・圧縮データをストアへ書き出して
  * メインメモリから外し、必要になったら非同期に読み戻す。退避と読み戻しは画像
  * （`texture.source`）単位で行うため、`Source` を共有するテクスチャ間でも状態は1つである。
  *
- * 対象は `image.data` が `Uint8Array` の画像（`DataTexture` 等）に限る。
- * `HTMLCanvasElement`・`ImageBitmap` 等の画像は退避せず、常に準備済みとして扱う。
+ * 対応するテクスチャ形式は次のとおり。
+ * - `DataTexture` 等の TypedArray 画像（`Uint8Array`・`Float32Array`・`Uint16Array` 等、`SharedArrayBuffer` 除く）
+ * - `CompressedTexture`（2D / Array / Cube）およびミップ配列を持つ `DataTexture`
+ * - `ImageBitmap`・`HTMLImageElement`・`HTMLCanvasElement`・`OffscreenCanvas`・`ImageData` を持つ `Texture`
+ *
+ * レンダーターゲット・深度・動画・`HTMLTexture`・非圧縮 `CubeTexture`・未対応形式は退避せず、
+ * 常に準備済みとして扱う。読み込み未完了の `HTMLImageElement` は完了後に再判定する。
  * 画素内容は登録後に変わらないものとして扱い、一度書き込んだ内容は再退避時に書き直さない。
  *
  * @remarks
- * 退避中のテクスチャは `image.data === null` になり、描画に使うと three がアップロードに失敗する。
+ * 退避中のテクスチャは表示用実体を外しているため、そのまま描画すると正しく表示できない。
  * {@link TextureLodManager} に渡すとマネージャが表示前の読み戻しを待つが、
  * マネージャ外でテクスチャを表示する前（LOD 無効化でベースマテリアルへ戻す場合など）は
  * {@link TextureSpillCache.restoreAll} の完了を待つこと。
@@ -115,41 +112,49 @@ export class TextureSpillCache {
   }
 
   /**
-   * テクスチャの画素データを退避する。
+   * テクスチャのデータを退避する。
    *
    * 書き込み済みの画像はただちにメインメモリから外す。未書き込みの画像は書き込みを始め、
    * 完了した時点で外す。対象外の画像・読み戻し中・退避済みの場合は何もしない。
    *
    * @param texture - GPU から破棄済みで、どの描画にも使われていないテクスチャ。
    * @remarks
-   * 書き込みに失敗した場合は画素データをテクスチャへ戻し、その画像は以後退避しない。
+   * 書き込みに失敗した場合はデータをテクスチャへ戻し、その画像は以後退避しない。
+   * 画素抽出に失敗した場合（CORS 汚染など）も元画像を壊さず、以後退避しない。
    */
   spill(texture: Texture): void {
     const entry = this.entryOf(texture);
-    if (entry === null || entry.phase.kind !== 'resident' || !entry.spillable) {
+    if (entry === null) {
       return;
     }
-    const data = entry.image.data;
-    // ADR: 登録時に `Uint8Array` を確認済みだが、利用者が `image.data` を別の長さの配列へ
-    // 差し替えた場合は書き込み済みの内容と食い違うため、以後は退避しない。
-    // 同じ長さでの内容の書き換えは検出しない（画素内容は不変という契約に委ねる）。
-    if (!(data instanceof Uint8Array) || data.byteLength !== entry.byteLength) {
+    entry.adapter.trackTexture?.(texture, entry.phase.kind !== 'resident');
+    if (entry.phase.kind !== 'resident' || !entry.spillable) {
+      return;
+    }
+    const needBytes = !entry.persisted && !entry.writing;
+    const detached = entry.adapter.detach(needBytes);
+    if (detached.status === 'invalid') {
       entry.spillable = false;
       return;
     }
-    entry.image.data = null;
+    if (detached.status === 'error') {
+      entry.spillable = false;
+      this.failureCount++;
+      return;
+    }
     if (entry.persisted) {
+      entry.adapter.releaseSnapshot?.(detached.snapshot);
       entry.phase = { kind: 'spilled' };
       return;
     }
-    entry.phase = { kind: 'detached', data };
-    if (!entry.writing) {
-      this.write(entry, data);
+    entry.phase = { kind: 'detached', snapshot: detached.snapshot };
+    if (!entry.writing && detached.bytes !== undefined) {
+      this.write(entry, detached.bytes);
     }
   }
 
   /**
-   * テクスチャの画素データがメインメモリ上にあるかを返す。
+   * テクスチャのデータがメインメモリ上にあるかを返す。
    *
    * @returns 退避対象外の画像、または一度も退避していない画像では常に `true`。
    */
@@ -159,7 +164,7 @@ export class TextureSpillCache {
   }
 
   /**
-   * テクスチャの画素データの読み戻しを始める。
+   * テクスチャのデータの読み戻しを始める。
    *
    * 書き込み中で手元にデータがある場合はその場で戻し、呼び出し直後から {@link isReady} が `true` になる。
    * ストアにだけある場合は読み出しを始め、完了後に `true` になる。
@@ -168,6 +173,7 @@ export class TextureSpillCache {
   request(texture: Texture): void {
     const entry = this.entries.get(texture.source);
     if (entry !== undefined) {
+      entry.adapter.trackTexture?.(texture, entry.phase.kind !== 'resident');
       this.restore(entry);
     }
   }
@@ -175,7 +181,7 @@ export class TextureSpillCache {
   /**
    * 退避中の全画像を読み戻す。
    *
-   * @returns 全画像の画素データがメインメモリへ戻ったときに解決する。
+   * @returns 全画像のデータがメインメモリへ戻ったときに解決する。
    * 読み戻せない画像が1件でもあれば `Error` で拒否する（他の画像の読み戻しは完了している）。
    */
   async restoreAll(): Promise<void> {
@@ -207,7 +213,7 @@ export class TextureSpillCache {
       const kind = entry.phase.kind;
       if (kind === 'spilled' || kind === 'reading') {
         spilledCount++;
-        spilledBytes += entry.byteLength;
+        spilledBytes += entry.adapter.byteLength;
       }
       if (kind === 'reading') {
         restoringCount++;
@@ -216,7 +222,7 @@ export class TextureSpillCache {
     return { spilledCount, spilledBytes, restoringCount, failureCount: this.failureCount };
   }
 
-  /** 追跡情報を返す。初回は画像形式を検査して作り、対象外なら `null` を返す。 */
+  /** 追跡情報を返す。初回は画像形式を検査して作り、対象外または一時保留なら `null` を返す。 */
   private entryOf(texture: Texture): SpillEntry | null {
     const source = texture.source;
     const existing = this.entries.get(source);
@@ -226,15 +232,17 @@ export class TextureSpillCache {
     if (this.unsupported.has(source)) {
       return null;
     }
-    const pixels = pixelImageOf(source.data);
-    if (pixels === null) {
+    const resolved = createSpillAdapter(texture);
+    if (resolved.kind === 'unsupported') {
       this.unsupported.add(source);
+      return null;
+    }
+    if (resolved.kind === 'defer') {
       return null;
     }
     const entry: SpillEntry = {
       key: source.uuid,
-      image: pixels.image,
-      byteLength: pixels.byteLength,
+      adapter: resolved.adapter,
       phase: { kind: 'resident' },
       persisted: false,
       writing: false,
@@ -244,7 +252,7 @@ export class TextureSpillCache {
     return entry;
   }
 
-  /** 書き込みを始める。完了時に `detached` のままなら画素データを手放す。 */
+  /** 書き込みを始める。完了時に `detached` のままならスナップショットを解放する。 */
   private write(entry: SpillEntry, data: Uint8Array<ArrayBuffer>): void {
     entry.writing = true;
     this.store.write(entry.key, data).then(
@@ -252,6 +260,7 @@ export class TextureSpillCache {
         entry.writing = false;
         entry.persisted = true;
         if (entry.phase.kind === 'detached') {
+          entry.adapter.releaseSnapshot?.(entry.phase.snapshot);
           entry.phase = { kind: 'spilled' };
         }
       },
@@ -260,7 +269,7 @@ export class TextureSpillCache {
         entry.spillable = false;
         this.failureCount++;
         if (entry.phase.kind === 'detached') {
-          entry.image.data = entry.phase.data;
+          entry.adapter.reattach(entry.phase.snapshot);
           entry.phase = { kind: 'resident' };
         }
       },
@@ -271,63 +280,28 @@ export class TextureSpillCache {
   private restore(entry: SpillEntry): void {
     const phase = entry.phase;
     if (phase.kind === 'detached') {
-      entry.image.data = phase.data;
+      entry.adapter.reattach(phase.snapshot);
       entry.phase = { kind: 'resident' };
       return;
     }
     if (phase.kind !== 'spilled') {
       return;
     }
-    const done = this.store.read(entry.key).then(
-      (buffer) => {
-        // ADR: 長さの一致だけを確かめる。ストアの契約上は内容も一致するため、
-        // ハッシュ照合までは行わない（読み戻しのたびに全画素を走査する負荷を避ける）。
-        if (buffer.byteLength !== entry.byteLength) {
+    const done = (async () => {
+      try {
+        const buffer = await this.store.read(entry.key);
+        const restored = await entry.adapter.restore(buffer);
+        if (!restored) {
           this.failureCount++;
           entry.phase = { kind: 'lost' };
           return;
         }
-        entry.image.data = new Uint8Array(buffer);
         entry.phase = { kind: 'resident' };
-      },
-      () => {
+      } catch {
         this.failureCount++;
         entry.phase = { kind: 'lost' };
-      },
-    );
+      }
+    })();
     entry.phase = { kind: 'reading', done };
   }
-}
-
-/**
- * 画像が退避対象の形式なら、画素データを差し替えられる形で返す。
- *
- * `{ data: Uint8Array, width: number, height: number }` を満たし、`data` が
- * `SharedArrayBuffer` を参照しないものだけを対象とする。
- *
- * @returns 画像オブジェクトそのものと画素データのバイト数。対象外なら `null`。
- */
-function pixelImageOf(image: unknown): { image: PixelImage; byteLength: number } | null {
-  if (
-    typeof image !== 'object' ||
-    image === null ||
-    !('data' in image) ||
-    !('width' in image) ||
-    !('height' in image)
-  ) {
-    return null;
-  }
-  const { data, width, height } = image;
-  if (
-    !(data instanceof Uint8Array) ||
-    !(data.buffer instanceof ArrayBuffer) ||
-    typeof width !== 'number' ||
-    typeof height !== 'number'
-  ) {
-    return null;
-  }
-  // ADR: `data` を書き換えるため元の画像オブジェクトをそのまま使う。
-  // 直前の検査で `data`・`width`・`height` の型と `data.buffer` が `ArrayBuffer` であることを
-  // 確認済みであり、`PixelImage` として扱える（`buffer` の検査は型引数の絞り込みに反映されない）。
-  return { image: image as PixelImage, byteLength: data.byteLength };
 }

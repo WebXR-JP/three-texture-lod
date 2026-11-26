@@ -27,13 +27,21 @@ WebGPU / WebGL2 の両バックエンドで板ポリデモを検証します。
 
 WebGPU / WebGL2 の両バックエンドで VRM デモを検証します。
 
-- **1 体詳細**: 最適化前後のメッシュ・マテリアル数、使用スロット、実テクスチャ幅（`[1024, 1024, 1024, 512, 256]`）、ヒステリシス 16 点＋上側バンド保持 4 点＋バンド内 0 切替＋`h=0` 対照＋`forceLevel` 3/4＋メッシュ間同期、L0↔L4 往復後のパイプライン非増加、`evict` 常駐減（20m/30m、30m では実 GPU テクスチャ数減少も確認）と輝度復帰、`keep-all` 非減
+- **1 体詳細**: 最適化前後のメッシュ・マテリアル数、使用スロット、実テクスチャ幅（`[1024, 1024, 1024, 512, 256]`）、ヒステリシス 16 点＋上側バンド保持 4 点＋バンド内 0 切替＋`h=0` 対照＋`forceLevel` 3/4＋メッシュ間同期、L0↔L4 往復後のパイプライン非増加、`evict` 常駐減（20m/30m、30m では実 GPU テクスチャ数減少も確認）と輝度復帰、`keep-all` 非減、クローズアップ有効時（20m）のレベル・draw calls 不変
 - **既定（3 ソース + 複製 1） / 複製（1 ソース + 複製 3） / 4 ソース**: `sourceCount` / `cloneCount`、初期レベル `[0,1,2,3]`、最適化回数、常駐倍率、複製頭ボーンの揺れ、追加/削除・`h` 変更後の再バインド、WebGL での 4 ソースコンテキスト無警告
 - **100 体群衆**: `objectCount` / `ringCount` 100、L3+L4 が 80 体以上、静止 3 秒のフレーム性能計測、徘徊 ON（模擬時間 7 秒で 9 割移動・home 誤差 0.75 以内・最小間隔 0.4 以上）、徘徊 OFF での home 一致（`1e-6`）、`4 ↔ 100` 体往復後のパイプライン非増加
 - **上限キャッシュと予算適応**: 予算なし（`?evictDelay=10000&adaptive=0`）から動的予算を設定した際のレベル不変キャッシュ掃引、8MB 締めでの `resident === required` 維持と解除、予算適応 `?budget=32` での 2 軸制御（scale＋finestLevel）・2MB 締めでの下限到達・解除後 60 秒以内の復帰と 5 秒静定・世代番号不変の再適用
 - **ディスク退避**（`?spill=1&evictDelay=0`、1 体）: 遠景（20m）で `spilledBytes > 0`、近景へ戻ると読み戻し後に L0 へ復帰し輝度比 `< 0.1`、退避中の手動 L0 固定・LOD 無効でも輝度比 `< 0.1`・コンソールエラー 0・`failureCount === 0`
 - **4096 と Tier 上限**: WebGPU で `?atlas=4096&top=1024`（`topLevel=2`, `finestLevel=2`, map 幅 `[4096,2048,1024,512,256]` 等）と `?atlas=4096&budget=64`（`finestLevel=2`, `scale=1`, 解除 30 秒以内で復帰）、WebGL で軽量 `?atlas=1024&top=1024`
 - **圧縮テクスチャ（`?compress=1`）**: WebGPU / WebGL2 で `compressTextures=true`・`compressedSlots`・全レベル `CompressedTexture`・`map` 幅 `[1024,1024,1024,512,256]` とミップ数 `[11,11,11,10,9]`・`atlasBytes` 削減・L0→L3→L4→L0 での `evict` と輝度復帰・パイプライン非増加・エラーゼロを確認
+
+## `scripts/record-vrm-video.mjs`（`pnpm record:vrm`）
+
+VRM デモで、メモリ予算に応じて選択 LOD が変わる様子を紹介動画（`artifacts/video/vrm-budget-lod.mp4`）として録画します。
+
+- 前提はスモークと同じく `pnpm models:fetch` と `pnpm build` 済みであること。加えて ffmpeg が必要で、PATH にないときは `FFMPEG_PATH` で指定するか `nix shell nixpkgs#ffmpeg -c pnpm record:vrm` で実行します。
+- 実 GPU の出るディスプレイ上で実行してください。ソフトウェア描画だと録画せずに失敗します。
+- 予算の推移とキャプションはスクリプト先頭の `SCRIPT` で決めています。テクスチャの粗さはデモのクローズアップ（`?closeup=1` で B の上半身）で見せるので、カメラ位置（`CAMERA`）や体数を変えたら、A・B が小窓やパネルに隠れないか静止画で確かめてください。
 
 ## `scripts/fetch-models.mjs`（`pnpm models:fetch`）
 

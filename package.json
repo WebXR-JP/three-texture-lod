@@ -26,7 +26,8 @@
     "test": "vitest run",
     "smoke": "node scripts/smoke.mjs",
     "models:fetch": "node scripts/fetch-models.mjs",
-    "smoke:vrm": "node scripts/smoke-vrm.mjs"
+    "smoke:vrm": "node scripts/smoke-vrm.mjs",
+    "record:vrm": "node scripts/record-vrm-video.mjs"
   },
   "peerDependencies": {
     "three": ">=0.187.0"

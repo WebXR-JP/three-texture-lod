@@ -9,7 +9,7 @@
 | [src/lib/AGENTS.md](src/lib/AGENTS.md) | LOD ライブラリ本体 | three 依存方針、バリアント共有、常駐管理と予算適応の不変条件 |
 | [src/demo/AGENTS.md](src/demo/AGENTS.md) | デモ共通・板ポリデモ | デモビルド構成、板ポリデモ仕様、`window.__lodDemo` |
 | [src/demo/vrm/AGENTS.md](src/demo/vrm/AGENTS.md) | VRM デモ | アトラス化、絶対 Tier、複製・徘徊、URL パラメータと HUD/GUI |
-| [scripts/AGENTS.md](scripts/AGENTS.md) | 検証・取得スクリプト | スモークテスト前提・検証内容、モデル取得と SHA-256 固定 |
+| [scripts/AGENTS.md](scripts/AGENTS.md) | 検証・取得・録画スクリプト | スモークテスト前提・検証内容、紹介動画の録画、モデル取得と SHA-256 固定 |
 | [docs/measurements.md](docs/measurements.md) | 計測記録 | WebGPU / WebGL2 のパイプライン・メモリ・フレーム時間実測値 |
 
 ## ビルドと配布物の構成
@@ -26,6 +26,8 @@
 - `pnpm test` — Vitest によるユニット・ファズテスト
 - `pnpm smoke` — 板ポリデモの E2E スモーク（`pnpm build` 済み前提）
 - `pnpm smoke:vrm` — VRM デモの E2E スモーク（`pnpm models:fetch` と `pnpm build` 済み前提）
+
+紹介動画は `pnpm record:vrm` で録画します（前提は [scripts/AGENTS.md](scripts/AGENTS.md) を参照）。
 
 ## 単位表記の規約
 

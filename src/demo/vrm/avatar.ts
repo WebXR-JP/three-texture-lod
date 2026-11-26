@@ -102,6 +102,8 @@ export interface AvatarTemplate {
    * `vrm.update()` が無い複製では skinning に反映されない。raw ボーンを直接動かす。
    */
   readonly headRawBoneName: string | null;
+  /** 腰の raw ボーン名。無いモデルでは null。クローズアップの枠取りで頭ボーンと組にして使う。 */
+  readonly hipsRawBoneName: string | null;
   /** 最適化の実測値。複製は所有しないため、集計はテンプレート単位で行う。 */
   readonly stats: AvatarStats;
   /**
@@ -618,12 +620,14 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
     templateRoot.getObjectByName(normalizedRoot.name)?.removeFromParent();
   }
   const headRawBoneName = vrm.humanoid?.getRawBoneNode('head')?.name ?? null;
+  const hipsRawBoneName = vrm.humanoid?.getRawBoneNode('hips')?.name ?? null;
 
   const template: AvatarTemplate = {
     name,
     root: templateRoot,
     anchorName: anchor.name,
     headRawBoneName,
+    hipsRawBoneName,
     stats: {
       before,
       after: analyze(vrm.scene),

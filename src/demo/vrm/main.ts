@@ -25,6 +25,7 @@
  * - `?spill=1` 破棄したテクスチャの画素データを OPFS へ退避する（既定は無効）
  * - `?adaptive=0` 予算適応の距離しきい値スケールを無効化（既定は有効）
  * - `?scale=0.5` 固定の距離しきい値倍率（0.05〜4。範囲外はクランプ、非数値は無視。指定時は adaptive より優先）
+ * - `?closeup=1` 指定番号（0 始まり。1 = B）のアバターの上半身を右下の小窓に拡大表示する（既定無効）
  * - `?hud=0` HUDを折りたたんで起動（`?hud=1` で展開。一時的な上書きで localStorage には保存されない。既定は展開）
  */
 import GUI from 'lil-gui';
@@ -54,6 +55,7 @@ import { LOD_DISTANCES, LOD_TIERS, tierIndexForResolution } from './tiers.js';
 import { createEnvironment, createLevelRings } from './environment.js';
 import { buildSlots } from './layout.js';
 import { createAvatarLabel, type AvatarLabel } from './labels.js';
+import { createCloseupView, type CloseupTarget } from './closeup.js';
 import { describeGpu, gpuLabel } from '../gpu.js';
 import {
   WANDER_TUNING,
@@ -88,6 +90,8 @@ let lodEnabled = params.get('lod') !== '0';
 const spillCache = params.get('spill') === '1' ? await openSpillCache() : null;
 let autoCamera = params.get('auto') === '1';
 let wanderEnabled = params.get('wander') !== '0';
+// クローズアップ対象のアバター番号。null で無効。範囲外の番号は対象が現れるまで描かない。
+let closeupIndex = parseCloseupIndex(params.get('closeup'));
 // 予算適応の距離しきい値スケール。既定で有効（予算0では実質無効。
 // 予算がなくても manager には adaptive を渡し、後から `setMaxResidentBytes` で
 // 予算を設定できる（作り直し不要）。`?adaptive=0` で無効。
@@ -169,6 +173,8 @@ camera.position.set(0, 1.55, 7.5);
 camera.lookAt(CAMERA_CENTER);
 
 const environment = createEnvironment(scene);
+const closeup = createCloseupView();
+closeup.setEnabled(closeupIndex !== null);
 
 // ---------------------------------------------------------------- 一人称カメラ
 
@@ -345,6 +351,8 @@ for (let index = 0; index < MAX_LABELS; index++) {
   scene.add(label.sprite);
   labels.push(label);
 }
+// 頭上ラベルは小窓に写り込むと顔を隠すため、小窓の描画中は隠す
+const labelSprites = labels.map((label) => label.sprite);
 
 let manager = createManager();
 // マネージャの世代番号。`recreateManager()`/`recreateLod()` で置き換えるたびに進む。
@@ -1030,6 +1038,7 @@ const guiState = {
   autoCamera,
   avatarCount: avatars.length,
   wander: wanderEnabled,
+  closeup: (closeupIndex === null ? 'off' : String(closeupIndex)) as string,
   forceLevel: 'auto' as 'auto' | '0' | '1' | '2' | '3' | '4',
   add: pickFile,
   addClone,
@@ -1152,6 +1161,12 @@ gui
   .name('うろちょろ')
   .onChange(setWanderEnabled)
   .listen();
+// 選択肢は頭上ラベルを付ける先頭 4 体に合わせる
+gui
+  .add(guiState, 'closeup', ['off', '0', '1', '2', '3'])
+  .name('クローズアップ')
+  .onChange((value: string) => setCloseupIndex(value === 'off' ? null : Number(value)))
+  .listen();
 gui.add(guiState, 'add').name('VRMを追加');
 gui.add(guiState, 'addClone').name('複製を追加');
 gui.add(guiState, 'removeClone').name('複製を削除');
@@ -1231,7 +1246,45 @@ function updateVisuals(): void {
       label.set(`${avatar.name} ${distance.toFixed(1)}m`, levelOfAvatar(index));
     }
   }
+  const closeupAvatarNow = closeupIndex === null ? undefined : avatars[closeupIndex];
+  if (updateLabels && closeupAvatarNow) {
+    const level = levelOfAvatar(closeupIndex as number);
+    const widths = closeupAvatarNow.template.levelWidths;
+    closeup.setCaption(
+      `${closeupAvatarNow.name} ${level === null ? 'LOD off' : `L${level}`} ${widths[level ?? 0]}px`,
+    );
+  }
   labelsDirty = false;
+}
+
+/** `?closeup` の値を対象番号にする。0 以上の整数だけを受け付け、それ以外は無効（null）。 */
+function parseCloseupIndex(raw: string | null): number | null {
+  if (raw === null || raw.trim() === '') return null;
+  const index = Number(raw);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function setCloseupIndex(index: number | null): void {
+  closeupIndex = index;
+  guiState.closeup = index === null ? 'off' : String(index);
+  closeup.setEnabled(index !== null);
+  labelsDirty = true;
+}
+
+// 対象アバターと枠取り用ボーン。毎フレームの名前検索を避けるため、対象が変わったときだけ引き直す。
+let closeupAvatar: AvatarHandle | null = null;
+let closeupBones: CloseupTarget | null = null;
+
+function closeupTarget(): CloseupTarget | null {
+  const avatar = closeupIndex === null ? null : (avatars[closeupIndex] ?? null);
+  if (avatar !== closeupAvatar) {
+    closeupAvatar = avatar;
+    const { headRawBoneName, hipsRawBoneName } = avatar?.template ?? {};
+    const head = headRawBoneName ? avatar?.root.getObjectByName(headRawBoneName) : undefined;
+    const hips = hipsRawBoneName ? avatar?.root.getObjectByName(hipsRawBoneName) : undefined;
+    closeupBones = head && hips ? { head, hips } : null;
+  }
+  return closeupBones;
 }
 
 function updateHud(): void {
@@ -1377,7 +1430,9 @@ function animate(now: number): void {
     }
 
     renderer.render(scene, camera);
+    // 小窓の描画で info がリセットされるため、メイン画面の値を先に読む
     lastFrameCalls = renderer.info.render.drawCalls;
+    closeup.render(renderer, scene, camera, closeupTarget(), labelSprites);
     frame++;
   } catch (error) {
     // 1フレームの例外でループを永久に止めない。連続時はログを1秒に1回へ抑える。
@@ -1438,6 +1493,7 @@ const api = {
       topLevel,
       topResolution: topLevel === null ? null : LOD_TIERS[topLevel],
       wander: wanderEnabled,
+      closeupIndex,
       wanderRadius: WANDER_TUNING.radius,
       ringCount: rings.mesh.count,
       loadFailures: [...loadFailures],
@@ -1505,6 +1561,7 @@ const api = {
     top?: number | null;
     autoCamera?: boolean;
     wander?: boolean;
+    closeupIndex?: number | null;
   }) {
     // 破壊的な適用の前に、単体で検証できる値を弾く。
     if (partial.hysteresis !== undefined && !(partial.hysteresis >= 0 && partial.hysteresis < 1)) {
@@ -1526,6 +1583,13 @@ const api = {
       return false;
     }
     if (partial.adaptive !== undefined && typeof partial.adaptive !== 'boolean') {
+      return false;
+    }
+    if (
+      partial.closeupIndex !== undefined &&
+      partial.closeupIndex !== null &&
+      (!Number.isInteger(partial.closeupIndex) || partial.closeupIndex < 0)
+    ) {
       return false;
     }
     if (
@@ -1605,6 +1669,9 @@ const api = {
     }
     if (partial.wander !== undefined) {
       setWanderEnabled(partial.wander);
+    }
+    if (partial.closeupIndex !== undefined) {
+      setCloseupIndex(partial.closeupIndex);
     }
     if (partial.forceLevel !== undefined) {
       if (

@@ -245,6 +245,38 @@ async function checkPipelines(page, result) {
   );
 }
 
+/**
+ * クローズアップの小窓は対象の上半身から 1.6m の位置にカメラを置くが、レベル選択はメインカメラだけで決まることを確かめる。
+ * 小窓のカメラがレベル選択に混ざると、遠景（20m）でも L0 に上がってしまう。
+ * あわせて、HUD の draw calls がメイン画面の値のまま（小窓の描画で上書きされない）ことも確かめる。
+ */
+async function checkCloseup(page, backend, result) {
+  await page.evaluate(() => window.__vrmDemo.setSettings({ lodEnabled: true, forceLevel: null }));
+  await setDistance(page, 20);
+  const before = await statsOf(page);
+  await page.evaluate(() => window.__vrmDemo.setSettings({ closeupIndex: 0 }));
+  await waitFrames(page, 10);
+  const during = await statsOf(page);
+  await screenshot(page, `closeup-${backend}`);
+  await page.evaluate(() => window.__vrmDemo.setSettings({ closeupIndex: null }));
+  result.closeup = {
+    levelBefore: before.avatars[0].level,
+    levelDuring: during.avatars[0].level,
+    drawCallsBefore: before.drawCalls,
+    drawCallsDuring: during.drawCalls,
+  };
+  assert(during.closeupIndex === 0, `${backend}: closeupIndex が ${during.closeupIndex}`);
+  assert(
+    before.avatars[0].level >= 3 && during.avatars[0].level === before.avatars[0].level,
+    `${backend}: クローズアップでレベルが変わった: ${before.avatars[0].level} → ${during.avatars[0].level}`,
+  );
+  assert(
+    during.drawCalls === before.drawCalls,
+    `${backend}: クローズアップで draw calls が変わった: ${before.drawCalls} → ${during.drawCalls}`,
+  );
+  assert(during.errors.length === 0, `${backend}: クローズアップ中のエラー: ${during.errors.join(', ')}`);
+}
+
 async function checkEvict(page, backend, result) {
   await page.evaluate(() =>
     window.__vrmDemo.setSettings({ residency: 'evict', evictDelayMs: 0, forceLevel: null }),
@@ -1996,6 +2028,7 @@ async function checkBackend(browser, backend) {
     await checkPipelines(page, result);
     await checkEvict(page, backend, result);
     await checkKeepAll(page, result);
+    await checkCloseup(page, backend, result);
     await checkHud(page, backend, result);
 
     const consoleErrors = messages.filter(

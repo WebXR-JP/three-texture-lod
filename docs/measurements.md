@@ -61,3 +61,26 @@ WebGPU / WebGL2 ともスモーク通過時の実測値です（代表値は Web
 | `?atlas=4096&spill=1&evictDelay=0`（1 ソース・WebGPU・実ディスプレイ、GC 後の `usedJSHeapSize`） | 近景 L0: 301.5 MiB → 249.3 MiB（退避 52.0 MiB）。最遠 L4: 301.5 MiB → 89.8 MiB（退避 212.0 MiB）。L4 から L0 への復帰後は 249.9 MiB で、`spill=0` は距離によらず 301.5 MiB 前後 |
 | `?atlas=1024&top=1024`（1 ソース・WebGL） | `topLevel=2`, `topResolution=1024`, `finestLevel=2`, 選択 L2、コンソールエラー 0 |
 | 4096・3 ソース・50 体・`?budget=256`・徘徊 ON（WebGPU, Xvfb） | `finestLevel=1`, `scale=1.0`, `requiredBytes` 254.7 MiB, `residentBytes` 254.7 MiB, `over=0`, `levelCapLower=1 / raise=0`, レベル `[0,2,11,37,0]`, frame p50 916.6ms / max 933.3ms（SwiftShader）。証拠画像: `artifacts/vrm/tiers-4096-50-256.png` |
+
+## VRM デモ（iPhone 実機・Safari）
+
+iPhone 11 Pro（iOS 26.6.2）の Safari で、WebGPU を使って計測した値です。シミュレータは iOS のメモリ上限を再現しないので、実機で見ています。
+
+- **計測方法**: LAN 上の HTTPS（secure context）で `dist/demo` を配信します。条件ごとに Safari を終了してから開き、ready 後に約 110 秒、`?auto=1` で動かします。
+- **合格条件**: タブの再読込（クラッシュ）、WebGPU デバイスの喪失、エラーのいずれも起きないこと。
+
+### テクスチャ予算（`?models=A,B&avatars=50&atlas=4096&auto=1`）
+
+| 予算 | 回数 | 結果 |
+| --- | --- | --- |
+| なし | 2 | 2 回とも読み込み開始から約 12 秒でタブがクラッシュする |
+| `?budget=128` | 2 | 2 回とも安定。約 5,600 フレーム・16.5ms、常駐 120.0 MiB、`over=0`、レベル `[0,1,2,27,20]` |
+| `?budget=64` | 2 | 2 回とも安定。約 5,650 フレーム・17ms 前後、常駐 56.0 MiB、`over=0`、レベル `[0,0,13,37,0]`（最細 L2） |
+
+ソース 1 体（`?models=A&avatars=50&atlas=4096`）なら、予算なしで常駐 284.0 MiB まで載せても約 80 秒安定します。
+
+### ジオメトリ量の上限
+
+サンプル VRM は 1 体あたり頂点属性が約 43〜49 MiB（モーフターゲットは別に約 25〜26 MiB）あります。3 ソース（A, B, C）だと、初回描画で作る頂点バッファの合計が 100 MiB 前後を超えたところで `getMappedRange()` が 0 バイトを返し、WebGPU デバイスが失われます。1024px アトラスの既定構成（3 ソース + 複製 1）でも起きることがあり、2048px・50 体では `?budget=64 / 96 / 128` のどれでも起きます。テクスチャ予算では抑えられないので、iPhone ではソース数（ジオメトリ量）も絞ってください。同じ構成でも WebGL2（`?backend=webgl`、1024px・50 体）なら約 60 秒安定します。
+
+デバイスの喪失を繰り返すと、Safari を再起動しても WebGPU が不安定なままになることがあります。計測は条件ごとに Safari を終了し、同じ条件を複数回回してください。

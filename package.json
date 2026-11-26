@@ -1,7 +1,7 @@
 {
   "name": "@webxr-jp/three-texture-lod",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "three.js向け距離ベース・テクスチャLOD（マテリアルバリアント切替方式）",
   "author": "HALBY",
   "license": "MIT",

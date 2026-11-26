@@ -1823,6 +1823,100 @@ async function checkHud(page, backend, result) {
   };
 }
 
+async function checkSpill(browser, backend) {
+  // 画素データのディスク退避（`?spill=1`）を検証する。猶予0で即時破棄させ、次を確かめる。
+  // 1. 遠ざかって破棄した L0〜L2 の画素データが OPFS へ退避される（spilledBytes > 0）。
+  // 2. 近づくと読み戻しを待って L0 に戻り、輝度が退避前と一致する（読み戻した内容が正しい）。
+  // 3. 退避中に手動レベル固定・LOD 無効へ切り替えても、読み戻してから表示するため描画エラーが出ない。
+  const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+  const messages = [];
+  page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  const result = { backend, ok: false };
+  const spillOf = async () => (await statsOf(page)).spill;
+  const goFarAndSpill = async (label) => {
+    await setDistance(page, 20);
+    await waitFor(page, () => (window.__vrmDemo.stats().spill?.spilledCount ?? 0) > 0, null, 10000);
+    const spill = await spillOf();
+    assert(spill.spilledBytes > 0, `${backend} (spill ${label}): 退避量が 0: ${JSON.stringify(spill)}`);
+    return spill;
+  };
+  try {
+    await page.goto(
+      `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&wander=0&evictDelay=0&spill=1${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      { waitUntil: 'load' },
+    );
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 240000 },
+    );
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    result.status = status;
+    if (status !== 'ready') {
+      assert(false, `${backend} (spill): デモが ready にならなかった（status=${status}）`);
+      return result;
+    }
+    assert((await spillOf()) !== null, `${backend} (spill): 退避キャッシュが有効になっていない`);
+
+    await setDistance(page, 2.5);
+    const near = await screenshot(page, `${backend}-spill-near.png`);
+    result.far = await goFarAndSpill('far');
+
+    await setDistance(page, 2.5);
+    await waitFor(page, () => window.__vrmDemo.stats().avatars[0]?.level === 0, null, 10000);
+    await waitFrames(page, 6);
+    const recovered = await screenshot(page, `${backend}-spill-recovered.png`);
+    result.recovered = await spillOf();
+    result.brightness = { near, recovered };
+    assert(near > 20, `${backend} (spill): 近景の輝度が低すぎる: ${near}`);
+    assert(
+      Math.abs(recovered / near - 1) < 0.1,
+      `${backend} (spill): 読み戻し後の輝度比が 10% を超えた: near=${near}, recovered=${recovered}`,
+    );
+
+    await goFarAndSpill('force');
+    await page.evaluate(() => window.__vrmDemo.setSettings({ forceLevel: 0 }));
+    await waitFor(page, () => window.__vrmDemo.stats().manualLevel === 0, null, 10000);
+    await setDistance(page, 2.5);
+    const forced = await screenshot(page, `${backend}-spill-forced.png`);
+    assert(
+      Math.abs(forced / near - 1) < 0.1,
+      `${backend} (spill): 手動 L0 の輝度比が 10% を超えた: near=${near}, forced=${forced}`,
+    );
+    await page.evaluate(() => window.__vrmDemo.setSettings({ forceLevel: null }));
+
+    await goFarAndSpill('lod-off');
+    await page.evaluate(() => window.__vrmDemo.setSettings({ lodEnabled: false }));
+    await setDistance(page, 2.5);
+    await waitFrames(page, 30);
+    const lodOff = await screenshot(page, `${backend}-spill-lod-off.png`);
+    result.brightness.forced = forced;
+    result.brightness.lodOff = lodOff;
+    assert(
+      Math.abs(lodOff / near - 1) < 0.1,
+      `${backend} (spill): LOD 無効の輝度比が 10% を超えた: near=${near}, lodOff=${lodOff}`,
+    );
+    const final = await spillOf();
+    result.final = final;
+    assert(final.failureCount === 0, `${backend} (spill): 退避・読み戻しの失敗がある: ${JSON.stringify(final)}`);
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    result.consoleErrors = consoleErrors;
+    assert(consoleErrors.length === 0, `${backend} (spill): コンソールエラー: ${consoleErrors.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (spill): 例外: ${String(error)}`);
+  } finally {
+    result.messages = messages.slice(-20);
+    await page.close();
+  }
+  return result;
+}
+
 async function checkBackend(browser, backend) {
   const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
   const messages = [];
@@ -2058,6 +2152,14 @@ async function main() {
         }
       }
 
+      const spillBrowser = await launchBrowser(backend);
+      let spill;
+      try {
+        spill = await checkSpill(spillBrowser, backend);
+      } finally {
+        await spillBrowser.close();
+      }
+
       single.fourSources = fourSources;
       single.default = defaultPage;
       single.clones = clones;
@@ -2065,6 +2167,7 @@ async function main() {
       single.adaptive = adaptive;
       single.crowd = crowd;
       single.tierCap = tierCap;
+      single.spill = spill;
       single.ok = failures.length === 0;
       results.push(single);
     }

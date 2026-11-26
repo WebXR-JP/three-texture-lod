@@ -58,5 +58,6 @@ WebGPU / WebGL2 ともスモーク通過時の実測値です（代表値は Web
 | 4096・3 ソース（未計測の規模目安） | 1024px 3 ソース（40.0 MiB）の面積比 16 倍換算で `atlasBytes` 約 640 MiB 級（L0〜L4 の `DataTexture` 用 JS ヒープも同規模消費） |
 | `?atlas=4096&top=1024`（1 ソース・WebGPU） | `topLevel=2`, `topResolution=1024`, `finestLevel=2`, 選択 L2。`map` 幅 `[4096,2048,1024,512,256]`, `normalMap` 幅 `[2048,2048,1024,512,256]`, 選択 L2 `map` 幅 1024 |
 | `?atlas=4096&budget=64`（1 ソース近距離・WebGPU） | `finestLevel=2`, `scale=1`, `required` 22.7 MiB ≤ 64MB, `over=0`, `levelCapLowerCount=1`, 選択 L2 `map` 幅 1024。解除後 2 秒以内に `finestLevel=0` へ復帰 |
+| `?atlas=4096&spill=1&evictDelay=0`（1 ソース・WebGPU・実ディスプレイ、GC 後の `usedJSHeapSize`） | 近景 L0: 301.5 MiB → 249.3 MiB（退避 52.0 MiB）。最遠 L4: 301.5 MiB → 89.8 MiB（退避 212.0 MiB）。L4 から L0 への復帰後は 249.9 MiB で、`spill=0` は距離によらず 301.5 MiB 前後 |
 | `?atlas=1024&top=1024`（1 ソース・WebGL） | `topLevel=2`, `topResolution=1024`, `finestLevel=2`, 選択 L2、コンソールエラー 0 |
 | 4096・3 ソース・50 体・`?budget=256`・徘徊 ON（WebGPU, Xvfb） | `finestLevel=1`, `scale=1.0`, `requiredBytes` 254.7 MiB, `residentBytes` 254.7 MiB, `over=0`, `levelCapLower=1 / raise=0`, レベル `[0,2,11,37,0]`, frame p50 916.6ms / max 933.3ms（SwiftShader）。証拠画像: `artifacts/vrm/tiers-4096-50-256.png` |

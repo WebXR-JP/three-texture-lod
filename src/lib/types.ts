@@ -8,6 +8,7 @@
  * @packageDocumentation
  */
 import type { Camera, Material, Mesh, Object3D, Texture } from 'three';
+import type { TextureSpillCache } from './texture-spill-cache.js';
 
 /**
  * LOD切替の対象になる既知のテクスチャスロット。
@@ -267,6 +268,16 @@ export interface TextureLodManagerOptions {
    * @defaultValue `0`（`TextureLodManager` が補う）。
    */
   readonly finestLevel?: number;
+  /**
+   * GPU から破棄したテクスチャの画素データを退避するキャッシュ。
+   *
+   * 指定すると、`evict` で破棄したテクスチャの画素データをメインメモリからキャッシュのストアへ移し、
+   * 再び必要になったレベルは読み戻しが済むまで切り替えずに現在のレベル（初回は最粗レベル）を表示する。
+   * `residency: 'keep-all'` では退避しないが、他のマネージャが退避したテクスチャの読み戻し待ちは行う。
+   *
+   * @defaultValue 退避しない
+   */
+  readonly spillCache?: TextureSpillCache;
 }
 
 /**

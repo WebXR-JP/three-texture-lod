@@ -81,6 +81,8 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
   1メッシュ分の LOD 定義です。レベルごとにバリアントマテリアルを事前生成し、`variant(level)` で取得できます。同一内容のレベルは同じマテリアル実体を共有するため、`createVariant` フックは共有グループの先頭レベルで 1 回だけ呼ばれます。`canonicalLevel(level)` で先頭レベル番号の取得、`syncFromBase()` で材質変更の一括反映、`dispose()` で破棄ができます。スロット名はマテリアル型の `Texture | null` プロパティから自動導出されるため、MToon の `shadeMultiplyTexture` などもそのまま指定できます。
 - `TextureLodManager`
   複数メッシュのレベル判定とテクスチャ常駐を管理します。`add` / `addGroup` / `remove` / `update` / `levelOf` / `stats` / `dispose` に加え、実行時の調整用として `setThresholdScale` / `setMaxResidentBytes` / `setFinestLevel` を持ちます。
+- `TextureSpillCache` / `openOpfsPixelStore()`
+  GPU から破棄したテクスチャの画素データをディスク（OPFS）へ退避し、メインメモリから外すキャッシュです。マネージャの `spillCache` に渡すと、破棄に合わせて退避し、再び必要になったレベルは読み戻しが済んでから切り替えます。退避先は `TexturePixelStore` を実装すれば差し替えられます。
 - `selectLevel(previous, distance, thresholds, hysteresis)`
   ヒステリシス付きレベル判定の純粋関数です。
 - `computeLodDistance(object, camera, mode)`
@@ -98,12 +100,21 @@ pnpm build:all   # デモ（dist/demo/）とライブラリ（dist/lib/）を両
 | `thresholdScale` | `1` | 固定の距離しきい値倍率（有限かつ `> 0`）。`adaptiveThresholdScale` と併用不可 |
 | `adaptiveThresholdScale` | `false` | `true` または設定オブジェクトで予算適応（距離スケール＋Tier上限の2軸）を有効にする（`'keep-all'`・`thresholdScale` と併用不可） |
 | `finestLevel` | `0` | 手動で指定する最も細かいレベル番号（0 が最細）。自動適応時もこれより細かくはならない |
+| `spillCache` | なし | 破棄したテクスチャの画素データを退避する `TextureSpillCache` |
 
 ### 利用上のポイント
 
 - **最粗レベルの常駐**: `'evict'` でも各セットの最粗レベルはピン留めされ、遠景で描画が欠けません。破棄されたテクスチャが近景で再び使われる際は GPU への再アップロードが走ります。管理外のメッシュと同一 `Texture` を共有する場合は `'keep-all'` を使うか管理対象に含めてください。
 - **容量の判定基準**: `residentBytes` や `requiredBytes` は RGBA8 とミップマップ係数（4/3）に基づく推定値です。予算上限を設定しても現用中と最粗レベルは保護されるため、予算が厳しい場合は超過が残ります（`stats().overBudgetBytes` で確認できます）。
 - **予算適応の 2 軸制御**: `adaptiveThresholdScale` を有効にすると、必要常駐量（現用＋最粗）が予算内に収まるよう「距離しきい値の縮小」と「Tier 上限の引き上げ（`levelCap: false` で無効化可）」の 2 軸で自動調整します。
+- **ディスク退避**: three はテクスチャを `dispose()` しても `image` の画素配列を JS ヒープに残すため、`'evict'` だけでは VRAM は減ってもメインメモリは減りません。`spillCache` を渡すと、破棄したテクスチャの画素データ（`image.data` が `Uint8Array` のもの）を退避し、メインメモリに残る画素データを GPU 常駐分＋書き込み中の分に抑えます。読み戻しは非同期で行うため、近づいた直後は数フレームほど現在のレベルのまま表示が続きます。退避中のテクスチャは `image.data === null` になるので、マネージャ外で表示する前（LOD を外してベースマテリアルへ戻すなど）は `await spillCache.restoreAll()` で読み戻してください。
+
+  ```ts
+  import { TextureSpillCache, openOpfsPixelStore } from 'three-texture-lod';
+
+  const spillCache = new TextureSpillCache(await openOpfsPixelStore());
+  const manager = new TextureLodManager({ residency: 'evict', spillCache });
+  ```
 - **非表示オブジェクト**: `visible === false` のグループは更新を飛ばして参照を保持するため、そのテクスチャは破棄対象になりません。
 - **対象外のマテリアルと機能**: 判定はオブジェクト単位で、`InstancedMesh` のインスタンス単位 LOD には対応していません。`colorNode` 等で独自に `texture()` を組む場合は `createVariant` フックでレベルごとのノードを組み立ててください。また、解像度以外のテクスチャ設定（色空間やフィルタなど）はレベル間で揃えてください。
 
@@ -150,6 +161,7 @@ flowchart TD
 | `?atlas=1024` | VRM | アトラス解像度（256〜4096、既定 1024） |
 | `?top=1024` | VRM | 許可する最細の解像度 Tier 上限（4096 / 2048 / 1024 / 512 / 256） |
 | `?budget=32` | VRM | 常駐メモリ上限（MB、`0` で無効） |
+| `?spill=1` | VRM | 破棄したテクスチャの画素データを OPFS へ退避してメインメモリを減らす |
 | `?adaptive=0` | VRM | 予算適応による距離スケール・Tier 上限の自動調整を無効にする |
 | `?scale=0.5` | VRM | 固定の距離しきい値倍率（`0.05〜4`） |
 | `?wander=0` | VRM | アバターの徘徊を無効にする |
@@ -157,7 +169,7 @@ flowchart TD
 
 ### 高解像度アトラスの目安
 
-`?atlas=2048` や `?atlas=4096` では、VRAM だけでなく縮小元の `DataTexture` 配列も JS ヒープに残るためメモリ消費が大きくなります。`4096` を試す場合はソース 1 体（または `?budget=256` などの予算指定と併用）、`2048` はソース 2〜3 体での利用をおすすめします。
+`?atlas=2048` や `?atlas=4096` では、VRAM だけでなく縮小元の `DataTexture` 配列も JS ヒープに残るためメモリ消費が大きくなります。`4096` を試す場合はソース 1 体（または `?budget=256` などの予算指定と併用）、`2048` はソース 2〜3 体での利用をおすすめします。`?spill=1` を併用すると、使っていないレベルの画素配列が JS ヒープから外れます。
 
 ## 関連ドキュメント
 

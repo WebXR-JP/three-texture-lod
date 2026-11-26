@@ -21,6 +21,7 @@
  * - `?residency=keep-all` 常駐モード
  * - `?evictDelay=1000` evict の猶予ms
  * - `?budget=32` 常駐上限MB（0で無効、既定0。0〜4096）
+ * - `?spill=1` 破棄したテクスチャの画素データを OPFS へ退避する（既定は無効）
  * - `?adaptive=0` 予算適応の距離しきい値スケールを無効化（既定は有効）
  * - `?scale=0.5` 固定の距離しきい値倍率（0.05〜4。範囲外はクランプ、非数値は無視。指定時は adaptive より優先）
  * - `?hud=0` HUDを折りたたんで起動（`?hud=1` で展開。一時的な上書きで localStorage には保存されない。既定は展開）
@@ -37,7 +38,9 @@ import {
 import { WebGPURenderer } from 'three/webgpu';
 import {
   TextureLodManager,
+  TextureSpillCache,
   computeLodDistance,
+  openOpfsPixelStore,
   type ResidencyMode,
 } from '../../lib/index.js';
 import {
@@ -72,6 +75,8 @@ let residency: ResidencyMode = params.get('residency') === 'keep-all' ? 'keep-al
 let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 10000, 1000);
 let budgetMB = clampNumber(Math.round(Number(params.get('budget') ?? 0)), 0, 4096, 0);
 let lodEnabled = params.get('lod') !== '0';
+// 退避先を開けない環境（非セキュアコンテキスト等）では退避なしで続ける。
+const spillCache = params.get('spill') === '1' ? await openSpillCache() : null;
 let autoCamera = params.get('auto') !== '0';
 let wanderEnabled = params.get('wander') !== '0';
 // 予算適応の距離しきい値スケール。既定で有効（予算0では実質無効。
@@ -87,6 +92,15 @@ if (scaleParamRaw !== null && scaleParamRaw.trim() !== '') {
   if (Number.isFinite(parsed)) fixedScale = clampNumber(parsed, 0.05, 4, parsed);
 }
 if (fixedScale !== null) adaptiveEnabled = false;
+
+async function openSpillCache(): Promise<TextureSpillCache | null> {
+  try {
+    return new TextureSpillCache(await openOpfsPixelStore('three-texture-lod-vrm-demo'));
+  } catch (error) {
+    console.warn(`[Texture LOD] OPFS を開けないため退避を無効にします: ${String(error)}`);
+    return null;
+  }
+}
 
 /** adaptive が実際に manager へ渡る条件。固定 scale・keep-all・LOD無効では効かない。
  * 予算0でも adaptive 自体は渡す（引き上げのみで実質無効）。予算の後付けは作り直し不要。 */
@@ -194,6 +208,11 @@ let lastHudAt = 0;
 let lastErrorAt = 0;
 let cameraAngle = 0;
 let busy = false;
+// 退避中の画素データを読み戻している間は true。マネージャの掃引が読み戻した分を再退避しないよう、
+// `manager.update` を止めて表示中のバリアントのまま描画する。
+let restoringSpill = false;
+// マネージャ外表示への切り替え要求の世代。読み戻し中に別の切り替えが入ったら古い要求を捨てる。
+let unmanagedRequest = 0;
 // 体構成が変わったらラベルを即時更新する。12フレーム周期の更新だけでは
 // 追加・削除・配置直後の古い表示が残る。
 let labelsDirty = true;
@@ -206,6 +225,7 @@ function createManager(): TextureLodManager {
     evictDelayMs,
     maxResidentBytes: residency === 'evict' && budgetMB > 0 ? budgetMB * 1048576 : undefined,
     finestLevel: topLevel ?? 0,
+    ...(spillCache !== null ? { spillCache } : {}),
     ...(adaptive ? { adaptiveThresholdScale: true as const } : {}),
     ...(!adaptive && fixedScale !== null ? { thresholdScale: fixedScale } : {}),
   });
@@ -330,7 +350,8 @@ function syncAvatarCount(): void {
  * @returns 追加できたら true。上限到達やソース無しでは false。
  */
 function addClone(): boolean {
-  if (busy) {
+  // 退避の読み戻し中はマネージャが止まっており、追加した体がベースマテリアルのまま描画されるため待たせる。
+  if (busy || restoringSpill) {
     showToast('読み込み中は体数を変更できません');
     return false;
   }
@@ -373,7 +394,8 @@ function removeClone(): boolean {
  * @returns 変更後の実際の体数。
  */
 function setAvatarCount(n: number): number {
-  if (busy) {
+  // 退避の読み戻し中はマネージャが止まっており、追加した体がベースマテリアルのまま描画されるため待たせる。
+  if (busy || restoringSpill) {
     showToast('読み込み中は体数を変更できません');
     return avatars.length;
   }
@@ -456,6 +478,7 @@ function recreateLod(nextHysteresis: number): boolean {
   guiState.hysteresis = nextHysteresis;
   for (const template of unique) template.rebuild(hysteresis);
   for (const avatar of avatars) avatar.rebind();
+  cancelUnmanaged();
   manualLevel = null;
   guiState.forceLevel = 'auto';
   manager = createManager();
@@ -474,17 +497,54 @@ function recreateManager(): void {
   }
 }
 
+/**
+ * マネージャ外でテクスチャを表示する切り替えを、退避中の画素データを全て読み戻してから行う。
+ *
+ * 退避なしでは `action` をその場で実行する。読み戻しの間に {@link cancelUnmanaged} や
+ * 別の要求が入った場合、古い `action` は実行しない。
+ */
+function whenSpillRestored(action: () => void): void {
+  const request = ++unmanagedRequest;
+  if (spillCache === null) {
+    action();
+    return;
+  }
+  restoringSpill = true;
+  spillCache
+    .restoreAll()
+    .then(
+      () => {
+        if (request === unmanagedRequest) action();
+      },
+      (error: unknown) => {
+        showToast(`退避したテクスチャを読み戻せません: ${String(error)}`);
+      },
+    )
+    .finally(() => {
+      if (request === unmanagedRequest) restoringSpill = false;
+    });
+}
+
+/** 読み戻し待ちのマネージャ外表示への切り替えを取り消す。 */
+function cancelUnmanaged(): void {
+  unmanagedRequest++;
+  restoringSpill = false;
+}
+
 function setLodEnabled(enabled: boolean): void {
   lodEnabled = enabled;
   updateBudgetController();
   guiState.forceLevel = 'auto';
+  manualLevel = null;
   if (enabled) {
-    manualLevel = null;
+    cancelUnmanaged();
     recreateManager();
   } else {
-    manager.dispose();
-    manualLevel = null;
-    restoreBaseMaterials();
+    // LOD 無効中は `manager.update` が走らないため、読み戻しの間は現在のバリアントのまま描画する。
+    whenSpillRestored(() => {
+      manager.dispose();
+      restoreBaseMaterials();
+    });
   }
 }
 
@@ -494,21 +554,17 @@ function setForceLevel(level: number | null): void {
     return;
   }
   if (level === null) {
+    cancelUnmanaged();
     manualLevel = null;
     if (lodEnabled) recreateManager();
-    else restoreBaseMaterials();
+    else whenSpillRestored(restoreBaseMaterials);
     return;
   }
-  manualLevel = level;
-  manager.dispose();
-  for (const avatar of avatars) {
-    const sets = avatar.template.sets;
-    const max = sets[0]?.levels.length ? sets[0].levels.length - 1 : 4;
-    const clamped = Math.min(level, max);
-    for (const binding of avatar.bindings) {
-      binding.mesh.material = binding.set.variant(clamped);
-    }
-  }
+  whenSpillRestored(() => {
+    manualLevel = level;
+    manager.dispose();
+    applyManualLevel();
+  });
 }
 
 /**
@@ -1131,6 +1187,7 @@ function updateHud(): void {
           : residency === 'evict' && budgetMB > 0 && manualLevel !== null
             ? `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)  budget off (manual)`
             : `VRAM      ${(resident / 1048576).toFixed(1)} MB (est.)`,
+    ...(spillCache !== null ? [spillLine(spillCache)] : []),
     `switch    ${stats.switchCount}   pipelines ${pipelines.caches}/${pipelines.fragmentPrograms}`,
     `frame     ${frameTimeMs.toFixed(2)}ms upd ${updateMs.toFixed(2)}ms calls ${lastFrameCalls}`,
     '',
@@ -1149,6 +1206,15 @@ function updateHud(): void {
       : '';
   hudSummaryEl.textContent =
     `src ${sources} / ${avatars.length}体 · ${frameTimeMs.toFixed(1)}ms${summaryScale}${summaryFloor}`;
+}
+
+/** 退避キャッシュの HUD 行。容量は他の行と同じく 1048576 で割った MB 表記にする。 */
+function spillLine(cache: TextureSpillCache): string {
+  const spill = cache.stats();
+  return (
+    `spill     ${(spill.spilledBytes / 1048576).toFixed(1)} MB on disk (${spill.spilledCount})` +
+    `  restoring ${spill.restoringCount}  fail ${spill.failureCount}`
+  );
 }
 
 let lastTime = performance.now();
@@ -1173,7 +1239,7 @@ function animate(now: number): void {
     updateAutoCamera(delta);
 
     if (manualLevel !== null) applyManualLevel();
-    else if (lodEnabled) manager.update(camera);
+    else if (lodEnabled && !restoringSpill) manager.update(camera);
 
     updateVisuals();
     updateMs += (performance.now() - updateStart - updateMs) * 0.1;
@@ -1265,6 +1331,7 @@ const api = {
         after: avatar.stats.after,
       })),
       manager: manager.stats(),
+      spill: spillCache?.stats() ?? null,
       levelCounts: LEVELS.map(
         (level) => avatars.filter((_, index) => levelOfAvatar(index) === level).length,
       ),

@@ -18,6 +18,7 @@ import {
 } from './threshold-scale.js';
 import type { LodBudgetState } from './threshold-scale.js';
 import type { TextureLodSet } from './texture-lod-set.js';
+import type { TextureSpillCache } from './texture-spill-cache.js';
 import type { Camera, Material, Mesh, Texture } from 'three';
 import type {
   AdaptiveThresholdScaleOptions,
@@ -124,7 +125,11 @@ interface TrackedTexture {
   pins: number;
   /** このテクスチャを含む登録済みset数。0になったら追跡から外す。 */
   registeredBy: number;
-  /** 破棄済みなら true。再使用時に false へ戻す（再アップロードは three に任せる）。 */
+  /**
+   * GPU から破棄済みなら true。再使用時に false へ戻す（再アップロードは three に任せる）。
+   *
+   * 退避キャッシュ使用時は、画素データがメインメモリにない（退避中の）テクスチャも true で登録する。
+   */
   evicted: boolean;
 }
 
@@ -138,6 +143,8 @@ interface TrackedTexture {
  * マネージャは判定の実行と参照カウントのみを担当する。
  * 同一距離で連動させる複数メッシュは {@link TextureLodManager.addGroup} で1グループに束ねる。
  * グループ内では anchor 1件の距離からレベルを1つだけ決め、全束縛に同じレベルを適用する。
+ * `spillCache` を指定すると、破棄したテクスチャの画素データもメインメモリから退避し、
+ * 読み戻しが済んだレベルにだけ切り替える。
  */
 export class TextureLodManager {
   private readonly distanceMode: DistanceMode;
@@ -189,6 +196,15 @@ export class TextureLodManager {
   /** `budgetCaps` を作り直す必要がある場合に `true`。 */
   private capsDirty = true;
   private readonly now: () => number;
+  /** 画素データの退避先。未指定なら `null` で、退避も読み戻し待ちもしない。 */
+  private readonly spillCache: TextureSpillCache | null;
+  /**
+   * 直近の `update()` で読み戻しを待ったテクスチャ。
+   *
+   * ADR: 同じレベルの他スロットの読み戻しが済む前に、先に戻った分を掃引で再退避すると
+   * 読み戻しと退避を繰り返して切り替わらなくなる。待機中の分は掃引の再退避から外す。
+   */
+  private readonly awaitingRestore = new Set<Texture>();
   private readonly groups = new Set<ManagedGroup>();
   private readonly groupOfMesh = new Map<Mesh, ManagedGroup>();
   /** ADR: 異なるsetが同じ Texture オブジェクトを共有しても参照カウントが壊れないよう、追跡は Texture 単位で行う。 */
@@ -270,6 +286,7 @@ export class TextureLodManager {
       this.thresholdScaleValue = this.scaleLadder[0] as number;
     }
     this.now = options?.now ?? (() => performance.now());
+    this.spillCache = options?.spillCache ?? null;
     const finestLevel = options?.finestLevel ?? 0;
     if (!Number.isInteger(finestLevel) || finestLevel < 0) {
       throw new RangeError(`finestLevel は0以上の整数である必要があります: ${String(finestLevel)}`);
@@ -745,10 +762,15 @@ export class TextureLodManager {
       }
     }
     // pass2: `distance / scale` の判定に上限をかける。保持グループにも上限を適用する。
+    this.awaitingRestore.clear();
     for (const group of this.groups) {
       const cap = this.effectiveCap(group.thresholds.length);
-      const applyLevel = (next: number): void => {
-        if (group.level !== next) {
+      const applyLevel = (desired: number): void => {
+        if (group.level === desired) {
+          return;
+        }
+        const next = this.displayableLevel(group, desired);
+        if (next !== null && group.level !== next) {
           if (group.level !== null) {
             for (const binding of group.bindings) {
               this.release(binding.set, group.level, at);
@@ -910,7 +932,8 @@ export class TextureLodManager {
           // フォールバック先がGPUから消えると全LODが表示不能になるため、安全側に倒す。
           pins: coarsest.has(texture) ? 1 : 0,
           registeredBy: 1,
-          evicted: false,
+          // ADR: 別のマネージャが退避したテクスチャは GPU からも破棄済みのため、常駐量に数えない。
+          evicted: this.spillCache !== null && !this.spillCache.isReady(texture),
         });
       } else {
         tracked.registeredBy++;
@@ -985,11 +1008,59 @@ export class TextureLodManager {
     }
   }
 
-  /** テクスチャを1件破棄し、破棄回数を数える。 */
+  /**
+   * 退避キャッシュ使用時に、望むレベルの代わりに今表示できるレベルを求める。
+   *
+   * 望むレベルの画素データが揃っていればそのレベル、揃っていなければ読み戻しを始めて
+   * 現在のレベルを返す。初回（現在のレベルなし）は最粗レベルを試し、それも揃わなければ `null` を返す。
+   *
+   * ADR: 現在のレベルのテクスチャは参照中で破棄されないため、常に表示できる。
+   * 上限（`cap`）より細かいまま待つことがあるが、読み戻し完了までの一時的な超過として許容する。
+   */
+  private displayableLevel(group: ManagedGroup, desired: number): number | null {
+    const cache = this.spillCache;
+    if (cache === null || this.levelReady(group, desired, cache)) {
+      return desired;
+    }
+    if (group.level !== null) {
+      return group.level;
+    }
+    const coarsest = group.thresholds.length - 1;
+    return coarsest !== desired && this.levelReady(group, coarsest, cache) ? coarsest : null;
+  }
+
+  /**
+   * グループの全束縛でレベルの画素データが揃っているかを返し、揃っていない分の読み戻しを始める。
+   *
+   * 揃っていない場合は、そのレベルの全テクスチャ（準備済みの分を含む）を読み戻し待ちとして記録する。
+   */
+  private levelReady(group: ManagedGroup, level: number, cache: TextureSpillCache): boolean {
+    const textures: Texture[] = [];
+    let ready = true;
+    for (const binding of group.bindings) {
+      for (const texture of TextureLodManager.texturesOf(binding.set, level)) {
+        textures.push(texture);
+        // 書き込み中の画像はその場で戻るため、要求後にもう一度確かめる。
+        if (!cache.isReady(texture)) {
+          cache.request(texture);
+          ready = ready && cache.isReady(texture);
+        }
+      }
+    }
+    if (!ready) {
+      for (const texture of textures) {
+        this.awaitingRestore.add(texture);
+      }
+    }
+    return ready;
+  }
+
+  /** テクスチャを1件破棄し、破棄回数を数える。退避キャッシュ使用時は画素データも退避する。 */
   private evict(texture: Texture, tracked: TrackedTexture): void {
     texture.dispose();
     tracked.evicted = true;
     this.evictCount++;
+    this.spillCache?.spill(texture);
   }
 
   /**
@@ -1003,6 +1074,16 @@ export class TextureLodManager {
     // 段1（従来どおり）: 猶予切れの破棄。
     for (const [texture, tracked] of this.tracked) {
       if (tracked.evicted) {
+        // ADR: 読み戻したが使われずに終わった画素データを再退避する。破棄済みで未参照のため
+        // 猶予は待たない。書き込み済みならメモリから外すだけで、ストアへの書き直しはない。
+        if (
+          this.spillCache !== null &&
+          tracked.refs === 0 &&
+          tracked.pins === 0 &&
+          !this.awaitingRestore.has(texture)
+        ) {
+          this.spillCache.spill(texture);
+        }
         continue;
       }
       if (tracked.refs === 0 && tracked.pins === 0) {

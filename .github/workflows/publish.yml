@@ -42,3 +42,21 @@ jobs:
 
       - name: Publish with OIDC
         run: pnpm publish --access public --no-git-checks
+
+      - name: Wait for npm tarball availability
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          BASENAME=${NAME##*/}
+          URL="https://registry.npmjs.org/${NAME}/-/${BASENAME}-${VERSION}.tgz"
+          echo "Waiting for ${URL}"
+          for i in $(seq 1 40); do
+            CODE=$(curl -sL -o /dev/null -w '%{http_code}' "$URL" || echo 000)
+            echo "attempt ${i}/40: HTTP ${CODE}"
+            if [ "$CODE" = "200" ]; then
+              echo "Tarball is available."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::warning::Published ${NAME}@${VERSION}, but the tarball is still unavailable after 20 minutes. Check npm notifications for a possible manual review."

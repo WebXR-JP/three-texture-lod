@@ -25,6 +25,15 @@ export type {
   TextureLodGroupOptions,
   TextureLodSetContract,
 } from './texture-lod-manager.js';
+export type {
+  CompressedMipSliceOptions,
+} from './compressed-texture.js';
+export {
+  createCompressedTextureMipLevels,
+  estimateTextureBytes,
+  isCompressedTexture,
+  sliceCompressedTexture,
+} from './compressed-texture.js';
 export { selectLevel } from './select-level.js';
 export { computeLodDistance } from './lod-distance.js';
 export { TextureLodSet, createTextureLodSet } from './texture-lod-set.js';

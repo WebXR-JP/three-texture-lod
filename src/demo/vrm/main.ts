@@ -17,6 +17,7 @@
  * - `?wander=0` 徘徊を無効化（全員を配置位置に固定）
  * - `?h=0.15` ヒステリシス幅
  * - `?atlas=1024` アトラス解像度（256〜4096、既定1024）
+ * - `?compress=1` KTX2 テクスチャ圧縮を有効化（既定無効）
  * - `?auto=0` 自動カメラを停止
  * - `?residency=keep-all` 常駐モード
  * - `?evictDelay=1000` evict の猶予ms
@@ -40,6 +41,7 @@ import {
   TextureLodManager,
   TextureSpillCache,
   computeLodDistance,
+  isCompressedTexture,
   openOpfsPixelStore,
   type ResidencyMode,
 } from '../../lib/index.js';
@@ -70,6 +72,7 @@ if (!(canvas instanceof HTMLCanvasElement)) {
 const params = new URLSearchParams(location.search);
 const forceWebGL = params.get('backend') === 'webgl';
 const atlasResolution = clampNumber(Math.round(Number(params.get('atlas') ?? 1024)), 256, 4096, 1024);
+const compressTextures = params.get('compress') === '1';
 let hysteresis = clampNumber(Number(params.get('h') ?? 0.15), 0, 0.3, 0.15);
 let residency: ResidencyMode = params.get('residency') === 'keep-all' ? 'keep-all' : 'evict';
 let evictDelayMs = clampNumber(Number(params.get('evictDelay') ?? 1000), 0, 10000, 1000);
@@ -759,6 +762,7 @@ async function addFromSource(spec: string, index: number, total: number): Promis
     renderer,
     atlasResolution,
     hysteresis,
+    compressTextures,
     onProgress: (message) => setLoading(message, (index + 0.35) / total),
   });
   register(avatar, true);
@@ -795,6 +799,7 @@ async function addFromFile(file: File): Promise<void> {
       renderer,
       atlasResolution,
       hysteresis,
+      compressTextures,
       onProgress: (message) => setLoading(message, 0.6),
     });
     // 読み込み中に体数が上限へ達したら、配置せず破棄する（slots の範囲外参照を防ぐ）。
@@ -880,6 +885,7 @@ try {
 
 const guiState = {
   lod: lodEnabled,
+  compress: compressTextures,
   hysteresis,
   residency,
   evictDelayMs,
@@ -924,6 +930,15 @@ gui.add(guiState, 'lod').name('LOD有効').onChange((value: boolean) => {
   setLodEnabled(value);
   guiState.forceLevel = 'auto';
 }).listen();
+gui
+  .add(guiState, 'compress')
+  .name('テクスチャ圧縮(KTX2)')
+  .onChange((value: boolean) => {
+    const nextUrl = new URL(location.href);
+    if (value) nextUrl.searchParams.set('compress', '1');
+    else nextUrl.searchParams.delete('compress');
+    location.href = nextUrl.toString();
+  });
 gui
   .add(guiState, 'hysteresis', 0, 0.3, 0.01)
   .name('ヒステリシス')
@@ -1166,7 +1181,7 @@ function updateHud(): void {
   hudBodyEl.textContent = [
     `backend   ${backendName()}`,
     `models    src ${sources} / avatars ${avatars.length} (clones ${clones})`,
-    `optimize  ${(optimizeMs / 1000).toFixed(1)}s  atlas ${atlasResolution}px`,
+    `optimize  ${(optimizeMs / 1000).toFixed(1)}s  atlas ${atlasResolution}px${compressTextures ? '  KTX2' : ''}`,
     `meshes    ${before.meshes} → ${after.meshes}  (rendered ${renderedMeshes})`,
     `materials ${before.materials} → ${after.materials}`,
     `atlas     ${(atlasBytes / 1048576).toFixed(1)} MB (full)`,
@@ -1295,6 +1310,7 @@ const api = {
       backend: backendName(),
       frame,
       lodEnabled,
+      compressTextures,
       hysteresis,
       residency,
       evictDelayMs,
@@ -1326,6 +1342,7 @@ const api = {
         atlasResolution: avatar.stats.atlasResolution,
         atlasBytes: avatar.stats.atlasBytes,
         usedSlots: avatar.stats.usedSlots,
+        compressedSlots: [...avatar.stats.compressedSlots],
         levelWidths: [...avatar.template.levelWidths],
         before: avatar.stats.before,
         after: avatar.stats.after,
@@ -1539,6 +1556,42 @@ const api = {
           | undefined;
         const width = texture?.image?.width;
         return typeof width === 'number' ? width : null;
+      }),
+    );
+  },
+  /**
+   * 指定スロットの各セット・各レベルが圧縮テクスチャかを返す（テスト用）。
+   *
+   * @param index - アバター番号。
+   * @param slot - テクスチャスロット名。
+   * @returns セットごとの各レベルの `isCompressedTexture` 判定。スロット無ければ null。
+   */
+  variantSlotCompressed(index: number, slot: string): (boolean | null)[][] {
+    const avatar = avatars[index];
+    if (!avatar) return [];
+    return avatar.template.sets.map((set) =>
+      set.levels.map((level) => {
+        const texture = (level.textures as Record<string, unknown>)[slot];
+        return texture === undefined ? null : isCompressedTexture(texture);
+      }),
+    );
+  },
+  /**
+   * 指定スロットの各セット・各レベルのミップ枚数を返す（テスト用）。
+   *
+   * @param index - アバター番号。
+   * @param slot - テクスチャスロット名。
+   * @returns セットごとの各レベルの `mipmaps.length`。配列でなければ null。
+   */
+  variantSlotMipCounts(index: number, slot: string): (number | null)[][] {
+    const avatar = avatars[index];
+    if (!avatar) return [];
+    return avatar.template.sets.map((set) =>
+      set.levels.map((level) => {
+        const texture = (level.textures as Record<string, unknown>)[slot] as
+          | { mipmaps?: unknown }
+          | undefined;
+        return Array.isArray(texture?.mipmaps) ? texture.mipmaps.length : null;
       }),
     );
   },

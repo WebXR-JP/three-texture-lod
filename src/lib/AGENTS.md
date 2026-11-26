@@ -24,7 +24,8 @@
 ## 常駐管理と予算適応（`TextureLodManager`）
 
 - **ピン留めと破棄**: `'evict'` 時も最粗レベルはピン留めされ破棄対象になりません。`texture.dispose()` は GPU 側リソースのみ解放し CPU 側の `image` は残るため、復帰時は再アップロードが走ります。LOD 管理外のメッシュと同じ `Texture` を共有する場合は `'keep-all'` を使います。
-- **推定バイト数**: `residentBytes`・`requiredBytes`・`pinnedBytes` は RGBA8（4バイト/画素）× ミップマップ係数 4/3 の推定値です。`requiredBytes`（現用＋最粗の必要量）と `overBudgetBytes`（`residentBytes` 基準の超過量）は別指標です。
+- **推定・実測バイト数**: `residentBytes`・`requiredBytes`・`pinnedBytes` は `estimateTextureBytes` により算出します。非圧縮テクスチャは RGBA8（4バイト/画素）× ミップマップ係数 4/3 の推定値、`CompressedTexture`（`isCompressedTexture === true`）は `mipmaps[].data.byteLength` の合算値（Cube 構造時は各面の `mipmaps` 合算）を使い、スロット単位で圧縮・非圧縮が混在してもそのまま合算します。`requiredBytes`（現用＋最粗の必要量）と `overBudgetBytes`（`residentBytes` 基準の超過量）は別指標です。
+- **圧縮テクスチャのミップスライス**: `sliceCompressedTexture` は `source.clone()` による `Source` 共有破壊を避けるため `source.constructor` で独立インスタンスを生成し、`needsUpdate = true` を設定します（`mipOffset === 0` は元インスタンスを返却）。`createCompressedTextureMipLevels` は長辺上限配列と `minDimension`（既定 `4`、ブロック圧縮の基底サイズ制約対策）でミップを選び、同一オフセット間でインスタンスを共有します。2D `CompressedTexture` のみ対応（Cube / Array は未対応）。
 - **上限キャッシュ（`maxResidentBytes`）**: `update()` 内でのみ適用され、超過分について未参照（`refs === 0`）かつ非ピン（`pins === 0`）のテクスチャを最終使用の古い順（同時刻なら推定バイトの大きい順）に猶予を待たず破棄します。現用中とピン留めは保護するため、上限まで下げられない場合は超過を許容します。`evictDelayMs: Infinity` との併用で時間破棄なしの容量キャッシュになります。
 - **予算適応（2軸制御）**: `adaptiveThresholdScale` 有効時は、予測常駐量（`requiredBytes`）が予算内に収まるよう「距離しきい値スケール（判定距離を `d / scale` に読み替え）」と「Tier 上限（`finestLevel`、`levelCap: false` で無効化可）」の 2 軸で制御します。手動設定の `finestLevel` は適応の下限として常に効きます。
 - **適応の応答特性**: 引き下げは即時・複数段で行い、引き上げは `predict(1段上) <= 0.9 * budget` のときのみ 1 段/秒（引き下げ後の冷却 3 秒）で行います。予算が最粗レベルの合計より小さい場合などは下限（スケール既定 `0.05`・cap 最粗、`requiredBytes === pinnedBytes`）に張り付き超過が残ります。cap 変更に連動して再予測するため `scaleRaiseCount` が増えることがあります。
@@ -36,7 +37,7 @@
 - **退避の契機**: マネージャは `spillCache` 指定時、`evict` で `dispose()` したテクスチャの画素データを退避します。読み戻したまま未参照・非ピンで終わった分は、次の掃引で猶予を待たずに再退避します（書き込み済みならストアへは書き直しません）。
 - **表示前の読み戻し待ち**: レベル切替は、そのレベルの全束縛・全スロットの画素データが揃ってから行います。揃うまでは現在のレベル（初回は最粗レベル）を保ち、上限（`cap`）より細かいまま待つ場合があります。待機中のテクスチャは同じ `update()` の掃引で再退避しません。
 - **状態の単位と寿命**: 退避状態は `texture.source` 単位でキャッシュが持ち、マネージャの作り直しをまたいで引き継ぎます。新しいマネージャは退避中のテクスチャを破棄済み（`residentBytes` 対象外）として登録します。
-- **対象と契約**: 退避対象は `image.data` が `ArrayBuffer` 上の `Uint8Array` の画像だけです。画素内容は登録後に変わらないものとして扱います。書き込みに失敗した画像は以後退避せず、読み戻しに失敗した画像は準備済みにならないまま `failureCount` に数えます。
+- **対象と契約**: 退避対象は `image.data` が `ArrayBuffer` 上の `Uint8Array` の画像だけで、画素を `mipmaps` に持つ圧縮テクスチャはメモリに残します。画素内容は登録後に変わらないものとして扱います。書き込みに失敗した画像は以後退避せず、読み戻しに失敗した画像は準備済みにならないまま `failureCount` に数えます。
 - **OPFS ストア**: `openOpfsPixelStore` はページごとのセッションディレクトリを Web Locks のロックで示し、開くときにロックのないディレクトリ（閉じたページの残り）を削除します。
 
 ## テスト

@@ -31,6 +31,7 @@ WebGPU / WebGL2 の両バックエンドで VRM デモを検証します。
 - **上限キャッシュと予算適応**: 予算なし（`?evictDelay=10000&adaptive=0`）から動的予算を設定した際のレベル不変キャッシュ掃引、8MB 締めでの `resident === required` 維持と解除、予算適応 `?budget=32` での 2 軸制御（scale＋finestLevel）・2MB 締めでの下限到達・解除後 60 秒以内の復帰と 5 秒静定・世代番号不変の再適用
 - **ディスク退避**（`?spill=1&evictDelay=0`、1 体）: 遠景（20m）で `spilledBytes > 0`、近景へ戻ると読み戻し後に L0 へ復帰し輝度比 `< 0.1`、退避中の手動 L0 固定・LOD 無効でも輝度比 `< 0.1`・コンソールエラー 0・`failureCount === 0`
 - **4096 と Tier 上限**: WebGPU で `?atlas=4096&top=1024`（`topLevel=2`, `finestLevel=2`, map 幅 `[4096,2048,1024,512,256]` 等）と `?atlas=4096&budget=64`（`finestLevel=2`, `scale=1`, 解除 30 秒以内で復帰）、WebGL で軽量 `?atlas=1024&top=1024`
+- **圧縮テクスチャ（`?compress=1`）**: WebGPU / WebGL2 で `compressTextures=true`・`compressedSlots`・全レベル `CompressedTexture`・`map` 幅 `[1024,1024,1024,512,256]` とミップ数 `[11,11,11,10,9]`・`atlasBytes` 削減・L0→L3→L4→L0 での `evict` と輝度復帰・パイプライン非増加・エラーゼロを確認
 
 ## `scripts/fetch-models.mjs`（`pnpm models:fetch`）
 

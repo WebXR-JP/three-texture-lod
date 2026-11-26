@@ -4,16 +4,18 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  CompressedTexture,
   DataTexture,
   type ColorSpace,
   LinearFilter,
   LinearMipmapLinearFilter,
   NoColorSpace,
+  RGBA_BPTC_Format,
   RGBAFormat,
   SRGBColorSpace,
   UnsignedByteType,
 } from 'three/webgpu';
-import { createDownscaledTexture, enableMipmaps } from './downscale.js';
+import { createDownscaledTexture, createTierTexturesForSlot, enableMipmaps } from './downscale.js';
 
 function texture(pixels: number[][], colorSpace: ColorSpace = NoColorSpace): DataTexture {
   const size = pixels.length;
@@ -142,5 +144,56 @@ describe('createDownscaledTexture', () => {
     enableMipmaps(source);
     expect(source.generateMipmaps).toBe(true);
     expect(source.minFilter).toBe(LinearMipmapLinearFilter);
+  });
+
+  it('enableMipmaps は CompressedTexture の generateMipmaps を true にしない', () => {
+    const multi = new CompressedTexture(
+      [
+        { data: new Uint8Array(64), width: 8, height: 8 },
+        { data: new Uint8Array(16), width: 4, height: 4 },
+      ],
+      8,
+      8,
+      RGBA_BPTC_Format,
+    );
+    multi.minFilter = LinearFilter;
+    enableMipmaps(multi);
+    expect(multi.generateMipmaps).toBe(false);
+    expect(multi.minFilter).toBe(LinearMipmapLinearFilter);
+
+    const single = new CompressedTexture(
+      [{ data: new Uint8Array(64), width: 8, height: 8 }],
+      8,
+      8,
+      RGBA_BPTC_Format,
+    );
+    single.minFilter = LinearFilter;
+    enableMipmaps(single);
+    expect(single.generateMipmaps).toBe(false);
+    expect(single.minFilter).toBe(LinearFilter);
+  });
+
+  it('createTierTexturesForSlot は圧縮・非圧縮スロットを独立に処理する', () => {
+    const compressed = new CompressedTexture(
+      [
+        { data: new Uint8Array(16), width: 16, height: 16 },
+        { data: new Uint8Array(16), width: 8, height: 8 },
+        { data: new Uint8Array(16), width: 4, height: 4 },
+      ],
+      16,
+      16,
+      RGBA_BPTC_Format,
+    );
+    const compLevels = createTierTexturesForSlot(compressed, [32, 16, 8], 'color');
+    expect(compLevels[0]).toBe(compressed);
+    expect(compLevels[1]).toBe(compressed);
+    expect((compLevels[2].image as { width: number }).width).toBe(8);
+
+    const uncompressed = new DataTexture(new Uint8Array(16 * 16 * 4), 16, 16, RGBAFormat, UnsignedByteType);
+    uncompressed.needsUpdate = true;
+    const rawLevels = createTierTexturesForSlot(uncompressed, [32, 16, 8], 'scalar');
+    expect(rawLevels[0]).toBe(uncompressed);
+    expect(rawLevels[1]).toBe(uncompressed);
+    expect((rawLevels[2].image as { width: number }).width).toBe(8);
   });
 });

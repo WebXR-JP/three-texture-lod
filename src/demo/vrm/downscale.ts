@@ -19,6 +19,8 @@ import {
   UnsignedByteType,
   type Texture,
 } from 'three/webgpu';
+import { createCompressedTextureMipLevels, isCompressedTexture } from '../../lib/index.js';
+import { tierDivisor } from './tiers.js';
 
 /** スロットの性質。法線だけ特別扱いする。 */
 export type DownsampleKind = 'color' | 'normal' | 'scalar';
@@ -56,14 +58,49 @@ function clamp255(value: number): number {
  * アトラステクスチャにミップマップを有効化する。
  *
  * 元のアトラスは LinearFilter・ミップなしで生成される。遠景でちらつくため、
- * LODの全レベルで同じ設定（LinearMipmapLinear + generateMipmaps）に揃える。
- * 設定をレベル間で揃えることで、TextureLodSet の設定ずれ警告も出ない。
+ * 非圧縮テクスチャは LOD の全レベルで同じ設定（LinearMipmapLinear + generateMipmaps）に揃える。
+ * 圧縮テクスチャは自動ミップ生成ができないため、`generateMipmaps = false` を維持し、
+ * 複数ミップを持つ場合のみフィルタを揃える。
  */
 export function enableMipmaps(texture: Texture): void {
+  if (isCompressedTexture(texture)) {
+    texture.generateMipmaps = false;
+    if (Array.isArray(texture.mipmaps) && texture.mipmaps.length > 1) {
+      texture.minFilter = LinearMipmapLinearFilter;
+      texture.magFilter = LinearFilter;
+    }
+    return;
+  }
   texture.generateMipmaps = true;
   texture.minFilter = LinearMipmapLinearFilter;
   texture.magFilter = LinearFilter;
   texture.needsUpdate = true;
+}
+
+/**
+ * スロット単位で、Tier 解像度列に対応する LOD テクスチャ配列を生成する。
+ *
+ * 圧縮テクスチャ（`CompressedTexture`）は埋め込みミップチェーンのスライスを用い、
+ * 非圧縮テクスチャはピクセル縮小（`downscale`）を用いる。
+ *
+ * @param source - 元テクスチャ。
+ * @param tiers - 各 LOD レベルの長辺上限（px）。
+ * @param kind - 非圧縮時の縮小アルゴリズム。
+ * @param downscale - 非圧縮時の縮小関数（キャッシュ共有用に差し替え可能）。
+ * @returns `tiers` と同じ長さのテクスチャ配列。
+ */
+export function createTierTexturesForSlot(
+  source: Texture,
+  tiers: readonly number[],
+  kind: DownsampleKind,
+  downscale: (source: Texture, divisor: number, kind: DownsampleKind) => Texture = createDownscaledTexture,
+): Texture[] {
+  if (isCompressedTexture(source)) {
+    return createCompressedTextureMipLevels(source, tiers);
+  }
+  const image = source.image as { width?: number; height?: number } | undefined;
+  const maxDim = Math.max(image?.width ?? 0, image?.height ?? 0);
+  return tiers.map((tier) => downscale(source, tierDivisor(maxDim, tier), kind));
 }
 
 /**

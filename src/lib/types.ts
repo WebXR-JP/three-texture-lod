@@ -219,13 +219,14 @@ export interface TextureLodManagerOptions {
    */
   readonly evictDelayMs?: number;
   /**
-   * 常駐テクスチャ推定バイト数の上限。
+   * 常駐テクスチャバイト数の上限。
    *
    * 超過時は未参照（`refs === 0`）かつ非ピン（`pins === 0`）のテクスチャを、
-   * 最終使用の古い順（同時刻なら推定バイトの大きい順）に、猶予 `evictDelayMs` を待たず破棄する。
+   * 最終使用の古い順（同時刻ならバイト数の大きい順）に、猶予 `evictDelayMs` を待たず破棄する。
    * 現用中と最粗レベルのフォールバック先は破棄しないため、上限まで下げられない場合は超過を許容する
    * （{@link TextureLodStats.overBudgetBytes} で確認する）。
-   * 判定は {@link TextureLodStats.residentBytes} と同じ推定値で行い、実VRAMではない。適用は `update()` 内のみ。
+   * 判定は {@link TextureLodStats.residentBytes} と同じ基準（非圧縮は推定値、圧縮テクスチャはミップ実バイト合計）で行い、
+   * スロット単位で混在していても合算して判定する。適用は `update()` 内のみ。
    * `residency: 'keep-all'` との併用は不可。
    *
    * @defaultValue 上限なし
@@ -295,10 +296,11 @@ export interface TextureLodStats {
    */
   readonly levelCounts: readonly number[];
   /**
-   * 常駐テクスチャの推定バイト数。
+   * 常駐テクスチャのバイト数。
    *
-   * RGBA8（1画素4バイト）にミップマップ係数 4/3 を掛けた `w*h*4*4/3` の合計であり、
-   * 実測値ではなく推定値である。破棄済みのテクスチャは含まない。
+   * 非圧縮テクスチャは RGBA8（1画素4バイト）にミップマップ係数 4/3 を掛けた `w*h*4*4/3` の推定値、
+   * `CompressedTexture` は `mipmaps[].data.byteLength` の合計実バイト数として合算する。
+   * スロット単位で圧縮・非圧縮が混在する場合はそれぞれの値を合算する。破棄済みのテクスチャは含まない。
    */
   readonly residentBytes: number;
   /** 設定された上限バイト数。未設定なら `null`。 */
@@ -313,9 +315,9 @@ export interface TextureLodStats {
    */
   readonly thresholdScale: number;
   /**
-   * 必要常駐量の推定バイト数。
+   * 必要常駐量のバイト数。
    *
-   * 追跡中のうち `!evicted && (refs > 0 || pins > 0)` の `estimateBytes` 合計である。
+   * 追跡中のうち `!evicted && (refs > 0 || pins > 0)` のバイト数（非圧縮は推定、圧縮はミップ実バイト）合計である。
    * `residentBytes` と違い、未参照の非ピン留めテクスチャ（いずれ破棄される分）を含まない。
    * `update()` 直後の値であり、`update` と `stats()` の間の `addGroup` や画像差し替えでは
    * 一時的に予算を超え得る（次の `update()` で解消する）。
@@ -334,7 +336,7 @@ export interface TextureLodStats {
    */
   readonly finestLevel: number;
   /**
-   * ピン留め（`pins > 0`）の推定バイト合計。破棄済みは含まない。
+   * ピン留め（`pins > 0`）のバイト合計（非圧縮は推定、圧縮はミップ実バイト）。破棄済みは含まない。
    */
   readonly pinnedBytes: number;
   /** 上限の引き下げで動いた累計回数（`cap` 増加時）。非適応時は `0`。 */

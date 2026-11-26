@@ -2013,6 +2013,170 @@ async function checkBackend(browser, backend) {
   return result;
 }
 
+async function checkCompressed(browser, backend) {
+  const page = await browser.newPage({ viewport: { width: 1200, height: 760 } });
+  const messages = [];
+  page.on('console', (message) => messages.push(`${message.type()}: ${message.text()}`));
+  page.on('pageerror', (error) => messages.push(`pageerror: ${String(error)}`));
+  const result = { backend, ok: false, messages: [] };
+  try {
+    await page.goto(
+      `${BASE_URL}/vrm.html?models=A&avatars=1&auto=0&h=0.15&wander=0&compress=1${backend === 'webgl' ? '&backend=webgl' : ''}`,
+      { waitUntil: 'load' },
+    );
+    await page.waitForFunction(
+      () => window.__vrmDemo?.status === 'ready' || window.__vrmDemo?.status === 'error',
+      null,
+      { timeout: 300000 },
+    );
+    const status = await page.evaluate(() => window.__vrmDemo.status);
+    result.status = status;
+    if (status !== 'ready') {
+      assert(false, `${backend} (compressed): デモが ready にならなかった（status=${status}）`);
+      return result;
+    }
+
+    const stats = await statsOf(page);
+    const avatar = stats.avatars[0];
+    assert(stats.compressTextures === true, `${backend} (compressed): compressTextures が true でない`);
+    assert(
+      avatar?.compressedSlots?.includes('map') &&
+        avatar?.compressedSlots?.includes('shadeMultiplyTexture'),
+      `${backend} (compressed): compressedSlots が不足: ${JSON.stringify(avatar?.compressedSlots)}`,
+    );
+    assert(
+      avatar?.atlasBytes > 0 && avatar?.atlasBytes < 8 * 1048576,
+      `${backend} (compressed): atlasBytes が圧縮サイズ想定外: ${avatar?.atlasBytes}`,
+    );
+
+    const slotCompressed = await page.evaluate(() =>
+      window.__vrmDemo.variantSlotCompressed(0, 'map'),
+    );
+    assert(
+      slotCompressed.length > 0 &&
+        slotCompressed.every((setFlags) => setFlags.every((flag) => flag === true)),
+      `${backend} (compressed): map が全セット全レベルで圧縮テクスチャでない: ${JSON.stringify(slotCompressed)}`,
+    );
+
+    const mapWidths = await page.evaluate(() => window.__vrmDemo.variantTextureWidths(0));
+    const normalWidths = await page.evaluate(() =>
+      window.__vrmDemo.variantSlotWidths(0, 'normalMap'),
+    );
+    const mapMips = await page.evaluate(() => window.__vrmDemo.variantSlotMipCounts(0, 'map'));
+    for (const setWidths of mapWidths) {
+      assert(
+        JSON.stringify(setWidths) === JSON.stringify([1024, 1024, 1024, 512, 256]),
+        `${backend} (compressed): map 幅が想定外: ${JSON.stringify(setWidths)}`,
+      );
+    }
+    for (const setWidths of normalWidths) {
+      assert(
+        JSON.stringify(setWidths) === JSON.stringify([512, 512, 512, 512, 256]),
+        `${backend} (compressed): normalMap 幅が想定外: ${JSON.stringify(setWidths)}`,
+      );
+    }
+    for (const setMips of mapMips) {
+      assert(
+        JSON.stringify(setMips) === JSON.stringify([11, 11, 11, 10, 9]),
+        `${backend} (compressed): map ミップ数が想定外: ${JSON.stringify(setMips)}`,
+      );
+    }
+
+    // evictDelay=0 で L0 → L3 → L4 → L0 の解放・輝度復帰とパイプライン非増加を検証する。
+    await page.evaluate(() =>
+      window.__vrmDemo.setSettings({ residency: 'evict', evictDelayMs: 0, forceLevel: null }),
+    );
+    await setDistance(page, 2.5);
+    const nearStats = await statsOf(page);
+    const nearBrightness = await screenshot(page, `${backend}-compressed-near.png`);
+
+    await setDistance(page, 20);
+    await sleep(600);
+    const farStats = await statsOf(page);
+
+    await setDistance(page, 30);
+    await sleep(400);
+    const veryFarStats = await statsOf(page);
+
+    await setDistance(page, 2.5);
+    await sleep(500);
+    const recoveredStats = await statsOf(page);
+    const recoveredBrightness = await screenshot(page, `${backend}-compressed-recovered.png`);
+
+    // 往復してパイプラインが増えないことを確認する。
+    for (const d of [30, 2.5, 30, 2.5]) {
+      await setDistance(page, d);
+    }
+    const pipelineAfter = await statsOf(page);
+
+    result.compressed = {
+      atlasBytes: avatar.atlasBytes,
+      compressedSlots: avatar.compressedSlots,
+      mapWidths,
+      normalWidths,
+      mapMips,
+      nearResident: nearStats.manager.residentBytes,
+      farResident: farStats.manager.residentBytes,
+      veryFarResident: veryFarStats.manager.residentBytes,
+      nearBrightness,
+      recoveredBrightness,
+      pipelines: {
+        before: { caches: nearStats.pipelineCaches, fragment: nearStats.fragmentPrograms },
+        after: { caches: pipelineAfter.pipelineCaches, fragment: pipelineAfter.fragmentPrograms },
+      },
+    };
+
+    assert(nearStats.avatars[0]?.level === 0, `${backend} (compressed): 近景で L0 でない`);
+    assert(farStats.avatars[0]?.level === 3, `${backend} (compressed): 20m で L3 でない`);
+    assert(veryFarStats.avatars[0]?.level === 4, `${backend} (compressed): 30m で L4 でない`);
+    assert(
+      farStats.manager.residentBytes < nearStats.manager.residentBytes / 2,
+      `${backend} (compressed): evict で residentBytes が半分未満にならない: ${nearStats.manager.residentBytes} → ${farStats.manager.residentBytes}`,
+    );
+    assert(
+      farStats.manager.evictCount > nearStats.manager.evictCount,
+      `${backend} (compressed): evictCount が増えていない`,
+    );
+    assert(
+      veryFarStats.manager.residentBytes < farStats.manager.residentBytes,
+      `${backend} (compressed): L4 で residentBytes がさらに減っていない: ${farStats.manager.residentBytes} → ${veryFarStats.manager.residentBytes}`,
+    );
+    assert(nearBrightness > 20, `${backend} (compressed): 近景輝度が低すぎる: ${nearBrightness}`);
+    assert(
+      Math.abs(recoveredBrightness / nearBrightness - 1) < 0.1,
+      `${backend} (compressed): 復帰後の輝度比が 10% 超: near=${nearBrightness}, recovered=${recoveredBrightness}`,
+    );
+    assert(
+      recoveredStats.avatars[0]?.level === 0,
+      `${backend} (compressed): 復帰後に L0 へ戻っていない`,
+    );
+    assert(
+      pipelineAfter.pipelineCaches <= nearStats.pipelineCaches &&
+        pipelineAfter.fragmentPrograms <= nearStats.fragmentPrograms,
+      `${backend} (compressed): パイプラインが増えた: ${nearStats.pipelineCaches}/${nearStats.fragmentPrograms} → ${pipelineAfter.pipelineCaches}/${pipelineAfter.fragmentPrograms}`,
+    );
+
+    const consoleErrors = messages.filter(
+      (message) => message.startsWith('pageerror:') || message.startsWith('error:'),
+    );
+    const noise = messages.filter((message) =>
+      /Too many active WebGL contexts|WebGPU|destroyed|THREE\./i.test(message),
+    );
+    result.consoleErrors = consoleErrors;
+    result.webgpuNoise = noise;
+    assert(consoleErrors.length === 0, `${backend} (compressed): コンソールエラー ${consoleErrors.join(' | ')}`);
+    assert(noise.length === 0, `${backend} (compressed): GPU関連の警告 ${noise.join(' | ')}`);
+    result.ok = failures.length === 0;
+  } catch (error) {
+    result.error = String(error?.stack ?? error);
+    assert(false, `${backend} (compressed): 例外: ${String(error)}`);
+  } finally {
+    result.messages = messages.slice(-40);
+    await page.close();
+  }
+  return result;
+}
+
 async function main() {
   const missingModels = MODEL_PATHS.flatMap(({ public: publicPath, dist }) =>
     [publicPath, dist].filter((path) => !existsSync(path)),
@@ -2168,6 +2332,15 @@ async function main() {
       single.crowd = crowd;
       single.tierCap = tierCap;
       single.spill = spill;
+
+      const compressedBrowser = await launchBrowser(backend);
+      let compressed;
+      try {
+        compressed = await checkCompressed(compressedBrowser, backend);
+      } finally {
+        await compressedBrowser.close();
+      }
+      single.compressed = compressed;
       single.ok = failures.length === 0;
       results.push(single);
     }

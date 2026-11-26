@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/WebXR-JP/three-texture-lod.git"
+    "url": "git+https://github.com/WebXR-JP/three-texture-lod.git"
   },
   "homepage": "https://github.com/WebXR-JP/three-texture-lod#readme",
   "bugs": {

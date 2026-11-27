@@ -4,9 +4,9 @@ VRM × テクスチャ LOD デモ（`vrm.html` / `src/demo/vrm/`）の実装仕�
 
 ## 読み込みと最適化
 
-- three r187 では `@pixiv/three-vrm` の `MToonNodeMaterial` がバンドル要件と合わないため、読み込みは classic `MToonMaterial` で行い、`@webxr-jp/avatar-optimizer`（0.7.1）でアトラス化・マテリアル統合したあと `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換えます。
+- three r187 では `@pixiv/three-vrm` の `MToonNodeMaterial` がバンドル要件と合わないため、読み込みは classic `MToonMaterial` で行い、`@webxr-jp/avatar-optimizer`（0.7.2）でアトラス化・マテリアル統合したあと `@webxr-jp/mtoon-atlas/nodes` の `MToonAtlasNodeMaterial`（TSL）へ置き換えます。
 - 使用されているスロット（`map`, `shadeMultiplyTexture`, `normalMap`, `emissiveMap` 等）だけを実サイズでアトラス化し、未使用スロットは 8px に落とします。
-- 最適化後は、最適化後のシーンが参照しなくなった元テクスチャを破棄し、画素（`ImageBitmap`）を `close()` します（`source-textures.ts`）。保持し続ける `VRM` の firstPerson などが元のメッシュとマテリアルを参照するため、そのままではソース 1 体あたり約 85 MiB がメインメモリに残ります。
+- 置き換えられた元のマテリアル・テクスチャ・メッシュは `optimizeModel` が解放します（0.7.2 以降）。0.7.1 以前に戻すと、ソース 1 体あたり約 85 MiB の元テクスチャがメインメモリに残ります。
 - `matcap` は UV 非依存のため LOD 対象外です。また `materialColorBind` / `textureTransformBind` は最適化後のマテリアルには効きません。
 - `?compress=1`（既定 OFF）または GUI の `テクスチャ圧縮(KTX2)` トグルで `optimizeModel` に `textureCompression`（UASTC + `generateMipmaps: true`）を渡し、共有 `KTX2Loader`（three 同梱ローカル transcoder）で `CompressedTexture` へトランスコードします。
 

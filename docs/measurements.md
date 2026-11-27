@@ -67,6 +67,7 @@ WebGPU / WebGL2 ともスモーク通過時の実測値です（代表値は Web
 iPhone 11 Pro（iOS 26.6.2）の Safari で、WebGPU を使って計測した値です（`@webxr-jp/avatar-optimizer` 0.7.1）。シミュレータは iOS のメモリ上限を再現しないので、実機で見ています。
 
 - **計測方法**: LAN 上の HTTPS（secure context）で `dist/demo` を配信します。条件ごとに Safari を終了してから開き、ready 後に約 110 秒、`?auto=1` で動かします。
+- **ストレージを使う計測**: `devicectl` で Safari を強制終了して開き直すと、5〜8 秒後にこのオリジンのサイトデータ（OPFS・localStorage・IndexedDB）が消え、それより前に取った OPFS のハンドルは `UnknownError` を返します。`?spill=1` を測るときは、再起動後に軽いページを開いて 30 秒ほど待ってから試験の URL を開いてください。
 - **合格条件**: タブの再読込（クラッシュ）、WebGPU デバイスの喪失、エラーのいずれも起きないこと。
 
 ### テクスチャ予算（`?models=A,B&avatars=50&atlas=4096&auto=1`）
@@ -88,4 +89,25 @@ iPhone 11 Pro（iOS 26.6.2）の Safari で、WebGPU を使って計測した値
 | 2048px で `C` 単独・`A,B`・`A,C`・`B,C`（各 1〜2 体） | 安定（常駐は最大 125.3 MiB） |
 | `?models=A,B,C` で 2048px・50 体、4096px・3〜50 体 | 初回描画で WebGPU デバイスを失う（4096px ではタブのクラッシュも起きる） |
 
-最後の構成は `?budget=128` でも同じく失われます。2 ソース・4096px の `?budget=128`（常駐 120.0 MiB）は通るので、GPU 常駐テクスチャ量の差では説明できず、原因は特定できていません。iPhone では 3 ソースなら 1024px に留めてください。
+最後の構成は `?budget=128` でも同じく失われます。2 ソース・4096px の `?budget=128`（常駐 120.0 MiB）は通るので、GPU 常駐テクスチャ量の差では説明できません。後述のプロセスメモリも上限より十分小さく、原因は特定できていません。iPhone では 3 ソースなら 1024px に留めてください。
+
+### プロセスメモリ
+
+Safari のページからはメモリを取れないので、Mac から次の 2 つで見ます。値は各プロセスの physical footprint です。
+
+- **動作中**: `xcrun xctrace record --device <UDID> --template "Activity Monitor" --all-processes` を ready 後に 5 秒だけ記録し、`sysmon-process` 表を書き出します。ページが重いと、長い記録は保存が終わらなくなります。記録の直前に `xcrun devicectl device info details` で接続を起こしておかないと、`Waiting for device to boot` で止まります。
+- **強制終了時**: iOS が残す `JetsamEvent-*.ips` を `xcrun devicectl device copy from --domain-type systemCrashLogs` で取り出し、プロセスごとの `rpages`（16 KiB ページ）と終了理由を読みます。
+
+| 構成 | WebContent | GPU プロセス | 結果 |
+| --- | --- | --- | --- |
+| `?models=A,B&avatars=50&atlas=4096`（予算なし） | 1,536.0〜1,684.2 MiB | 211.2〜232.0 MiB | WebContent が `highwater` で強制終了（3 回の計測すべてで、再読込後の 2 回目も同様） |
+| 同上 `?budget=128` | 1,221.7〜1,227.6 MiB | 222.2〜222.3 MiB | 安定 |
+| 同上 `?budget=128&spill=1` | 842.8 MiB | 217.8 MiB | 安定。2 回とも 12 件・336.0 MiB を退避し、失敗 0 |
+| 同上 `?spill=1`（予算なし） | — | — | 2 回とも ready 後約 17 秒でクラッシュ。退避は 2 件・128.0 MiB に留まる |
+| `?models=A,B,C&avatars=50&atlas=2048`（予算なし / `?budget=128`） | 715.4 / 742.6 MiB | 19.9 / 22.3 MiB | WebGPU デバイスを失う。GPU プロセスの値はデバイス喪失後のもので、GPU プロセスの強制終了は記録されない |
+
+予算なしでのクラッシュは、ページのプロセス（WebContent）が 1 タブあたり約 1.5 GiB の上限に届くことで起きます。GPU プロセスには余裕があります。テクスチャ予算は GPU 常駐量だけでなく WebContent のメモリも 1.2 GiB 台まで下げ、この上限を避けます。
+
+`?spill=1` を予算と組み合わせると、予算で破棄したレベルの画素データが OPFS へ移り、WebContent はさらに約 385 MiB 減ります（退避量 336.0 MiB とおおむね同じ規模）。予算なしでは距離で破棄されるレベルが少なく、spill だけでは上限を避けられません。
+
+計測の切り替え中に、どの試験のものか分からない 1,607.4 MiB の WebContent が強制終了されることがあります。Safari の再起動時に前回の重いタブが裏で読み直されている可能性があるので（未確認）、計測前に Safari のタブを閉じておいてください。

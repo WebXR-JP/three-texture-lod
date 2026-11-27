@@ -28,6 +28,7 @@ import {
   enableMipmaps,
   type DownsampleKind,
 } from './downscale.js';
+import { collectSceneTextures, releaseReplacedTextures } from './source-textures.js';
 import { LOD_DISTANCES, LOD_TIERS } from './tiers.js';
 
 /** アトラス化される MToon のテクスチャスロット。matcap はUV非依存なので対象外。 */
@@ -413,6 +414,7 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
   }
   const vrm = loaded.value;
   const before = analyze(vrm.scene);
+  const sourceTextures = collectSceneTextures(vrm.scene);
 
   const used = collectUsedSlots(vrm.scene);
   const half = Math.max(256, Math.round(atlasResolution / 2));
@@ -461,6 +463,7 @@ export async function loadAvatar(options: LoadAvatarOptions): Promise<AvatarHand
     );
   }
   const optimizeMs = performance.now() - started;
+  releaseReplacedTextures(sourceTextures, vrm.scene);
 
   faceCamera(vrm);
   applyRestPose(vrm);
